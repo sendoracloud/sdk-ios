@@ -2,23 +2,23 @@
 import PackageDescription
 
 let package = Package(
-    name: "Sendora",
+    name: "SendoraCloud",
     platforms: [
         .iOS(.v15),
         .macOS(.v12)
     ],
     products: [
-        .library(name: "Sendora", targets: ["Sendora"])
+        .library(name: "SendoraCloud", targets: ["SendoraCloud"])
     ],
     targets: [
         .target(
-            name: "Sendora",
-            path: "Sources/Sendora"
+            name: "SendoraCloud",
+            path: "Sources/SendoraCloud"
         ),
         .testTarget(
-            name: "SendoraTests",
-            dependencies: ["Sendora"],
-            path: "Tests/SendoraTests"
+            name: "SendoraCloudTests",
+            dependencies: ["SendoraCloud"],
+            path: "Tests/SendoraCloudTests"
         )
     ]
 )
