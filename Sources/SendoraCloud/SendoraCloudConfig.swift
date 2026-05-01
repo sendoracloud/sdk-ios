@@ -18,6 +18,15 @@ public struct SendoraCloudConfig {
     /// Call `SendoraCloud.startAttribution()` after ATT prompt / consent. Default: `true`
     /// for backwards compatibility — set to `false` for App Store ATT compliance.
     public var autoStartAttribution: Bool
+    /// Optional certificate-pinning set. When non-empty the SDK enforces
+    /// that the server's leaf-certificate Subject Public Key Info SHA-256
+    /// matches one of the supplied base64 hashes — an attacker-installed
+    /// enterprise CA can no longer MitM auth tokens. Compute the hash
+    /// with: `openssl x509 -in cert.pem -pubkey -noout | openssl pkey
+    /// -pubin -outform der | openssl dgst -sha256 -binary | openssl
+    /// base64`. Always include at least one backup pin. Default: empty
+    /// (system trust only).
+    public var pinnedSPKIHashes: [String]
 
     public init(
         apiKey: String,
@@ -27,9 +36,10 @@ public struct SendoraCloudConfig {
         flushAt: Int = 20,
         maxQueueSize: Int = 1000,
         debug: Bool = false,
-        linkHosts: [String] = ["sendoracloud.com"],
+        linkHosts: [String] = ["go.sendoracloud.com", "sendoracloud.com"],
         defaultConsent: Bool = false,
-        autoStartAttribution: Bool = true
+        autoStartAttribution: Bool = true,
+        pinnedSPKIHashes: [String] = []
     ) {
         self.apiKey = apiKey
         self.projectId = projectId
@@ -41,6 +51,7 @@ public struct SendoraCloudConfig {
         self.linkHosts = linkHosts
         self.defaultConsent = defaultConsent
         self.autoStartAttribution = autoStartAttribution
+        self.pinnedSPKIHashes = pinnedSPKIHashes
     }
 }
 

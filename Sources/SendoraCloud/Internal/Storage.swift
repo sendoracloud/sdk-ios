@@ -74,6 +74,23 @@ final class SendoraStorage {
         }
     }
 
+    /// Unix-millis when the cached access token expires.
+    /// 0 = unknown / not set.
+    var authAccessExpiresAt: Int64 {
+        get {
+            guard let s = keychainGet(key: "sendora_auth_access_expires"),
+                  let ms = Int64(s) else { return 0 }
+            return ms
+        }
+        set {
+            if newValue > 0 {
+                keychainSet(key: "sendora_auth_access_expires", value: String(newValue))
+            } else {
+                keychainDelete(key: "sendora_auth_access_expires")
+            }
+        }
+    }
+
     /// JSON-encoded `AuthUser`. Stored as opaque string since Storage
     /// is dependency-free; SendoraCloudAuth handles encode/decode.
     var authUserJson: String? {
@@ -86,6 +103,7 @@ final class SendoraStorage {
 
     func clearAuthTokens() {
         keychainDelete(key: "sendora_auth_access_token")
+        keychainDelete(key: "sendora_auth_access_expires")
         keychainDelete(key: "sendora_auth_refresh_token")
         keychainDelete(key: "sendora_auth_user")
     }
@@ -152,7 +170,16 @@ final class SendoraStorage {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        SecItemAdd(query as CFDictionary, nil)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status != errSecSuccess {
+            // Surface OSStatus failures so the developer can diagnose
+            // pre-first-unlock writes (errSecInteractionNotAllowed) or
+            // duplicate-item races (errSecDuplicateItem) — previously
+            // swallowed, leaving the user "logged out" with no log.
+            SendoraCloudLogger.shared.error(
+                "Keychain set failed for key=\(key) status=\(status)"
+            )
+        }
     }
 
     private func keychainDelete(key: String) {

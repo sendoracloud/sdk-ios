@@ -66,6 +66,17 @@ final class EventQueue {
         }
     }
 
+    /// Discard every queued event without flushing. Used by Auth on
+    /// cross-account signin so the prior identity's pending events
+    /// don't surface under the next user.
+    func dropAll() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.events = []
+            self.storage.clearEventQueue()
+        }
+    }
+
     func persistToDisk() {
         queue.async { [weak self] in
             guard let self = self else { return }

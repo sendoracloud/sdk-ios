@@ -95,7 +95,11 @@ public final class SendoraCloud {
             self.deviceContext = device
             self.fingerprintHash = FingerprintGenerator.generate(device: device)
 
-            let client = APIClient(baseUrl: finalConfig.apiBaseUrl, apiKey: finalConfig.apiKey)
+            let client = APIClient(
+                baseUrl: finalConfig.apiBaseUrl,
+                apiKey: finalConfig.apiKey,
+                pinnedSPKIHashes: finalConfig.pinnedSPKIHashes
+            )
             self.apiClient = client
 
             let queue = EventQueue(storage: store, flushAt: finalConfig.flushAt, maxSize: finalConfig.maxQueueSize)
@@ -116,17 +120,25 @@ public final class SendoraCloud {
                     }
                 },
                 onAnonymousWipe: {
-                    // Switching from anonymous to a real account —
-                    // rotate the device-side identity so events from
-                    // the new user can't carry over the prior
-                    // anonymous attribution.
+                    // Switching identities — rotate device-side state
+                    // so events from the new user can't carry over the
+                    // prior anonymous attribution. Also drain the
+                    // event queue: pending events were captured under
+                    // the prior currentUserId and shouldn't surface
+                    // under the next.
                     self.serialQueue.sync {
                         self.currentUserId = nil
                         self.currentIdentityToken = nil
                         store.cachedUserId = nil
                         store.regenerateDeviceId()
+                        // Force-mint a fresh device id immediately so
+                        // any concurrent track() that races the wipe
+                        // sees the new id rather than a transiently
+                        // missing one.
+                        _ = store.deviceId
                         store.sessionId = UUID().uuidString
                     }
+                    self.eventQueue?.dropAll()
                 }
             )
 
@@ -257,7 +269,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "1.0.0"],
+                "sdk": ["name": "sendora-ios", "version": "2.2.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],
