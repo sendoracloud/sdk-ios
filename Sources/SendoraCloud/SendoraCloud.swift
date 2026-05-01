@@ -48,6 +48,10 @@ public final class SendoraCloud {
     /// (unless `config.defaultConsent = true`).
     public static let consent = SendoraCloudConsent(initial: false)
 
+    /// Auth Service surface. Lazily initialised in `configure()`.
+    /// Access as `SendoraCloud.auth?.signInAnonymously { ... }`.
+    public private(set) static var auth: SendoraCloudAuth?
+
     // MARK: - Public API
 
     /// Initialize the SDK. Must be called before any other method. Non-throwing
@@ -101,6 +105,30 @@ public final class SendoraCloud {
             }
             queue.startTimer(interval: finalConfig.flushInterval)
             self.eventQueue = queue
+
+            self.auth = SendoraCloudAuth(
+                client: client,
+                storage: store,
+                onIdentityChange: { userId in
+                    self.serialQueue.sync {
+                        self.currentUserId = userId
+                        store.cachedUserId = userId
+                    }
+                },
+                onAnonymousWipe: {
+                    // Switching from anonymous to a real account —
+                    // rotate the device-side identity so events from
+                    // the new user can't carry over the prior
+                    // anonymous attribution.
+                    self.serialQueue.sync {
+                        self.currentUserId = nil
+                        self.currentIdentityToken = nil
+                        store.cachedUserId = nil
+                        store.regenerateDeviceId()
+                        store.sessionId = UUID().uuidString
+                    }
+                }
+            )
 
             self.isConfigured = true
         }

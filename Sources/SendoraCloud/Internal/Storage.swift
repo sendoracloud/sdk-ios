@@ -56,6 +56,40 @@ final class SendoraStorage {
         keychainDelete(key: "sendora_device_id")
     }
 
+    // MARK: - Auth Service tokens (Keychain-backed)
+
+    var authAccessToken: String? {
+        get { keychainGet(key: "sendora_auth_access_token") }
+        set {
+            if let v = newValue { keychainSet(key: "sendora_auth_access_token", value: v) }
+            else { keychainDelete(key: "sendora_auth_access_token") }
+        }
+    }
+
+    var authRefreshToken: String? {
+        get { keychainGet(key: "sendora_auth_refresh_token") }
+        set {
+            if let v = newValue { keychainSet(key: "sendora_auth_refresh_token", value: v) }
+            else { keychainDelete(key: "sendora_auth_refresh_token") }
+        }
+    }
+
+    /// JSON-encoded `AuthUser`. Stored as opaque string since Storage
+    /// is dependency-free; SendoraCloudAuth handles encode/decode.
+    var authUserJson: String? {
+        get { keychainGet(key: "sendora_auth_user") }
+        set {
+            if let v = newValue { keychainSet(key: "sendora_auth_user", value: v) }
+            else { keychainDelete(key: "sendora_auth_user") }
+        }
+    }
+
+    func clearAuthTokens() {
+        keychainDelete(key: "sendora_auth_access_token")
+        keychainDelete(key: "sendora_auth_refresh_token")
+        keychainDelete(key: "sendora_auth_user")
+    }
+
     // MARK: - Event queue (PII-stripped)
 
     /// Persist events to disk. `userId` and `traits` are stripped — they'll be
