@@ -328,6 +328,68 @@ public final class SendoraCloudAuth {
         }
     }
 
+    // MARK: - Password reset + email verification
+
+    /// Trigger a password-reset email. Backend always resolves
+    /// successfully even when the address is unknown — prevents
+    /// account enumeration.
+    public func requestPasswordReset(
+        email: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/password/forgot", body: ["email": email]) { response in
+            if let err = self.parseError(response) {
+                completion(.failure(err))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
+    /// Pair the reset-email token with the user's new password.
+    public func resetPassword(
+        token: String,
+        newPassword: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/password/reset", body: ["token": token, "newPassword": newPassword]) { response in
+            if let err = self.parseError(response) {
+                completion(.failure(err))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
+    /// Verify the email-address token from the link Sendora sent on
+    /// signup. Flips `emailVerified=true` on the user row.
+    public func verifyEmail(
+        token: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/email/verify", body: ["token": token]) { response in
+            if let err = self.parseError(response) {
+                completion(.failure(err))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
+    /// Re-send the email-verification email for the currently-
+    /// signed-in user. No-op when already verified.
+    public func sendVerificationEmail(
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        bearerCall(path: "/auth-service/email/verify/resend", body: [:]) { response in
+            if let err = self.parseError(response) {
+                completion(.failure(err))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
     // MARK: - MFA enrollment management (Bearer-authenticated)
 
     public struct MfaEnrollment {
