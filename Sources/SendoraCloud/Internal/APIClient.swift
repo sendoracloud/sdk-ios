@@ -53,6 +53,30 @@ final class APIClient: NSObject, URLSessionDelegate {
     }
 
     func post(path: String, body: [String: Any], completion: @escaping ([String: Any]?) -> Void) {
+        request(method: "POST", path: path, body: body, headers: nil, completion: completion)
+    }
+
+    /// POST with extra headers — used for Bearer-authenticated
+    /// self-service routes (MFA enroll, passkey enroll, etc).
+    func post(path: String, body: [String: Any], headers: [String: String]?, completion: @escaping ([String: Any]?) -> Void) {
+        request(method: "POST", path: path, body: body, headers: headers, completion: completion)
+    }
+
+    func get(path: String, headers: [String: String]?, completion: @escaping ([String: Any]?) -> Void) {
+        request(method: "GET", path: path, body: nil, headers: headers, completion: completion)
+    }
+
+    func delete(path: String, headers: [String: String]?, completion: @escaping ([String: Any]?) -> Void) {
+        request(method: "DELETE", path: path, body: nil, headers: headers, completion: completion)
+    }
+
+    private func request(
+        method: String,
+        path: String,
+        body: [String: Any]?,
+        headers: [String: String]?,
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
         if shouldSkip() {
             completion(nil)
             return
@@ -65,20 +89,25 @@ final class APIClient: NSObject, URLSessionDelegate {
             return
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        } catch {
-            SendoraCloudLogger.shared.error("JSON serialization failed")
-            completion(nil)
-            return
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        if let headers = headers {
+            for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
         }
 
-        let task = session.dataTask(with: request) { [weak self] data, response, _ in
+        if let body = body {
+            do {
+                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            } catch {
+                SendoraCloudLogger.shared.error("JSON serialization failed")
+                completion(nil)
+                return
+            }
+        }
+
+        let task = session.dataTask(with: req) { [weak self] data, response, _ in
             guard let self = self else { return }
             if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
                let data = data,

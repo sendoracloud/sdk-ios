@@ -1,3 +1,0 @@
-module Sendora {
-    header "/Users/paramvirsingh/ParamData/Projects/Sendora/sendora/packages/sdk-ios/.build/arm64-apple-macosx/debug/Sendora.build/include/Sendora-Swift.h"
-}

@@ -191,6 +191,246 @@ public final class SendoraCloudAuth {
         }
     }
 
+    /// Login MFA challenge — when an account has MFA enabled, signIn returns
+    /// a `mfaChallenge` outcome instead of an authenticated user. Caller
+    /// follows up with `challengeMfa(challengeToken:code:)`.
+    public enum SignInOutcome {
+        case authenticated(SendoraCloudAuthUser)
+        case mfaRequired(challengeToken: String, userId: String)
+    }
+
+    /// Like signIn(), but discriminates the MFA-required path. Use this
+    /// when you support MFA on your end-users.
+    public func signInWithMfaSupport(
+        email: String,
+        password: String,
+        completion: @escaping (Result<SignInOutcome, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            let hadUser: Bool = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.cachedUser != nil
+            }()
+            if hadUser { self.wipeLocalIdentity() }
+
+            let body: [String: Any] = ["email": email, "password": password]
+            let semaphore = DispatchSemaphore(value: 0)
+            self.client.post(path: "/auth-service/login", body: body) { response in
+                if let err = self.parseError(response) {
+                    completion(.failure(err))
+                    semaphore.signal()
+                    return
+                }
+                guard let data = response?["data"] as? [String: Any] else {
+                    completion(.failure(.unknown("Malformed response")))
+                    semaphore.signal()
+                    return
+                }
+                if let mfaRequired = data["mfaRequired"] as? Bool,
+                   mfaRequired,
+                   let challengeToken = data["mfaChallengeToken"] as? String {
+                    let userDict = data["user"] as? [String: Any]
+                    let userId = (userDict?["id"] as? String) ?? ""
+                    completion(.success(.mfaRequired(challengeToken: challengeToken, userId: userId)))
+                    semaphore.signal()
+                    return
+                }
+                guard let user = self.parseSuccess(response),
+                      let tokens = self.parseTokens(response) else {
+                    completion(.failure(.unknown("Malformed response")))
+                    semaphore.signal()
+                    return
+                }
+                self.persist(user: user, tokens: tokens)
+                completion(.success(.authenticated(user)))
+                semaphore.signal()
+            }
+            semaphore.wait()
+        }
+    }
+
+    /// Exchange the `mfaChallengeToken` from `signInWithMfaSupport` + a
+    /// 6-digit TOTP code (or a 17-char recovery code) for a real session.
+    public func challengeMfa(
+        challengeToken: String,
+        code: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            let body: [String: Any] = ["challengeToken": challengeToken, "code": code]
+            self.callAuthSync(path: "/auth-service/mfa/challenge", body: body, completion: completion)
+        }
+    }
+
+    // MARK: - Magic link
+
+    /// Send a magic-link email. Always resolves successfully regardless
+    /// of whether the email matches a known user.
+    public func sendMagicLink(
+        email: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/magic-link/request", body: ["email": email]) { response in
+            if let err = self.parseError(response) {
+                completion(.failure(err))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
+    /// Consume a magic-link token (extracted from the deep-link the user
+    /// tapped) and mint a session.
+    public func verifyMagicLink(
+        token: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            let hadUser: Bool = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.cachedUser != nil
+            }()
+            if hadUser { self.wipeLocalIdentity() }
+            self.callAuthSync(path: "/auth-service/magic-link/verify", body: ["token": token], completion: completion)
+        }
+    }
+
+    // MARK: - Email OTP (6-digit cross-device code)
+
+    /// Send a 6-digit email OTP. Always resolves successfully
+    /// regardless of whether the email matches a known user.
+    public func sendEmailOtp(
+        email: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/email-otp/request", body: ["email": email]) { response in
+            if let err = self.parseError(response) {
+                completion(.failure(err))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
+    /// Verify a typed 6-digit code + the email it was sent to.
+    public func verifyEmailOtp(
+        email: String,
+        code: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            let hadUser: Bool = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.cachedUser != nil
+            }()
+            if hadUser { self.wipeLocalIdentity() }
+            self.callAuthSync(path: "/auth-service/email-otp/verify", body: ["email": email, "code": code], completion: completion)
+        }
+    }
+
+    // MARK: - MFA enrollment management (Bearer-authenticated)
+
+    public struct MfaEnrollment {
+        public let secret: String
+        public let otpauthUrl: String
+        public let recoveryCodes: [String]
+    }
+
+    /// Begin MFA enrollment. Returns the otpauth:// URL + 8 recovery
+    /// codes — shown ONCE.
+    public func enrollMfa(completion: @escaping (Result<MfaEnrollment, SendoraCloudAuthError>) -> Void) {
+        bearerCall(path: "/auth-service/mfa/enroll/start", body: [:]) { response in
+            guard let data = response?["data"] as? [String: Any],
+                  let secret = data["secret"] as? String,
+                  let url = data["otpauthUrl"] as? String,
+                  let codes = data["recoveryCodes"] as? [String] else {
+                completion(.failure(.unknown("Malformed enrollment response")))
+                return
+            }
+            completion(.success(MfaEnrollment(secret: secret, otpauthUrl: url, recoveryCodes: codes)))
+        }
+    }
+
+    public func confirmMfa(code: String, completion: @escaping (Result<Bool, SendoraCloudAuthError>) -> Void) {
+        bearerCall(path: "/auth-service/mfa/enroll/confirm", body: ["code": code]) { response in
+            let confirmed = (response?["data"] as? [String: Any])?["confirmed"] as? Bool ?? false
+            completion(.success(confirmed))
+        }
+    }
+
+    public func disableMfa(completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        bearerCall(path: "/auth-service/mfa/disable", body: [:]) { _ in completion(.success(())) }
+    }
+
+    // MARK: - Device sessions self-service
+
+    public struct DeviceSession {
+        public let id: String
+        public let deviceInfo: String?
+        public let lastUsedAt: String?
+        public let createdAt: String
+    }
+
+    public func listMySessions(completion: @escaping ([DeviceSession]) -> Void) {
+        guard let headers = bearerHeaders() else { completion([]); return }
+        client.get(path: "/auth-service/sessions/me", headers: headers) { response in
+            guard let arr = response?["data"] as? [[String: Any]] else { completion([]); return }
+            completion(arr.compactMap { row in
+                guard let id = row["id"] as? String, !id.isEmpty,
+                      let createdAt = row["createdAt"] as? String else { return nil }
+                return DeviceSession(
+                    id: id,
+                    deviceInfo: row["deviceInfo"] as? String,
+                    lastUsedAt: row["lastUsedAt"] as? String,
+                    createdAt: createdAt
+                )
+            })
+        }
+    }
+
+    public func revokeSession(sessionId: String, completion: @escaping () -> Void) {
+        guard let headers = bearerHeaders() else { completion(); return }
+        client.delete(path: "/auth-service/sessions/me/\(sessionId)", headers: headers) { _ in completion() }
+    }
+
+    public func revokeAllSessions(completion: @escaping () -> Void) {
+        guard let headers = bearerHeaders() else { completion(); return }
+        client.delete(path: "/auth-service/sessions/me", headers: headers) { _ in completion() }
+    }
+
+    // MARK: - Internals (Bearer)
+
+    /// Internal helper used by passkey + SSO flows. Parses the
+    /// standard `{ data: { user, tokens } }` envelope and persists.
+    /// Returns the user on success, nil on malformed payload.
+    func persistFromAuthResponse(_ response: [String: Any]?) -> SendoraCloudAuthUser? {
+        guard let user = parseSuccess(response),
+              let tokens = parseTokens(response) else {
+            return nil
+        }
+        persist(user: user, tokens: tokens)
+        return user
+    }
+
+    /// Build the Authorization header for end-user-authenticated routes.
+    /// Returns nil when no current session — callers bail.
+    func bearerHeaders() -> [String: String]? {
+        guard let token = storage.authAccessToken else { return nil }
+        return ["Authorization": "Bearer \(token)"]
+    }
+
+    private func bearerCall(
+        path: String,
+        body: [String: Any],
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
+        guard let headers = bearerHeaders() else {
+            completion(nil)
+            return
+        }
+        client.post(path: path, body: body, headers: headers, completion: completion)
+    }
+
     public func signOut(completion: @escaping () -> Void) {
         opsQueue.async {
             // Wipe FIRST so the user is logged out on device even if

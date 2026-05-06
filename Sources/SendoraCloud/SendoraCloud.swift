@@ -52,6 +52,16 @@ public final class SendoraCloud {
     /// Access as `SendoraCloud.auth?.signInAnonymously { ... }`.
     public private(set) static var auth: SendoraCloudAuth?
 
+    /// Native passkey flows (iOS only — gated on UIKit). Wired
+    /// alongside `auth` on configure(). Use as
+    /// `SendoraCloud.passkeys?.register(presentingWindow: window) { ... }`.
+    #if canImport(UIKit)
+    public private(set) static var passkeys: SendoraCloudPasskeys?
+    /// OIDC SSO via ASWebAuthenticationSession (iOS only). Use as
+    /// `SendoraCloud.sso?.signInWithOidc(returnTo:from:completion:)`.
+    public private(set) static var sso: SendoraCloudSso?
+    #endif
+
     // MARK: - Public API
 
     /// Initialize the SDK. Must be called before any other method. Non-throwing
@@ -141,6 +151,17 @@ public final class SendoraCloud {
                     self.eventQueue?.dropAll()
                 }
             )
+
+            // Wire passkeys against the same client + auth instance so
+            // the WebAuthn flows can read the bearer token + share the
+            // network stack. iOS only — UIKit gate keeps this clean
+            // for the macOS slice of the package.
+            #if canImport(UIKit)
+            if let auth = self.auth {
+                self.passkeys = SendoraCloudPasskeys(client: client, auth: auth)
+                self.sso = SendoraCloudSso(client: client, auth: auth)
+            }
+            #endif
 
             self.isConfigured = true
         }
@@ -269,7 +290,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "2.2.0"],
+                "sdk": ["name": "sendora-ios", "version": "2.4.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],
