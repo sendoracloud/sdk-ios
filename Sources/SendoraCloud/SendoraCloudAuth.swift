@@ -279,6 +279,114 @@ public final class SendoraCloudAuth {
         }
     }
 
+    // MARK: - Social sign-in (8 providers)
+
+    /// Verify an IdP-issued credential and mint a Sendora session.
+    /// Customer's app handles the IdP dance — typically via
+    /// ASAuthorization (Apple), ASWebAuthenticationSession (web-based
+    /// providers), or a 3rd-party SDK — then hands the result here.
+    ///
+    /// `provider` is one of: google, github, apple, microsoft,
+    /// linkedin, facebook, twitter, discord. Twitter is rejected
+    /// server-side per OAuth 2.0 verified-email gap.
+    ///
+    /// Pass either `code` + `redirectUri` (authorization-code flow)
+    /// OR `idToken` (Apple-native flow). Apple's first-time prompt
+    /// also yields name fields — pass via `appleFirstName` /
+    /// `appleLastName`. Apple only sends them once.
+    public func loginSocial(
+        provider: String,
+        code: String? = nil,
+        idToken: String? = nil,
+        redirectUri: String? = nil,
+        codeVerifier: String? = nil,
+        appleFirstName: String? = nil,
+        appleLastName: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            let hadUser: Bool = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.cachedUser != nil
+            }()
+            if hadUser { self.wipeLocalIdentity() }
+
+            var body: [String: Any] = ["provider": provider]
+            if let code = code { body["code"] = code }
+            if let idToken = idToken { body["idToken"] = idToken }
+            if let redirectUri = redirectUri { body["redirectUri"] = redirectUri }
+            if let codeVerifier = codeVerifier { body["codeVerifier"] = codeVerifier }
+            if appleFirstName != nil || appleLastName != nil {
+                var name: [String: String] = [:]
+                if let f = appleFirstName { name["firstName"] = f }
+                if let l = appleLastName { name["lastName"] = l }
+                body["appleName"] = name
+            }
+            self.callAuthSync(path: "/auth-service/login/social", body: body, completion: completion)
+        }
+    }
+
+    /// Convenience: Google authorization-code login.
+    public func signInWithGoogle(
+        code: String,
+        redirectUri: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) { loginSocial(provider: "google", code: code, redirectUri: redirectUri, completion: completion) }
+
+    /// Convenience: GitHub authorization-code login.
+    public func signInWithGitHub(
+        code: String,
+        redirectUri: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) { loginSocial(provider: "github", code: code, redirectUri: redirectUri, completion: completion) }
+
+    /// Apple Sign In via native ASAuthorization. Pass the
+    /// `identityToken` from `ASAuthorizationAppleIDCredential`. On
+    /// first sign-in, also pass the user's first + last name from
+    /// `fullName` — Apple won't send them again.
+    public func signInWithApple(
+        idToken: String,
+        firstName: String? = nil,
+        lastName: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        loginSocial(
+            provider: "apple",
+            idToken: idToken,
+            appleFirstName: firstName,
+            appleLastName: lastName,
+            completion: completion
+        )
+    }
+
+    /// Convenience: Microsoft Azure AD authorization-code login.
+    public func signInWithMicrosoft(
+        code: String,
+        redirectUri: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) { loginSocial(provider: "microsoft", code: code, redirectUri: redirectUri, completion: completion) }
+
+    /// Convenience: LinkedIn (Sign In with LinkedIn using OpenID Connect).
+    public func signInWithLinkedIn(
+        code: String,
+        redirectUri: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) { loginSocial(provider: "linkedin", code: code, redirectUri: redirectUri, completion: completion) }
+
+    /// Convenience: Facebook Graph login. Refuses if email permission not granted.
+    public func signInWithFacebook(
+        code: String,
+        redirectUri: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) { loginSocial(provider: "facebook", code: code, redirectUri: redirectUri, completion: completion) }
+
+    /// Convenience: Discord OAuth2. Refuses if account email not verified.
+    public func signInWithDiscord(
+        code: String,
+        redirectUri: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) { loginSocial(provider: "discord", code: code, redirectUri: redirectUri, completion: completion) }
+
     /// Consume a magic-link token (extracted from the deep-link the user
     /// tapped) and mint a session.
     public func verifyMagicLink(
