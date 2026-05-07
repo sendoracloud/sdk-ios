@@ -3,7 +3,12 @@ import Foundation
 /// Configuration for the SendoraCloud SDK.
 public struct SendoraCloudConfig {
     public let apiKey: String
-    public let projectId: String
+    /// Project UUID. Optional as of 3.0.0 — when omitted, the
+    /// backend derives project + org + environment from the API
+    /// key row server-side (matches sdk-web 2.7.0 behaviour).
+    /// Pre-3.0.0 callers passing a value still work; the field is
+    /// surfaced on every event payload for backwards compatibility.
+    public let projectId: String?
     public var apiBaseUrl: String
     public var flushInterval: TimeInterval
     public var flushAt: Int
@@ -30,7 +35,7 @@ public struct SendoraCloudConfig {
 
     public init(
         apiKey: String,
-        projectId: String,
+        projectId: String? = nil,
         apiBaseUrl: String = "https://api.sendoracloud.com",
         flushInterval: TimeInterval = 30,
         flushAt: Int = 20,

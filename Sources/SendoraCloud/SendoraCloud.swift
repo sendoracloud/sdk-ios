@@ -66,11 +66,14 @@ public final class SendoraCloud {
 
     /// Initialize the SDK. Must be called before any other method. Non-throwing
     /// for backwards compatibility — validation errors log and abort configure.
-    public static func configure(apiKey: String, projectId: String, options: SendoraCloudConfig? = nil) {
+    /// 3.0.0: `projectId` is now optional. When omitted, the backend
+    /// derives project + org + environment from the API key row.
+    /// Existing callers passing a value continue to work unchanged.
+    public static func configure(apiKey: String, projectId: String? = nil, options: SendoraCloudConfig? = nil) {
         let cfg = options ?? SendoraCloudConfig(apiKey: apiKey, projectId: projectId)
         let finalConfig = SendoraCloudConfig(
             apiKey: cfg.apiKey.isEmpty ? apiKey : cfg.apiKey,
-            projectId: cfg.projectId.isEmpty ? projectId : cfg.projectId,
+            projectId: cfg.projectId ?? projectId,
             apiBaseUrl: cfg.apiBaseUrl,
             flushInterval: cfg.flushInterval,
             flushAt: cfg.flushAt,
@@ -290,7 +293,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "2.5.0"],
+                "sdk": ["name": "sendora-ios", "version": "3.0.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],
