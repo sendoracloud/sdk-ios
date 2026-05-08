@@ -62,6 +62,16 @@ public final class SendoraCloud {
     public private(set) static var sso: SendoraCloudSso?
     #endif
 
+    /// iOS Live Activities helper (iOS 16.1+, ActivityKit). Wired on
+    /// configure(). Use as `SendoraCloud.liveActivities?.track(activity:...)`.
+    #if canImport(ActivityKit)
+    @available(iOS 16.1, *)
+    public static var liveActivities: SendoraCloudLiveActivities? {
+        return _liveActivities as? SendoraCloudLiveActivities
+    }
+    private static var _liveActivities: AnyObject?
+    #endif
+
     // MARK: - Public API
 
     /// Initialize the SDK. Must be called before any other method. Non-throwing
@@ -165,6 +175,15 @@ public final class SendoraCloud {
             if let auth = self.auth {
                 self.passkeys = SendoraCloudPasskeys(client: client, auth: auth)
                 self.sso = SendoraCloudSso(client: client, auth: auth)
+            }
+            #endif
+
+            #if canImport(ActivityKit)
+            if #available(iOS 16.1, *) {
+                self._liveActivities = SendoraCloudLiveActivities(
+                    client: client,
+                    configProvider: { return self.config }
+                )
             }
             #endif
 
@@ -315,7 +334,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "3.1.0"],
+                "sdk": ["name": "sendora-ios", "version": "3.2.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],
