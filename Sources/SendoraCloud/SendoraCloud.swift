@@ -81,7 +81,9 @@ public final class SendoraCloud {
             debug: cfg.debug,
             linkHosts: cfg.linkHosts,
             defaultConsent: cfg.defaultConsent,
-            autoStartAttribution: cfg.autoStartAttribution
+            autoStartAttribution: cfg.autoStartAttribution,
+            pinnedSPKIHashes: cfg.pinnedSPKIHashes,
+            autoTrackLifecycle: cfg.autoTrackLifecycle
         )
 
         do {
@@ -190,6 +192,26 @@ public final class SendoraCloud {
         ) { _ in
             eventQueue?.persistToDisk()
             trackSessionEnd()
+            if finalConfig.autoTrackLifecycle {
+                trackEvent("app.backgrounded", properties: [
+                    "sessionId": storage?.sessionId ?? ""
+                ])
+            }
+        }
+        if finalConfig.autoTrackLifecycle {
+            // app.opened fires once per `configure` (per-launch). Mirrors
+            // Firebase's `app_open` auto-event.
+            trackEvent("app.opened", properties: [
+                "sessionId": storage?.sessionId ?? ""
+            ])
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil, queue: .main
+            ) { _ in
+                trackEvent("app.foregrounded", properties: [
+                    "sessionId": storage?.sessionId ?? ""
+                ])
+            }
         }
         #endif
     }
@@ -293,7 +315,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "3.0.0"],
+                "sdk": ["name": "sendora-ios", "version": "3.1.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],

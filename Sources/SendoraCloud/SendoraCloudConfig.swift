@@ -32,6 +32,13 @@ public struct SendoraCloudConfig {
     /// base64`. Always include at least one backup pin. Default: empty
     /// (system trust only).
     public var pinnedSPKIHashes: [String]
+    /// Auto-collect lifecycle events. Mirrors Firebase Analytics' auto-collected
+    /// surface: `app.opened` (per launch), `app.foregrounded` /
+    /// `app.backgrounded` (UIApplication state transitions), `session.start` /
+    /// `session.end` (launch-bounded session). Default: `true`. Set to
+    /// `false` to opt out — useful when the host app already wires its
+    /// own lifecycle telemetry.
+    public var autoTrackLifecycle: Bool
 
     public init(
         apiKey: String,
@@ -44,7 +51,8 @@ public struct SendoraCloudConfig {
         linkHosts: [String] = ["go.sendoracloud.com", "sendoracloud.com"],
         defaultConsent: Bool = false,
         autoStartAttribution: Bool = true,
-        pinnedSPKIHashes: [String] = []
+        pinnedSPKIHashes: [String] = [],
+        autoTrackLifecycle: Bool = true
     ) {
         self.apiKey = apiKey
         self.projectId = projectId
@@ -57,6 +65,7 @@ public struct SendoraCloudConfig {
         self.defaultConsent = defaultConsent
         self.autoStartAttribution = autoStartAttribution
         self.pinnedSPKIHashes = pinnedSPKIHashes
+        self.autoTrackLifecycle = autoTrackLifecycle
     }
 }
 
