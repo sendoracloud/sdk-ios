@@ -40,7 +40,7 @@ public final class SendoraCloud {
     private static var eventQueue: EventQueue?
     private static var deviceContext: DeviceContext?
     private static var fingerprintHash: String?
-    private static var currentUserId: String?
+    internal static var currentUserId: String?
     private static var currentIdentityToken: String?
     private static var isConfigured = false
 
@@ -210,6 +210,8 @@ public final class SendoraCloud {
                 )
             }
             #endif
+
+            self._push = SendoraCloudPush(client: client)
 
             self.isConfigured = true
         }

@@ -66,6 +66,11 @@ final class APIClient: NSObject, URLSessionDelegate {
         request(method: "GET", path: path, body: nil, headers: headers, completion: completion)
     }
 
+    /// Convenience GET without extra headers — most read paths use this.
+    func get(path: String, completion: @escaping ([String: Any]?) -> Void) {
+        request(method: "GET", path: path, body: nil, headers: nil, completion: completion)
+    }
+
     func delete(path: String, headers: [String: String]?, completion: @escaping ([String: Any]?) -> Void) {
         request(method: "DELETE", path: path, body: nil, headers: headers, completion: completion)
     }
