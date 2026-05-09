@@ -72,6 +72,19 @@ public final class SendoraCloud {
     private static var _liveActivities: AnyObject?
     #endif
 
+    /// Server-managed geofences (CLLocationManager region monitoring).
+    /// Wired on configure(). Operator manages geofences in the dashboard;
+    /// SDK auto-fetches + registers up to iOS cap of 20 regions.
+    /// Use as `SendoraCloud.geofences?.start()` after asking for
+    /// `requestAlwaysAuthorization()`.
+    #if canImport(CoreLocation)
+    @available(iOS 13.0, *)
+    public static var geofences: SendoraCloudGeofences? {
+        return _geofences as? SendoraCloudGeofences
+    }
+    private static var _geofences: AnyObject?
+    #endif
+
     // MARK: - Public API
 
     /// Initialize the SDK. Must be called before any other method. Non-throwing
@@ -183,6 +196,17 @@ public final class SendoraCloud {
                 self._liveActivities = SendoraCloudLiveActivities(
                     client: client,
                     configProvider: { return self.config }
+                )
+            }
+            #endif
+
+            #if canImport(CoreLocation)
+            if #available(iOS 13.0, *) {
+                self._geofences = SendoraCloudGeofences(
+                    client: client,
+                    configProvider: { return self.config },
+                    userIdProvider: { return self.currentUserId },
+                    anonIdProvider: { return self.storage?.deviceId }
                 )
             }
             #endif
@@ -334,7 +358,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "3.3.0"],
+                "sdk": ["name": "sendora-ios", "version": "3.4.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],
