@@ -667,6 +667,18 @@ public final class SendoraCloudAuth {
             self.client.post(path: "/auth-service/token/refresh",
                              body: ["refreshToken": refresh]) { [weak self] response in
                 guard let self = self else { return }
+                // s58.46 — stored token is dead. Wipe local identity
+                // so the next op doesn't loop on the same refresh
+                // value. Pre-s58.46 we silently returned nil and the
+                // host app re-tried indefinitely (Pulse News iOS hit
+                // /refresh ~1×/s for hours).
+                if let error = response?["error"] as? [String: Any],
+                   let code = error["code"] as? String,
+                   Self.isDeadRefreshError(code) {
+                    self.wipeLocalIdentity()
+                    self.completeRefresh(token: nil)
+                    return
+                }
                 guard let data = response?["data"] as? [String: Any],
                       let accessToken = data["accessToken"] as? String,
                       !accessToken.isEmpty,
@@ -771,5 +783,19 @@ public final class SendoraCloudAuth {
         lock.unlock()
         storage.clearAuthTokens()
         onAnonymousWipe()
+    }
+
+    /// Backend error codes on /token/refresh that mean the stored
+    /// refresh token is permanently dead — SDK must wipe local
+    /// identity + stop retrying. INVALID_REFRESH_TOKEN is the s58.46
+    /// canonical code; UNAUTHORIZED / HTTP_401 cover older backend
+    /// builds; RATE_LIMIT means the per-IP back-off tripped — also a
+    /// sign the loop has run amok.
+    private static func isDeadRefreshError(_ code: String) -> Bool {
+        return code == "INVALID_REFRESH_TOKEN"
+            || code == "UNAUTHORIZED"
+            || code == "HTTP_401"
+            || code == "RATE_LIMIT_EXCEEDED"
+            || code == "RATE_LIMIT"
     }
 }
