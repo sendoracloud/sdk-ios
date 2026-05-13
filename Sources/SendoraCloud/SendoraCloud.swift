@@ -213,6 +213,10 @@ public final class SendoraCloud {
 
             self._push = SendoraCloudPush(client: client)
 
+            // Deep-link surface — share-link creation, warm Universal Link
+            // resolution, deferred-install fingerprint match.
+            self._links = SendoraCloudLinks(client: client, bundleId: Bundle.main.bundleIdentifier)
+
             self.isConfigured = true
         }
 
@@ -360,7 +364,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "3.4.0"],
+                "sdk": ["name": "sendora-ios", "version": "3.8.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],
