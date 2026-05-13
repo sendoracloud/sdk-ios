@@ -102,17 +102,23 @@ public final class SendoraCloudAuth {
 
     /// Returns a non-expired access token. Triggers a single-flight
     /// refresh if the cached token is past expiry.
+    ///
+    /// s58.47 — when the cached ACCESS token is missing but a refresh
+    /// token is still in the Keychain (cold start after the access
+    /// token's 15-min TTL elapsed, or partial persist), drive a
+    /// refresh instead of returning nil. Pre-s58.47 we bailed
+    /// immediately, which left the host app reading nil and
+    /// triggering a fresh anonymous mint on every cold launch.
     public func getAccessToken(completion: @escaping (String?) -> Void) {
-        guard let token = storage.authAccessToken else {
-            completion(nil)
-            return
-        }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         let exp = cachedExpiresAt
-        if exp > 0 && nowMs < exp - refreshSafetyMs {
+        if let token = storage.authAccessToken, exp > 0, nowMs < exp - refreshSafetyMs {
             completion(token)
             return
         }
+        // Either no access token at all, or it's past (expiry - safety).
+        // refreshAccessToken handles both: it short-circuits when no
+        // refresh token is in storage either, returning nil.
         refreshAccessToken(completion: completion)
     }
 
