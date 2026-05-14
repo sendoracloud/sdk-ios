@@ -127,6 +127,78 @@ final class APIClient: NSObject, URLSessionDelegate {
         task.resume()
     }
 
+    /// Rich response for callers that need HTTP status + the typed
+    /// `error.code` / `error.message` envelope fields (used by the Links
+    /// surface to map backend errors into typed `LinkError` cases instead
+    /// of swallowing them as `nil`). Independent of the circuit breaker
+    /// for HTTP-level rejections — backend 4xx is a logical error from
+    /// the caller's perspective, not a transport failure, so it doesn't
+    /// flip the breaker.
+    struct RichResponse {
+        let statusCode: Int
+        let body: [String: Any]?
+        let errorCode: String?
+        let errorMessage: String?
+    }
+
+    func requestWithDetails(
+        method: String,
+        path: String,
+        body: [String: Any]?,
+        completion: @escaping (RichResponse) -> Void
+    ) {
+        if shouldSkip() {
+            completion(RichResponse(statusCode: 0, body: nil, errorCode: "NETWORK", errorMessage: "Circuit breaker open — too many recent failures"))
+            return
+        }
+
+        guard let url = URL(string: "\(baseUrl)/api/v1\(path)"),
+              url.scheme == "https" || url.host == "localhost" || url.host == "127.0.0.1" else {
+            SendoraCloudLogger.shared.error("APIClient refusing non-HTTPS URL")
+            completion(RichResponse(statusCode: 0, body: nil, errorCode: "NETWORK", errorMessage: "Non-HTTPS URL refused"))
+            return
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+
+        if let body = body {
+            do {
+                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            } catch {
+                completion(RichResponse(statusCode: 0, body: nil, errorCode: "INVALID_INPUT", errorMessage: "Body serialization failed"))
+                return
+            }
+        }
+
+        let task = session.dataTask(with: req) { [weak self] data, response, _ in
+            guard let self = self else { return }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            var parsed: [String: Any]?
+            if let data = data {
+                parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            }
+            if (200..<300).contains(status) {
+                self.recordSuccess()
+                completion(RichResponse(statusCode: status, body: parsed, errorCode: nil, errorMessage: nil))
+                return
+            }
+            if status == 0 {
+                self.recordFailure()
+            }
+            let err = parsed?["error"] as? [String: Any]
+            completion(RichResponse(
+                statusCode: status,
+                body: parsed,
+                errorCode: err?["code"] as? String,
+                errorMessage: err?["message"] as? String
+            ))
+        }
+        task.resume()
+    }
+
     func postBatch(path: String, events: [[String: Any]], completion: @escaping (Bool) -> Void) {
         post(path: path, body: ["events": events]) { response in
             let success = (response?["success"] as? Bool) ?? false
