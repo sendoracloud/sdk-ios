@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Auth Service surface for the iOS SDK.
 ///
@@ -666,10 +669,31 @@ public final class SendoraCloudAuth {
             self.isRefreshing = true
             self.lock.unlock()
 
+            // s58.73: re-read the stored refresh token at firing time
+            // (NOT at completion enqueue). If a sibling task (background
+            // push handler, deferred deep-link cold-start) rotated the
+            // token while this call was queued, we get the fresh value
+            // and dodge the backend's reuse-detection grace race.
             guard let refresh = self.storage.authRefreshToken else {
                 self.completeRefresh(token: nil)
                 return
             }
+
+            // Short-circuit: if we have a fresh access token in storage
+            // already (sibling rotated successfully + populated it
+            // before we acquired isRefreshing), return it directly.
+            // Saves a redundant /refresh round-trip.
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            if let stashedAccess = self.storage.authAccessToken,
+               !stashedAccess.isEmpty,
+               self.storage.authAccessExpiresAt > nowMs {
+                self.lock.lock()
+                self.cachedExpiresAt = self.storage.authAccessExpiresAt
+                self.lock.unlock()
+                self.completeRefresh(token: stashedAccess)
+                return
+            }
+
             self.client.post(path: "/auth-service/token/refresh",
                              body: ["refreshToken": refresh]) { [weak self] response in
                 guard let self = self else { return }
@@ -703,6 +727,63 @@ public final class SendoraCloudAuth {
                 self.lock.unlock()
                 self.completeRefresh(token: accessToken)
             }
+        }
+    }
+
+    // MARK: - Proactive refresh (s58.73)
+
+    /// Background timer + UIApplication.didBecomeActive observer that
+    /// triggers a refresh when the access token enters the last 20%
+    /// of its TTL ± 30s jitter. Refresh becomes a scheduled event,
+    /// never a 401-driven race. Started on persist(), stopped on
+    /// wipeLocalIdentity().
+    private var proactiveTimer: Timer?
+    private var proactiveAppActiveObserver: NSObjectProtocol?
+
+    fileprivate func startProactiveRefreshCron() {
+        guard proactiveTimer == nil else { return }
+        let tick: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            guard let _ = self.storage.authAccessToken else { return }
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let expMs = self.storage.authAccessExpiresAt
+            let remainingMs = expMs - nowMs
+            if remainingMs <= 0 { return }
+            // Assume 15-min default access-TTL when we can't observe the
+            // originally-issued lifetime; pad with jitter so multiple
+            // app instances on the same network don't synchronize the
+            // refresh herd.
+            let guessOriginalMs: Int64 = max(remainingMs, 5 * 60 * 1000)
+            let jitter = Int64.random(in: -30_000...30_000)
+            let fireWhenRemainingMs = Int64(Double(guessOriginalMs) * 0.2) + jitter
+            if remainingMs <= fireWhenRemainingMs {
+                self.refreshAccessToken { _ in }
+            }
+        }
+        // Fire immediately on start in case the app launched with a
+        // near-expired token.
+        tick()
+        // Then every 60s.
+        let t = Timer(timeInterval: 60.0, repeats: true) { _ in tick() }
+        RunLoop.main.add(t, forMode: .common)
+        self.proactiveTimer = t
+
+        // Also tick when the app comes back to foreground.
+        #if canImport(UIKit)
+        self.proactiveAppActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in tick() }
+        #endif
+    }
+
+    fileprivate func stopProactiveRefreshCron() {
+        proactiveTimer?.invalidate()
+        proactiveTimer = nil
+        if let obs = proactiveAppActiveObserver {
+            NotificationCenter.default.removeObserver(obs)
+            proactiveAppActiveObserver = nil
         }
     }
 
@@ -780,6 +861,7 @@ public final class SendoraCloudAuth {
             storage.authUserJson = str
         }
         onIdentityChange(user.id)
+        startProactiveRefreshCron()
     }
 
     private func wipeLocalIdentity() {
@@ -788,6 +870,7 @@ public final class SendoraCloudAuth {
         cachedExpiresAt = 0
         lock.unlock()
         storage.clearAuthTokens()
+        stopProactiveRefreshCron()
         onAnonymousWipe()
     }
 
