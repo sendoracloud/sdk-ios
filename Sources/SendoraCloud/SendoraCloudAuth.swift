@@ -187,15 +187,23 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
-            // Wipe BEFORE the network call so any track() during the
-            // auth round-trip can't attach to the prior identity.
-            let hadUser: Bool = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser != nil
-            }()
+            // Device-takeover (backend s58.111): if this device holds
+            // an anonymous session, forward its refresh token to
+            // /login so the backend revokes the anon session,
+            // reassigns this device's push tokens to the identified
+            // user, and deletes the anon user row. One device → one
+            // user_id on the platform side. Read BEFORE wipe.
+            var prevAnonRefreshToken: String? = nil
+            self.lock.lock()
+            let hadUser = self.cachedUser != nil
+            let isAnon = self.cachedUser?.isAnonymous == true
+            self.lock.unlock()
+            if isAnon { prevAnonRefreshToken = self.storage.authRefreshToken }
+
             if hadUser { self.wipeLocalIdentity() }
 
-            let body: [String: Any] = ["email": email, "password": password]
+            var body: [String: Any] = ["email": email, "password": password]
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
             self.callAuthSync(path: "/auth-service/login", body: body, completion: completion)
         }
     }
