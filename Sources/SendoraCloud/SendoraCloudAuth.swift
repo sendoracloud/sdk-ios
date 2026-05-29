@@ -322,10 +322,14 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
-            let hadUser: Bool = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser != nil
-            }()
+            // Device-takeover hint — same posture as signIn().
+            var prevAnonRefreshToken: String? = nil
+            self.lock.lock()
+            let hadUser = self.cachedUser != nil
+            let isAnon = self.cachedUser?.isAnonymous == true
+            self.lock.unlock()
+            if isAnon { prevAnonRefreshToken = self.storage.authRefreshToken }
+
             if hadUser { self.wipeLocalIdentity() }
 
             var body: [String: Any] = ["provider": provider]
@@ -339,6 +343,7 @@ public final class SendoraCloudAuth {
                 if let l = appleLastName { name["lastName"] = l }
                 body["appleName"] = name
             }
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
             self.callAuthSync(path: "/auth-service/login/social", body: body, completion: completion)
         }
     }
