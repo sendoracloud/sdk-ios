@@ -123,6 +123,11 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
             completion(.failure(.missingTokenInCallback))
             return
         }
+        // s58.116 — backend appends sendora_retired_anon=<uuid> to
+        // the callback fragment when an anon row got retired during
+        // the OIDC callback. Surface it through persistFromAuthResponse
+        // so the inline onDeviceTakeover listener fires.
+        let retiredAnonUserId = params["sendora_retired_anon"]?.removingPercentEncoding
 
         // Phase 4 — swap refresh token for a session via the standard
         // refresh path. SendoraCloudAuth has the persistence + identity
@@ -150,17 +155,21 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
                 "name": NSNull(),
                 "isAnonymous": false,
             ]
+            var data: [String: Any] = [
+                "user": synthesisedUser,
+                "tokens": [
+                    "accessToken": accessToken,
+                    "refreshToken": newRefresh,
+                    "expiresIn": expiresIn,
+                    "tokenType": "Bearer",
+                ],
+            ]
+            if let retired = retiredAnonUserId, !retired.isEmpty {
+                data["retiredAnonUserId"] = retired
+            }
             let synthesisedEnvelope: [String: Any] = [
                 "success": true,
-                "data": [
-                    "user": synthesisedUser,
-                    "tokens": [
-                        "accessToken": accessToken,
-                        "refreshToken": newRefresh,
-                        "expiresIn": expiresIn,
-                        "tokenType": "Bearer",
-                    ],
-                ],
+                "data": data,
             ]
             if let user = self.auth.persistFromAuthResponse(synthesisedEnvelope) {
                 completion(.success(user))

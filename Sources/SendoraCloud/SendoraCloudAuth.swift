@@ -50,6 +50,18 @@ public enum SendoraCloudAuthError: Error {
     case unknown(String)
 }
 
+/// Detail handed to onDeviceTakeover subscribers. Fires once per
+/// signin call where the backend retired an anonymous user_id
+/// (anon → identified flip on the same device, s58.111+). The
+/// host app's only job is to delete the matching row from any
+/// local mirror table so audience queries joining on user_id
+/// stop matching the stale anon row.
+public struct DeviceTakeoverEvent {
+    public let retiredAnonUserId: String
+    public let identifiedUserId: String
+    public let at: Date
+}
+
 public final class SendoraCloudAuth {
     private let client: APIClient
     private let storage: SendoraStorage
@@ -65,6 +77,10 @@ public final class SendoraCloudAuth {
     private var refreshInFlight: [(String?) -> Void] = []
     private var isRefreshing = false
     private let refreshSafetyMs: Int64 = 30_000
+    /// Inline device-takeover listeners. UUID-keyed so callers can
+    /// unsubscribe via the returned closure. Lock-protected.
+    private var takeoverListeners: [UUID: (DeviceTakeoverEvent) -> Void] = [:]
+    private var lastTakeover: DeviceTakeoverEvent?
 
     init(
         client: APIClient,
@@ -259,6 +275,10 @@ public final class SendoraCloudAuth {
                     return
                 }
                 self.persist(user: user, tokens: tokens)
+                if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
+                   !retired.isEmpty {
+                    self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
+                }
                 completion(.success(.authenticated(user)))
                 semaphore.signal()
             }
@@ -275,6 +295,67 @@ public final class SendoraCloudAuth {
         self.lock.lock(); defer { self.lock.unlock() }
         guard cachedUser?.isAnonymous == true else { return nil }
         return self.storage.authRefreshToken
+    }
+
+    // MARK: - Device-takeover listener (s58.116 parity with RN 1.0.5)
+
+    /// Register a callback fired when the backend retires an anon
+    /// `user_id` during a signin on this device. Use it to delete
+    /// the matching row from any local mirror table — Sendora's own
+    /// `auth_service_users` + `push_tokens` are already cleaned up
+    /// server-side. Returns an unsubscribe closure.
+    ///
+    /// Listeners fire on every identified-signin path:
+    /// signIn / loginSocial / verifyMagicLink / verifyEmailOtp /
+    /// challengeMfa / passkey authenticate / OIDC SSO callback.
+    /// Local-only — survives webhook receiver downtime. For
+    /// server-pipeline cleanup also subscribe `auth.device_takeover`
+    /// webhook.
+    @discardableResult
+    public func onDeviceTakeover(_ listener: @escaping (DeviceTakeoverEvent) -> Void) -> () -> Void {
+        let key = UUID()
+        lock.lock()
+        takeoverListeners[key] = listener
+        lock.unlock()
+        return { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock(); defer { self.lock.unlock() }
+            self.takeoverListeners.removeValue(forKey: key)
+        }
+    }
+
+    /// Returns the most recent takeover the SDK observed in this
+    /// session, or nil if none. Lets late subscribers pick up the
+    /// takeover their handler missed.
+    public func getLastDeviceTakeover() -> DeviceTakeoverEvent? {
+        lock.lock(); defer { lock.unlock() }
+        return lastTakeover
+    }
+
+    /// Internal — called from every identified-signin path with the
+    /// `retiredAnonUserId` parsed off the backend response (or off
+    /// the SSO redirect fragment). Snapshot + dispatch outside the
+    /// lock so a listener can't deadlock by re-entering the auth
+    /// surface.
+    ///
+    /// Validates UUID shape before firing. The value comes from a
+    /// URL fragment / response body that a MitM could tamper; a
+    /// non-UUID value handed to a listener that interpolates it
+    /// into a path (the documented pattern) becomes a
+    /// path-injection sink in the host app.
+    func fireDeviceTakeover(retiredAnonUserId: String, identifiedUserId: String) {
+        guard Self.isCanonicalUuid(retiredAnonUserId) else { return }
+        let evt = DeviceTakeoverEvent(
+            retiredAnonUserId: retiredAnonUserId,
+            identifiedUserId: identifiedUserId,
+            at: Date()
+        )
+        let snapshot: [(DeviceTakeoverEvent) -> Void] = {
+            lock.lock(); defer { lock.unlock() }
+            lastTakeover = evt
+            return Array(takeoverListeners.values)
+        }()
+        for fn in snapshot { fn(evt) }
     }
 
     /// Exchange the `mfaChallengeToken` from `signInWithMfaSupport` + a
@@ -612,13 +693,19 @@ public final class SendoraCloudAuth {
 
     /// Internal helper used by passkey + SSO flows. Parses the
     /// standard `{ data: { user, tokens } }` envelope and persists.
-    /// Returns the user on success, nil on malformed payload.
+    /// Returns the user on success, nil on malformed payload. Fires
+    /// the device-takeover listener when `data.retiredAnonUserId`
+    /// is present.
     func persistFromAuthResponse(_ response: [String: Any]?) -> SendoraCloudAuthUser? {
         guard let user = parseSuccess(response),
               let tokens = parseTokens(response) else {
             return nil
         }
         persist(user: user, tokens: tokens)
+        if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
+           !retired.isEmpty {
+            fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
+        }
         return user
     }
 
@@ -683,6 +770,10 @@ public final class SendoraCloudAuth {
                 return
             }
             self.persist(user: user, tokens: tokens)
+            if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
+               !retired.isEmpty {
+                self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
+            }
             completion(.success(user))
             semaphore.signal()
         }
@@ -903,6 +994,13 @@ public final class SendoraCloudAuth {
         storage.clearAuthTokens()
         stopProactiveRefreshCron()
         onAnonymousWipe()
+    }
+
+    /// Canonical UUID validator. Defends against tampered
+    /// `sendora_retired_anon` fragment / response values reaching
+    /// host-app listeners as a path-injection sink.
+    private static func isCanonicalUuid(_ s: String) -> Bool {
+        return UUID(uuidString: s) != nil
     }
 
     /// Backend error codes on /token/refresh that mean the stored
