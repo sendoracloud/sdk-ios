@@ -12,13 +12,23 @@ In Xcode → File → Add Package Dependencies → paste:
 https://github.com/sendoracloud/sdk-ios
 ```
 
-Pin to `3.9.0` or newer for the new `SendoraCloud.links` surface (typed errors, prewarm, revoke, getStats, computeDeviceFingerprint).
+Pin to `4.0.0` or newer for unprefixed alias routes (org is resolved
+server-side from the API key — no `orgId` config required).
 
 Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/sendoracloud/sdk-ios", from: "3.9.0"),
+.package(url: "https://github.com/sendoracloud/sdk-ios", from: "4.0.0"),
 ```
+
+### Upgrading from 3.x
+
+4.0.0 aligns with the backend's unprefixed alias routes (s58.104) — the
+backend now resolves the org from the API key server-side. The iOS SDK
+already used unprefixed URLs internally, so no host-app changes are
+required other than bumping the SwiftPM pin. All public method signatures
+(`configure`, `trackEvent`, `identify`, `links.*`, `push.*`, `auth.*`, …)
+are unchanged.
 
 ## Quick start
 
