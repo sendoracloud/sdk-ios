@@ -266,6 +266,17 @@ public final class SendoraCloudAuth {
         }
     }
 
+    /// Returns the stored anon refresh token iff the local subject is
+    /// currently anonymous. Used by every identified-session-mint path
+    /// so the backend can run device-takeover (s58.111 + s58.112).
+    /// Exposed as `internal` so cross-file helpers (e.g. passkey
+    /// assertion) can read it without copying the gating logic.
+    internal func takeoverHint() -> String? {
+        self.lock.lock(); defer { self.lock.unlock() }
+        guard cachedUser?.isAnonymous == true else { return nil }
+        return self.storage.authRefreshToken
+    }
+
     /// Exchange the `mfaChallengeToken` from `signInWithMfaSupport` + a
     /// 6-digit TOTP code (or a 17-char recovery code) for a real session.
     public func challengeMfa(
@@ -274,7 +285,8 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
-            let body: [String: Any] = ["challengeToken": challengeToken, "code": code]
+            var body: [String: Any] = ["challengeToken": challengeToken, "code": code]
+            if let prev = self.takeoverHint() { body["prevAnonRefreshToken"] = prev }
             self.callAuthSync(path: "/auth-service/mfa/challenge", body: body, completion: completion)
         }
     }
@@ -416,12 +428,15 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
+            let prev = self.takeoverHint()
             let hadUser: Bool = {
                 self.lock.lock(); defer { self.lock.unlock() }
                 return self.cachedUser != nil
             }()
             if hadUser { self.wipeLocalIdentity() }
-            self.callAuthSync(path: "/auth-service/magic-link/verify", body: ["token": token], completion: completion)
+            var body: [String: Any] = ["token": token]
+            if let prev = prev { body["prevAnonRefreshToken"] = prev }
+            self.callAuthSync(path: "/auth-service/magic-link/verify", body: body, completion: completion)
         }
     }
 
@@ -449,12 +464,15 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
+            let prev = self.takeoverHint()
             let hadUser: Bool = {
                 self.lock.lock(); defer { self.lock.unlock() }
                 return self.cachedUser != nil
             }()
             if hadUser { self.wipeLocalIdentity() }
-            self.callAuthSync(path: "/auth-service/email-otp/verify", body: ["email": email, "code": code], completion: completion)
+            var body: [String: Any] = ["email": email, "code": code]
+            if let prev = prev { body["prevAnonRefreshToken"] = prev }
+            self.callAuthSync(path: "/auth-service/email-otp/verify", body: body, completion: completion)
         }
     }
 

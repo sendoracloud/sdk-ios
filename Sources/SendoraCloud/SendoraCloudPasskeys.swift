@@ -209,7 +209,7 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
                 self.finishRegister(.success(RegisteredPasskey(id: id, credentialId: credentialId)))
             }
         } else if let cred = authorization.credential as? ASAuthorizationPlatformPublicKeyCredentialAssertion {
-            let body: [String: Any] = [
+            var body: [String: Any] = [
                 "userId": (pendingChallenge?.userId as Any?) ?? NSNull(),
                 "response": [
                     "id": Self.b64urlEncode(cred.credentialID),
@@ -223,6 +223,10 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
                     ],
                 ],
             ]
+            // Device-takeover (s58.112): if the device is currently
+            // signed in anonymously, forward the anon refresh so the
+            // backend retires the anon row + reassigns push tokens.
+            if let prev = auth.takeoverHint() { body["prevAnonRefreshToken"] = prev }
             client.post(path: "/auth-service/passkeys/authenticate/finish", body: body) { [weak self] response in
                 guard let self = self else { return }
                 if let user = self.auth.persistFromAuthResponse(response) {
