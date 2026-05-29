@@ -56,7 +56,12 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
     ) {
         self.presentingWindow = window
         // Phase 1 — get the authorization URL.
-        client.post(path: "/auth-service/sso/oidc/start", body: ["returnTo": returnTo]) { [weak self] response in
+        var startBody: [String: Any] = ["returnTo": returnTo]
+        // Device-takeover (s58.115): forward the anon refresh so the
+        // OIDC callback can retire the anon row + reassign push
+        // tokens after minting the identified session.
+        if let prev = auth.takeoverHint() { startBody["prevAnonRefreshToken"] = prev }
+        client.post(path: "/auth-service/sso/oidc/start", body: startBody) { [weak self] response in
             guard let self = self else { return }
             guard let data = response?["data"] as? [String: Any],
                   let urlString = data["authorizationUrl"] as? String,
