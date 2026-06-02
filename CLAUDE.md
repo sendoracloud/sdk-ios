@@ -166,6 +166,18 @@ DELETE /api/v1/orgs/:orgId/push/live-activities/:id
 - `aps.timestamp` must be monotonic; backend uses `Math.floor(Date.now()/1000)` per send.
 - iOS 17+: APNs can also START activities (not just update). Sendora doesn't surface this yet — host app must start v1.
 
+## Engagement time (Wave 75 — 4.1.0)
+
+`SendoraCloud.trackScreen(_:properties:)` emits `screen.viewed` and flushes the
+previous screen's `app.engagement { durationMs, screen, sessionId }` (foreground
+-only). New `autoTrackEngagement` config flag (default on). `willResignActive`
+flushes + pauses; `didBecomeActive` resumes (the observer is now registered when
+lifecycle OR engagement is on). State guarded by the existing `serialQueue`;
+spans <250ms dropped, >6h clamped, emit happens outside the lock. **No
+UIViewController swizzling** — deliberately, so screen names stay accurate
+(swizzle counts container / nav / tab controllers) and there's zero added crash
+surface. Matches GA4 `engagement_time_msec`; powers `/analytics/engagement`.
+
 ## Publish
 
 `git tag <semver> && git push origin <semver>`. Release via `gh release create`.
