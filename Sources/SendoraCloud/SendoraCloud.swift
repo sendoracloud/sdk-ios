@@ -394,7 +394,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "4.1.0"],
+                "sdk": ["name": "sendora-ios", "version": "4.1.1"],
             ],
             "sessionId": storage?.sessionId ?? "",
             "consent": ["analytics"],

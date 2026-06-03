@@ -1,5 +1,26 @@
 # Changelog
 
+## 4.1.1
+
+**macOS build fix.** `Package.swift` declares `.macOS(.v13)`, but
+`SendoraCloudLiveActivities.swift` guarded ActivityKit usage with only
+`#if canImport(ActivityKit)`. ActivityKit's module *is* importable on macOS, yet
+`Activity` / `ActivityAttributes` are `@available(macOS, unavailable)`, so
+`swift build` on a macOS host failed with "'ActivityAttributes' is unavailable
+in macOS". Both guards now use `#if canImport(ActivityKit) && os(iOS)` (true on
+iOS / iPadOS / Mac Catalyst, where the types are real). No API change; the iOS
+build path is unchanged. Unblocks the Swift Package Index macOS compatibility check.
+
+## 4.1.0
+
+**Engagement-time analytics** (Wave 75). New `SendoraCloud.trackScreen(_:properties:)`
+emits `screen.viewed` and flushes the previous screen's
+`app.engagement { durationMs, screen, sessionId }` (foreground-only). New
+`autoTrackEngagement` config flag (default on); `willResignActive` flushes +
+pauses, `didBecomeActive` resumes. Spans <250ms dropped, >6h clamped. No
+UIViewController swizzling. Matches GA4 `engagement_time_msec`; powers
+`/analytics/engagement`.
+
 ## 4.0.5
 
 **Device-takeover inline listener** (parity with RN 1.0.5).

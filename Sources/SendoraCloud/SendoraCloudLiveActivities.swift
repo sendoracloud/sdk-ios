@@ -1,5 +1,10 @@
 import Foundation
-#if canImport(ActivityKit)
+// ActivityKit's module IS importable on macOS, but `Activity` /
+// `ActivityAttributes` are `@available(macOS, unavailable)`, so a bare
+// `canImport(ActivityKit)` guard still fails to compile on the macOS
+// platform target (Package.swift declares .macOS(.v13)). Gate on
+// `os(iOS)` — true on iOS + iPadOS + Mac Catalyst, where the types are real.
+#if canImport(ActivityKit) && os(iOS)
 import ActivityKit
 #endif
 
@@ -60,7 +65,7 @@ public final class SendoraCloudLiveActivities {
         self.configProvider = configProvider
     }
 
-    #if canImport(ActivityKit)
+    #if canImport(ActivityKit) && os(iOS)
     /// Watch an Activity's push-token stream + register every token rotation
     /// with Sendora's backend. Idempotent — calling twice for the same
     /// activity replaces the prior watcher.
