@@ -84,6 +84,13 @@ public final class SendoraCloudLinks {
         /// **Optional as of 3.9.0** — backend defaults from the project's
         /// apps registry (web origin > iOS App Store URL > Android Play Store URL).
         public var fallbackUrl: String?
+        /// How a **mobile visitor without the app installed** is routed
+        /// (Adjust / Branch parity). `"auto"` (default) opens the app store
+        /// when one is registered for the platform, else the web
+        /// `fallbackUrl`; `"store"` prefers the store; `"web"` forces the web
+        /// `fallbackUrl` even when a store URL exists. `nil` inherits the
+        /// project default. Desktop is always web.
+        public var noAppMode: String?
         public var iosDeepLinkPath: String?
         public var androidDeepLinkPath: String?
         /// Typed linkData. Use `decodeLinkData<T>` on the receiving event
@@ -105,6 +112,7 @@ public final class SendoraCloudLinks {
         public init(
             title: String,
             fallbackUrl: String? = nil,
+            noAppMode: String? = nil,
             iosDeepLinkPath: String? = nil,
             androidDeepLinkPath: String? = nil,
             linkData: [String: Any]? = nil,
@@ -122,6 +130,7 @@ public final class SendoraCloudLinks {
         ) {
             self.title = title
             self.fallbackUrl = fallbackUrl
+            self.noAppMode = noAppMode
             self.iosDeepLinkPath = iosDeepLinkPath
             self.androidDeepLinkPath = androidDeepLinkPath
             self.linkData = linkData
@@ -312,6 +321,7 @@ public final class SendoraCloudLinks {
     private func buildCreateBody(_ input: LinkCreateInput) -> [String: Any] {
         var body: [String: Any] = ["title": input.title]
         if let v = input.fallbackUrl { body["fallbackUrl"] = v }
+        if let v = input.noAppMode { body["noAppMode"] = v }
         if let v = input.iosDeepLinkPath { body["iosDeepLinkPath"] = v }
         if let v = input.androidDeepLinkPath { body["androidDeepLinkPath"] = v }
         if let v = input.linkData { body["linkData"] = v }

@@ -182,6 +182,15 @@ UIViewController swizzling** — deliberately, so screen names stay accurate
 (swizzle counts container / nav / tab controllers) and there's zero added crash
 surface. Matches GA4 `engagement_time_msec`; powers `/analytics/engagement`.
 
+## Deep Links no-app routing mode (s58.208)
+
+`LinkCreateInput` gains an optional `noAppMode: String?` (`"auto"`/`"store"`/`"web"`)
+forwarded as `noAppMode` on `POST /sdk/links`. Controls what a **mobile visitor
+without the app installed** gets: `auto` (default) = store-if-registered-else-web,
+`store` = prefer store, `web` = force the web fallback even when a store URL
+exists. `nil` inherits the project default. Additive + backwards-compatible.
+Desktop is always web.
+
 ## Publish
 
 `git tag <semver> && git push origin <semver>`. Release via `gh release create`.
