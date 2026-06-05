@@ -13,6 +13,10 @@ Sendora.identify(userId:, traits:, options:)
 Sendora.consent.grant() / revoke()
 ```
 
+## MFA-from-anonymous device-takeover (4.1.3)
+
+`signInWithMfaSupport()` must NOT wipe the anon identity before the MFA challenge resolves — else `challengeMfa()`'s `takeoverHint()` reads a cleared `cachedUser` and forwards no `prevAnonRefreshToken`, so the backend never retires the anon row / reassigns push tokens (device ends with two user_ids + duplicate pushes). The fix captures the anon refresh BEFORE any wipe, stashes it in `pendingAnonTakeover` keyed to the `mfaChallengeToken`, and `challengeMfa()` forwards it + wipes **only on a successful mint** (a wrong code preserves the anon session for retry). Mirrors the non-MFA `signIn()` wipe-after-success ordering. Backend `/auth-service/mfa/challenge` already accepts `prevAnonRefreshToken`.
+
 ## Security
 
 - `SendoraValidator` refuses `sk_` keys, non-HTTPS URLs, bad event names, deep props.

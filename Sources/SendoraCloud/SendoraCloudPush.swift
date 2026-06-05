@@ -116,10 +116,14 @@ public final class SendoraCloudPush {
         sendId: String,
         clickAction: String? = nil
     ) {
-        var body: [String: Any] = ["sendId": sendId]
-        if let clickAction = clickAction {
-            body["clickAction"] = clickAction
-        }
+        // Backend `trackPushOpenSchema` requires `pushSendId` (uuid) + `action`
+        // (defaults to "body" for a notification-surface tap). The public
+        // parameter names stay the same for API stability; only the wire keys
+        // are mapped to what the backend validates.
+        let body: [String: Any] = [
+            "pushSendId": sendId,
+            "action": clickAction ?? "body",
+        ]
         client.post(path: "/push/track-open", body: body) { _ in }
     }
 }

@@ -69,6 +69,13 @@ public final class SendoraCloudAuth {
     private let onAnonymousWipe: () -> Void
     private var cachedUser: SendoraCloudAuthUser?
     private var cachedExpiresAt: Int64 = 0
+    /// Anon refresh token captured at `signInWithMfaSupport` time, stashed
+    /// keyed to the issued `mfaChallengeToken` so the later `challengeMfa`
+    /// can forward it for device-takeover (s58.111). Without this, the MFA
+    /// branch wiped the anon identity before the challenge resolved → the
+    /// takeover hint was lost → one device ended with two user_ids +
+    /// duplicate pushes (audit s58.203 fix).
+    private var pendingAnonTakeover: (challengeToken: String, prevAnonRefreshToken: String)?
     private let lock = NSLock()
     /// Serial queue for public auth ops. All signIn/signUp/signOut/anonymous
     /// calls funnel through here so concurrent invocations execute one at
@@ -240,13 +247,21 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SignInOutcome, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
-            let hadUser: Bool = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser != nil
-            }()
-            if hadUser { self.wipeLocalIdentity() }
+            // Capture the device-takeover hint BEFORE any wipe, exactly like
+            // signIn(). Do NOT wipe the anon identity here — the MFA challenge
+            // may not resolve (or may fail), so the anon session must survive
+            // until challengeMfa() actually mints a real session. On the
+            // no-MFA direct-success path we wipe-then-persist inside the
+            // success branch below (audit s58.203 device-takeover fix).
+            var prevAnonRefreshToken: String? = nil
+            self.lock.lock()
+            let hadUser = self.cachedUser != nil
+            let isAnon = self.cachedUser?.isAnonymous == true
+            self.lock.unlock()
+            if isAnon { prevAnonRefreshToken = self.storage.authRefreshToken }
 
-            let body: [String: Any] = ["email": email, "password": password]
+            var body: [String: Any] = ["email": email, "password": password]
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
             let semaphore = DispatchSemaphore(value: 0)
             self.client.post(path: "/auth-service/login", body: body) { response in
                 if let err = self.parseError(response) {
@@ -262,6 +277,13 @@ public final class SendoraCloudAuth {
                 if let mfaRequired = data["mfaRequired"] as? Bool,
                    mfaRequired,
                    let challengeToken = data["mfaChallengeToken"] as? String {
+                    // Stash the anon takeover token keyed to this challenge so
+                    // challengeMfa() can forward it. Anon identity stays intact.
+                    if let prev = prevAnonRefreshToken {
+                        self.lock.lock()
+                        self.pendingAnonTakeover = (challengeToken: challengeToken, prevAnonRefreshToken: prev)
+                        self.lock.unlock()
+                    }
                     let userDict = data["user"] as? [String: Any]
                     let userId = (userDict?["id"] as? String) ?? ""
                     completion(.success(.mfaRequired(challengeToken: challengeToken, userId: userId)))
@@ -274,6 +296,9 @@ public final class SendoraCloudAuth {
                     semaphore.signal()
                     return
                 }
+                // Direct success (account has no MFA): clear the old anon
+                // identity now, after the new session is confirmed, then persist.
+                if hadUser { self.wipeLocalIdentity() }
                 self.persist(user: user, tokens: tokens)
                 if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
                    !retired.isEmpty {
@@ -366,9 +391,58 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
+            // Forward the device-takeover hint: prefer the token stashed at
+            // signInWithMfaSupport() time (keyed to this challenge), falling
+            // back to the live anon refresh (covers callers who reached an
+            // MFA challenge through a path that didn't stash). Captured BEFORE
+            // any wipe. The anon identity is wiped ONLY on a successful mint
+            // below — a wrong/expired code preserves the anon session so the
+            // user can retry (audit s58.203 device-takeover fix).
+            let stashed: String? = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                if let p = self.pendingAnonTakeover, p.challengeToken == challengeToken {
+                    return p.prevAnonRefreshToken
+                }
+                return nil
+            }()
+            let prevAnonRefreshToken = stashed ?? self.takeoverHint()
+            let hadUser: Bool = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.cachedUser != nil
+            }()
+
             var body: [String: Any] = ["challengeToken": challengeToken, "code": code]
-            if let prev = self.takeoverHint() { body["prevAnonRefreshToken"] = prev }
-            self.callAuthSync(path: "/auth-service/mfa/challenge", body: body, completion: completion)
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
+
+            let semaphore = DispatchSemaphore(value: 0)
+            self.client.post(path: "/auth-service/mfa/challenge", body: body) { response in
+                if let err = self.parseError(response) {
+                    completion(.failure(err)) // anon identity preserved on failure
+                    semaphore.signal()
+                    return
+                }
+                guard let user = self.parseSuccess(response),
+                      let tokens = self.parseTokens(response) else {
+                    completion(.failure(.unknown("Malformed response")))
+                    semaphore.signal()
+                    return
+                }
+                // Success: clear the stash + old anon identity, then persist.
+                self.lock.lock()
+                if self.pendingAnonTakeover?.challengeToken == challengeToken {
+                    self.pendingAnonTakeover = nil
+                }
+                self.lock.unlock()
+                if hadUser { self.wipeLocalIdentity() }
+                self.persist(user: user, tokens: tokens)
+                if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
+                   !retired.isEmpty {
+                    self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
+                }
+                completion(.success(user))
+                semaphore.signal()
+            }
+            semaphore.wait()
         }
     }
 
@@ -990,6 +1064,7 @@ public final class SendoraCloudAuth {
         lock.lock()
         cachedUser = nil
         cachedExpiresAt = 0
+        pendingAnonTakeover = nil
         lock.unlock()
         storage.clearAuthTokens()
         stopProactiveRefreshCron()

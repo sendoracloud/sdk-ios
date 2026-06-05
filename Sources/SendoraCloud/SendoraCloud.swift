@@ -154,9 +154,15 @@ public final class SendoraCloud {
             self.apiClient = client
 
             let queue = EventQueue(storage: store, flushAt: finalConfig.flushAt, maxSize: finalConfig.maxQueueSize)
-            queue.setFlushHandler { events in
-                if !consent.isGranted { return } // gate flushes on consent
-                flushEvents(events, client: client)
+            queue.setFlushHandler { events, completion in
+                // Gate flushes on consent. Report `true` so the queue treats a
+                // consent-gated chunk as handled (it's intentionally not sent;
+                // re-queuing forever would never drain).
+                if !consent.isGranted {
+                    completion(true)
+                    return
+                }
+                flushEvents(events, client: client, completion: completion)
             }
             queue.startTimer(interval: finalConfig.flushInterval)
             self.eventQueue = queue
@@ -394,12 +400,22 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "4.1.1"],
+                "sdk": ["name": "sendora-ios", "version": "4.1.3"],
             ],
             "sessionId": storage?.sessionId ?? "",
-            "consent": ["analytics"],
+            // Reflect the SDK's actual (boolean) consent state rather than
+            // stamping a constant claim. The flush gate only sends events
+            // while granted, so this is just an honest in-payload record.
+            "consent": consent.isGranted ? ["analytics"] : [],
         ]
-        if let uid = currentUserId { event["userId"] = uid }
+        if let uid = currentUserId {
+            event["userId"] = uid
+        } else if let anonId = storage?.deviceId {
+            // No identified user yet — attach the stable Keychain device id
+            // as anonymousId so the backend can stitch pre-identify activity
+            // to the user once identify() runs (events.ts `anonymousId`).
+            event["anonymousId"] = anonId
+        }
         if let tok = currentIdentityToken { event["identityToken"] = tok }
 
         queue.add(event: event)
@@ -522,12 +538,28 @@ public final class SendoraCloud {
         trackEvent("session.ended", properties: ["sessionId": storage?.sessionId ?? ""])
     }
 
-    private static func flushEvents(_ events: [[String: Any]], client: APIClient) {
-        guard !events.isEmpty else { return }
+    /// Send one chunk of events (already capped at <=100 by EventQueue) and
+    /// report whether the backend ACCEPTED it. The queue only drops events on
+    /// `true`; `false` keeps them buffered for the next flush so nothing is
+    /// lost on an offline / 4xx / 5xx response.
+    private static func flushEvents(
+        _ events: [[String: Any]],
+        client: APIClient,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard !events.isEmpty else {
+            completion(true)
+            return
+        }
         if events.count == 1, let event = events.first {
-            client.post(path: "/events", body: event) { _ in }
+            client.post(path: "/events", body: event) { response in
+                let success = (response?["success"] as? Bool) ?? false
+                completion(success)
+            }
         } else {
-            client.postBatch(path: "/events/batch", events: events) { _ in }
+            client.postBatch(path: "/events/batch", events: events) { success in
+                completion(success)
+            }
         }
     }
 }

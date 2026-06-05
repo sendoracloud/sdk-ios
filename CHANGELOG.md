@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.1.3 — MFA-from-anonymous device-takeover fix (audit s58.203 follow-up)
+
+Fixes lost device-takeover when an MFA-enabled user signs in from an anonymous device:
+- `signInWithMfaSupport()` previously called `wipeLocalIdentity()` **before** the MFA challenge resolved, so `challengeMfa()`'s `takeoverHint()` returned nil — no `prevAnonRefreshToken` was forwarded, the backend never retired the anon row / reassigned push tokens, and the device ended with **two user_ids + duplicate pushes**.
+- Now: `signInWithMfaSupport()` captures the anon refresh token (no pre-call wipe) and on an MFA-required response **stashes** it keyed to the `mfaChallengeToken`. `challengeMfa()` forwards the stashed token and wipes the anon identity **only after a successful mint** — a wrong/expired code preserves the anon session for retry. The no-MFA direct-success path now also forwards the takeover hint (it previously didn't). Public API unchanged.
+
+## 4.1.2 — s58.203 audit P0: offline data loss + push tracking fixed
+
+Two production-breaking fixes:
+- **Offline event batches >100 were permanently dropped.** The queue buffered up to 1000 events offline but flushed the whole batch to a fire-and-forget send and cleared the queue immediately; the backend `/events/batch` caps at 100, so any flush >100 (or any rejection) 400'd and the events were already gone. Now chunks outbound batches to ≤100 and only removes events the backend actually accepted (re-enqueues the rest), preserving order.
+- **Push open / action-button tracking 400'd on every call.** `trackOpen` sent `sendId` + `clickAction`, but the backend requires `pushSendId` + `action`. Renamed the wire keys; public `trackOpen(sendId:clickAction:)` signature unchanged.
+
 ## 4.1.1
 
 **macOS build fix.** `Package.swift` declares `.macOS(.v13)`, but
