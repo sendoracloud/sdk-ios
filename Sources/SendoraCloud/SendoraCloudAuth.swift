@@ -776,32 +776,42 @@ public final class SendoraCloudAuth {
     /// Honors the project's configured grace period. Wipes local identity on
     /// success (the server has revoked the session). Fails when no user is
     /// signed in or the request errors.
+    ///
+    /// Resolves a FRESH access token via `getAccessToken` first (refreshing a
+    /// past-expiry cached token) — this is a one-shot destructive action, so a
+    /// 401 from a stale token would silently strand the user with an undeleted
+    /// account (the cause of the prod 401s when "delete" was tapped after the
+    /// app sat idle).
     public func deleteAccount(completion: @escaping (Result<AccountDeletionResult, Error>) -> Void) {
-        guard let headers = bearerHeaders() else {
-            completion(.failure(NSError(domain: "SendoraCloud", code: 401,
-                userInfo: [NSLocalizedDescriptionKey: "deleteAccount requires a signed-in user"])))
-            return
-        }
-        client.delete(path: "/auth-service/me", headers: headers) { [weak self] response in
-            guard let response = response else {
-                completion(.failure(NSError(domain: "SendoraCloud", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "deleteAccount failed (network error)"])))
+        getAccessToken { [weak self] token in
+            guard let self = self else { return }
+            guard let token = token else {
+                completion(.failure(NSError(domain: "SendoraCloud", code: 401,
+                    userInfo: [NSLocalizedDescriptionKey: "deleteAccount requires a signed-in user"])))
                 return
             }
-            if let error = response["error"] as? [String: Any] {
-                let msg = (error["message"] as? String) ?? "deleteAccount failed"
-                completion(.failure(NSError(domain: "SendoraCloud", code: 500,
-                    userInfo: [NSLocalizedDescriptionKey: msg])))
-                return
+            let headers = ["Authorization": "Bearer \(token)"]
+            self.client.delete(path: "/auth-service/me", headers: headers) { [weak self] response in
+                guard let response = response else {
+                    completion(.failure(NSError(domain: "SendoraCloud", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "deleteAccount failed (network error)"])))
+                    return
+                }
+                if let error = response["error"] as? [String: Any] {
+                    let msg = (error["message"] as? String) ?? "deleteAccount failed"
+                    completion(.failure(NSError(domain: "SendoraCloud", code: 500,
+                        userInfo: [NSLocalizedDescriptionKey: msg])))
+                    return
+                }
+                // Account is gone / deactivated server-side — drop local identity.
+                self?.wipeLocalIdentity()
+                let data = response["data"] as? [String: Any]
+                completion(.success(AccountDeletionResult(
+                    status: (data?["status"] as? String) ?? "pending",
+                    scheduledPurgeAt: data?["scheduledPurgeAt"] as? String,
+                    graceDays: (data?["graceDays"] as? Int) ?? 0
+                )))
             }
-            // Account is gone / deactivated server-side — drop local identity.
-            self?.wipeLocalIdentity()
-            let data = response["data"] as? [String: Any]
-            completion(.success(AccountDeletionResult(
-                status: (data?["status"] as? String) ?? "pending",
-                scheduledPurgeAt: data?["scheduledPurgeAt"] as? String,
-                graceDays: (data?["graceDays"] as? Int) ?? 0
-            )))
         }
     }
 
