@@ -182,6 +182,14 @@ UIViewController swizzling** — deliberately, so screen names stay accurate
 (swizzle counts container / nav / tab controllers) and there's zero added crash
 surface. Matches GA4 `engagement_time_msec`; powers `/analytics/engagement`.
 
+## Account deletion (s58.209)
+
+`auth.deleteAccount(completion:)` (Bearer) deletes the signed-in user's account
+for Apple App Store Guideline 5.1.1(v). `Result<AccountDeletionResult, Error>` —
+`status` is `"purged"` (grace 0) or `"pending"` (disabled + sessions revoked now;
+hard-deleted at `scheduledPurgeAt`, cancellable by signing back in within grace).
+Wipes local identity on success. Grace period is a per-project Auth setting.
+
 ## Deep Links no-app routing mode (s58.208)
 
 `LinkCreateInput` gains an optional `noAppMode: String?` (`"auto"`/`"store"`/`"web"`)

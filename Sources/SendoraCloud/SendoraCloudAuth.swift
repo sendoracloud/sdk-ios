@@ -763,6 +763,48 @@ public final class SendoraCloudAuth {
         client.delete(path: "/auth-service/sessions/me", headers: headers) { _ in completion() }
     }
 
+    /// Outcome of `deleteAccount`. `status` is `"purged"` (hard-deleted now,
+    /// grace = 0) or `"pending"` (deactivated + sessions revoked now, hard
+    /// delete scheduled at `scheduledPurgeAt`; cancellable by signing back in).
+    public struct AccountDeletionResult {
+        public let status: String
+        public let scheduledPurgeAt: String?
+        public let graceDays: Int
+    }
+
+    /// Delete the signed-in user's account (Apple App Store Guideline 5.1.1(v)).
+    /// Honors the project's configured grace period. Wipes local identity on
+    /// success (the server has revoked the session). Fails when no user is
+    /// signed in or the request errors.
+    public func deleteAccount(completion: @escaping (Result<AccountDeletionResult, Error>) -> Void) {
+        guard let headers = bearerHeaders() else {
+            completion(.failure(NSError(domain: "SendoraCloud", code: 401,
+                userInfo: [NSLocalizedDescriptionKey: "deleteAccount requires a signed-in user"])))
+            return
+        }
+        client.delete(path: "/auth-service/me", headers: headers) { [weak self] response in
+            guard let response = response else {
+                completion(.failure(NSError(domain: "SendoraCloud", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "deleteAccount failed (network error)"])))
+                return
+            }
+            if let error = response["error"] as? [String: Any] {
+                let msg = (error["message"] as? String) ?? "deleteAccount failed"
+                completion(.failure(NSError(domain: "SendoraCloud", code: 500,
+                    userInfo: [NSLocalizedDescriptionKey: msg])))
+                return
+            }
+            // Account is gone / deactivated server-side — drop local identity.
+            self?.wipeLocalIdentity()
+            let data = response["data"] as? [String: Any]
+            completion(.success(AccountDeletionResult(
+                status: (data?["status"] as? String) ?? "pending",
+                scheduledPurgeAt: data?["scheduledPurgeAt"] as? String,
+                graceDays: (data?["graceDays"] as? Int) ?? 0
+            )))
+        }
+    }
+
     // MARK: - Internals (Bearer)
 
     /// Internal helper used by passkey + SSO flows. Parses the
