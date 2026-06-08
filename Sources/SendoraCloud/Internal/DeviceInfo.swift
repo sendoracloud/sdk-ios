@@ -53,6 +53,9 @@ struct DeviceContext {
             "os": os,
             "osVersion": osVersion,
             "model": model,
+            // ADR-022: app version (CFBundleShortVersionString) so the
+            // dashboard can break analytics down by release.
+            "appVersion": appVersion,
         ]
     }
 }

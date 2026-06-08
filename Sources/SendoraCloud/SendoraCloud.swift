@@ -400,7 +400,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "4.3.1"],
+                "sdk": ["name": "sendora-ios", "version": "4.4.0"],
             ],
             "sessionId": storage?.sessionId ?? "",
             // Reflect the SDK's actual (boolean) consent state rather than

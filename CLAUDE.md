@@ -170,6 +170,16 @@ DELETE /api/v1/orgs/:orgId/push/live-activities/:id
 - `aps.timestamp` must be monotonic; backend uses `Math.floor(Date.now()/1000)` per send.
 - iOS 17+: APNs can also START activities (not just update). Sendora doesn't surface this yet — host app must start v1.
 
+## 4.4.0 — appVersion in device context (ADR-022)
+
+`DeviceInfo.toDictionary()` now also emits `appVersion` (already collected from
+`CFBundleShortVersionString`) alongside the existing `type` / `os` / `osVersion`
+/ `model`. So every event's `context.device` carries the host app version,
+powering the dashboard Analytics → Audience app-version breakdown. No config or
+host-app change — auto-detected from the bundle. The native SDKs already led on
+device context; this just surfaces the app version that was being collected but
+not sent.
+
 ## Engagement time (Wave 75 — 4.1.0)
 
 `SendoraCloud.trackScreen(_:properties:)` emits `screen.viewed` and flushes the
