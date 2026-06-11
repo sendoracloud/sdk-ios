@@ -170,6 +170,25 @@ DELETE /api/v1/orgs/:orgId/push/live-activities/:id
 - `aps.timestamp` must be monotonic; backend uses `Math.floor(Date.now()/1000)` per send.
 - iOS 17+: APNs can also START activities (not just update). Sendora doesn't surface this yet — host app must start v1.
 
+## 4.5.0 — SDK/API compatibility (ADR-023)
+
+4.5.0 — ADR-023: single-source sdkVersion constant (no more hardcoded drift) +
+X-Sendora-SDK-{Name,Version} headers + sendora_schema_version=1 marker (additive).
+
+The version string used to be hardcoded as `"4.4.0"` in two places (the event
+body `context.sdk` and a `Package.swift` reference) — drift risk. Now the ONLY
+source of truth is `Internal/SDKVersion.swift` (`SendoraCloud.sdkVersion` /
+`.sdkName`); the event body reads it and `Package.swift` just carries a comment
+kept in lockstep with the git tag. Every HTTP request (`APIClient`, both the
+plain `request` and `requestWithDetails` builders) now also sends
+`X-Sendora-SDK-Name: sendora-ios` + `X-Sendora-SDK-Version: <sdkVersion>` so the
+backend gets a version signal on non-event routes too (auth/links/push) — the
+backend ignores them today. On `configure`, `Storage.initSchemaVersionIfAbsent()`
+writes UserDefaults key `sendora_schema_version = "1"` if absent (non-sensitive →
+UserDefaults tier, NOT Keychain), giving a future in-place upgrade a hook to
+branch a local-storage migration. Read nowhere yet; no existing key renamed
+(frozen per ADR-023 §3.4). All additive + backward-compatible.
+
 ## 4.4.0 — appVersion in device context (ADR-022)
 
 `DeviceInfo.toDictionary()` now also emits `appVersion` (already collected from

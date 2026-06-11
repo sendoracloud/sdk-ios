@@ -140,6 +140,9 @@ public final class SendoraCloud {
 
             let store = SendoraStorage()
             self.storage = store
+            // ADR-023: stamp the on-device schema-version marker on first init.
+            // Additive + idempotent (never overwrites an existing value).
+            store.initSchemaVersionIfAbsent()
             self.currentUserId = store.cachedUserId
 
             let device = DeviceContext.collect()
@@ -400,7 +403,7 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "4.4.0"],
+                "sdk": ["name": sdkName, "version": sdkVersion],
             ],
             "sessionId": storage?.sessionId ?? "",
             // Reflect the SDK's actual (boolean) consent state rather than

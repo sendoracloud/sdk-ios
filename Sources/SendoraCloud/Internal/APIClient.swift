@@ -98,6 +98,11 @@ final class APIClient: NSObject, URLSessionDelegate {
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        // ADR-023: SDK-version request headers on every call. Gives the
+        // backend a version signal even for non-event routes (auth/links/
+        // push), which never carried one. Additive — backend ignores today.
+        req.setValue(SendoraCloud.sdkName, forHTTPHeaderField: "X-Sendora-SDK-Name")
+        req.setValue(SendoraCloud.sdkVersion, forHTTPHeaderField: "X-Sendora-SDK-Version")
         if let headers = headers {
             for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
         }
@@ -163,6 +168,9 @@ final class APIClient: NSObject, URLSessionDelegate {
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        // ADR-023: SDK-version request headers (see `request(...)`).
+        req.setValue(SendoraCloud.sdkName, forHTTPHeaderField: "X-Sendora-SDK-Name")
+        req.setValue(SendoraCloud.sdkVersion, forHTTPHeaderField: "X-Sendora-SDK-Version")
 
         if let body = body {
             do {

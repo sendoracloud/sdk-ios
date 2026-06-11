@@ -1,6 +1,10 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
+// Published version: 4.5.0 (git tag is the SwiftPM source of truth).
+// The runtime version constant lives in
+// `Sources/SendoraCloud/Internal/SDKVersion.swift` — keep both in lockstep
+// with the release git tag (ADR-023: no hardcoded version drift).
 let package = Package(
     name: "SendoraCloud",
     platforms: [
