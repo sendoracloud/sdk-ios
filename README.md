@@ -1,6 +1,6 @@
 # SendoraCloud iOS SDK
 
-Official SendoraCloud iOS SDK — deep linking (Branch / Firebase Dynamic Links parity), attribution, event tracking, auth, push, Live Activities, geofences. Swift 5.9+, iOS 15+.
+Official SendoraCloud iOS SDK — deep linking (Branch / Firebase Dynamic Links parity), attribution, event tracking, auth, push, Live Activities, geofences. Swift 5.9+, iOS 15+ (native passkeys require iOS 16 and are `@available`-gated). **4.6.0 restored the iOS 15 floor** — the full Links surface, including runtime `create()`, works on iOS 15; only passkeys need iOS 16. (2.3.0–4.5.0 forced iOS 16 because the passkey provider wasn't version-guarded.)
 
 Full docs: [sendoracloud.com/sdks](https://sendoracloud.com/sdks)
 

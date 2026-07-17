@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.6.0 — restore iOS 15 support (deep links incl. `links.create()` on iOS 15)
+
+Lowers the deployment floor back to **iOS 15** (2.3.0–4.5.0 required iOS 16). The package had been pinned to iOS 16 only because the passkey provider (`ASAuthorizationPlatformPublicKeyCredentialProvider`, iOS 16) wasn't availability-guarded. Now `SendoraCloudPasskeys` + `SendoraCloud.passkeys` are `@available(iOS 16, *)`-gated (same treatment Live Activities already had), so **deep links (including runtime `links.create()`), analytics, push, auth, and SSO all work on iOS 15 again**. Passkeys remain iOS 16+ — guard those call sites with `if #available(iOS 16, *)`. No other behavior change.
+
 ## 4.1.3 — MFA-from-anonymous device-takeover fix (audit s58.203 follow-up)
 
 Fixes lost device-takeover when an MFA-enabled user signs in from an anonymous device:

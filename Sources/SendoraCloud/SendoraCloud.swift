@@ -65,7 +65,16 @@ public final class SendoraCloud {
     /// alongside `auth` on configure(). Use as
     /// `SendoraCloud.passkeys?.register(presentingWindow: window) { ... }`.
     #if canImport(UIKit)
-    public private(set) static var passkeys: SendoraCloudPasskeys?
+    // Backing storage is type-erased so this declaration compiles on the iOS 15
+    // deployment floor (Swift forbids @available on a STORED property, and
+    // SendoraCloudPasskeys references iOS-16-only ASAuthorizationPlatform-
+    // PublicKeyCredentialProvider). The public accessor is gated to iOS 16; on
+    // iOS 15 `SendoraCloud.passkeys` is simply not available (compile-time),
+    // which is correct — passkeys are an iOS 16 feature. Everything else in the
+    // SDK (deep links, analytics, push, auth, SSO) works on iOS 15.
+    private static var _passkeys: Any?
+    @available(iOS 16.0, *)
+    public static var passkeys: SendoraCloudPasskeys? { _passkeys as? SendoraCloudPasskeys }
     /// OIDC SSO via ASWebAuthenticationSession (iOS only). Use as
     /// `SendoraCloud.sso?.signInWithOidc(returnTo:from:completion:)`.
     public private(set) static var sso: SendoraCloudSso?
@@ -208,7 +217,11 @@ public final class SendoraCloud {
             // for the macOS slice of the package.
             #if canImport(UIKit)
             if let auth = self.auth {
-                self.passkeys = SendoraCloudPasskeys(client: client, auth: auth)
+                // Passkeys need iOS 16 (ASAuthorizationPlatformPublicKeyCredential).
+                // Wire only where available; SSO + the rest work on iOS 15.
+                if #available(iOS 16.0, *) {
+                    self._passkeys = SendoraCloudPasskeys(client: client, auth: auth)
+                }
                 self.sso = SendoraCloudSso(client: client, auth: auth)
             }
             self.support = SendoraCloudSupport()
