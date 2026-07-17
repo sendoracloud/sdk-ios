@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.7.0 — anon→social link-in-place (ADR-025)
+
+`loginSocial` / `signInWithApple` / `signInWithGoogle` gain an opt-in `link: Bool = false`. When the device is anonymous and `link: true`, an anon→social upgrade sends `linkAnonymous` so the backend promotes the anonymous account **in place** — the user id (`sub`) is **preserved** (fires `auth.user_upgraded`) instead of a device-takeover that mints a new id (Firebase `linkWithCredential` parity). No effect when not anonymous, or on a collision (the social identity already belongs to another account, or the email is taken → falls back to the prior takeover/merge). Source-compatible default (existing trailing-closure callers unaffected); additive.
+
 ## 4.6.0 — restore iOS 15 support (deep links incl. `links.create()` on iOS 15)
 
 Lowers the deployment floor back to **iOS 15** (2.3.0–4.5.0 required iOS 16). The package had been pinned to iOS 16 only because the passkey provider (`ASAuthorizationPlatformPublicKeyCredentialProvider`, iOS 16) wasn't availability-guarded. Now `SendoraCloudPasskeys` + `SendoraCloud.passkeys` are `@available(iOS 16, *)`-gated (same treatment Live Activities already had), so **deep links (including runtime `links.create()`), analytics, push, auth, and SSO all work on iOS 15 again**. Passkeys remain iOS 16+ — guard those call sites with `if #available(iOS 16, *)`. No other behavior change.

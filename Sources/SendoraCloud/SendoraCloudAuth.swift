@@ -486,6 +486,11 @@ public final class SendoraCloudAuth {
         codeVerifier: String? = nil,
         appleFirstName: String? = nil,
         appleLastName: String? = nil,
+        // ADR-025 link-in-place opt-in. When anonymous + `link: true`, an
+        // anon→social upgrade KEEPS the same user id (sub) — promoted in place
+        // (like Firebase linkWithCredential) instead of a device-takeover that
+        // mints a new id. No effect off-anon or on a collision.
+        link: Bool = false,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
@@ -511,6 +516,8 @@ public final class SendoraCloudAuth {
                 body["appleName"] = name
             }
             if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if link { body["linkAnonymous"] = true }
             self.callAuthSync(path: "/auth-service/login/social", body: body, completion: completion)
         }
     }
@@ -519,8 +526,9 @@ public final class SendoraCloudAuth {
     public func signInWithGoogle(
         code: String,
         redirectUri: String,
+        link: Bool = false,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "google", code: code, redirectUri: redirectUri, completion: completion) }
+    ) { loginSocial(provider: "google", code: code, redirectUri: redirectUri, link: link, completion: completion) }
 
     /// Convenience: GitHub authorization-code login.
     public func signInWithGitHub(
@@ -537,6 +545,8 @@ public final class SendoraCloudAuth {
         idToken: String,
         firstName: String? = nil,
         lastName: String? = nil,
+        // ADR-025: keep the same user id on an anon→Apple upgrade. See `loginSocial`.
+        link: Bool = false,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         loginSocial(
@@ -544,6 +554,7 @@ public final class SendoraCloudAuth {
             idToken: idToken,
             appleFirstName: firstName,
             appleLastName: lastName,
+            link: link,
             completion: completion
         )
     }
