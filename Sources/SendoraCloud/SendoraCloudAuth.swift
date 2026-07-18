@@ -559,6 +559,48 @@ public final class SendoraCloudAuth {
         )
     }
 
+    /// Apple Game Center sign-in (email-less, player-keyed). Pass the payload
+    /// from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)`
+    /// plus your app's bundle id — obtain them via GameKit (or the Sendora
+    /// helper). `link: true` KEEPS the same user id when upgrading an anonymous
+    /// device (ADR-025 link-in-place); no effect off-anon or on a collision.
+    /// `signature`/`salt` are base64; `timestamp` is GameKit's millisecond value.
+    public func signInWithGameCenter(
+        publicKeyURL: String,
+        signature: String,
+        salt: String,
+        timestamp: UInt64,
+        teamPlayerID: String,
+        bundleID: String,
+        link: Bool = false,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            // Device-takeover hint — same posture as loginSocial().
+            var prevAnonRefreshToken: String? = nil
+            self.lock.lock()
+            let hadUser = self.cachedUser != nil
+            let isAnon = self.cachedUser?.isAnonymous == true
+            self.lock.unlock()
+            if isAnon { prevAnonRefreshToken = self.storage.authRefreshToken }
+
+            if hadUser { self.wipeLocalIdentity() }
+
+            var body: [String: Any] = [
+                "publicKeyUrl": publicKeyURL,
+                "signature": signature,
+                "salt": salt,
+                "timestamp": timestamp,
+                "teamPlayerId": teamPlayerID,
+                "bundleId": bundleID,
+            ]
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if link { body["linkAnonymous"] = true }
+            self.callAuthSync(path: "/auth-service/login/game-center", body: body, completion: completion)
+        }
+    }
+
     /// Convenience: Microsoft Azure AD authorization-code login.
     public func signInWithMicrosoft(
         code: String,
