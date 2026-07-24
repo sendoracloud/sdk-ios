@@ -34,6 +34,16 @@ public struct SendoraCloudAuthUser: Codable {
     public let emailVerified: Bool
     public let name: String?
     public let isAnonymous: Bool
+    /// How this account was FIRST created (`signupMethod`, immutable) and how it
+    /// MOST RECENTLY authenticated (`lastLoginMethod`). Free-form provider tokens
+    /// (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/
+    /// `magic_link`/`passkey`/`oidc`/…). Read-only, display-only — never an
+    /// authorization signal. `nil` against a backend older than s58.266, or for a
+    /// row created before it (backfilled on next sign-in). sdk-ios 4.9.0+.
+    /// Optional (Codable decodes to nil when absent) → decoding a cached user from
+    /// a pre-4.9.0 build stays safe.
+    public let signupMethod: String?
+    public let lastLoginMethod: String?
 }
 
 public struct SendoraCloudAuthTokens: Codable {
@@ -1126,7 +1136,9 @@ public final class SendoraCloudAuth {
             email: userDict["email"] as? String,
             emailVerified: userDict["emailVerified"] as? Bool ?? false,
             name: userDict["name"] as? String,
-            isAnonymous: userDict["isAnonymous"] as? Bool ?? false
+            isAnonymous: userDict["isAnonymous"] as? Bool ?? false,
+            signupMethod: userDict["signupMethod"] as? String,   // s58.266
+            lastLoginMethod: userDict["lastLoginMethod"] as? String
         )
     }
 
