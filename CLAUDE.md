@@ -172,6 +172,19 @@ DELETE /api/v1/orgs/:orgId/push/live-activities/:id
 - `aps.timestamp` must be monotonic; backend uses `Math.floor(Date.now()/1000)` per send.
 - iOS 17+: APNs can also START activities (not just update). Sendora doesn't surface this yet — host app must start v1.
 
+## 4.11.0 — onDeletionCancelled (account-restore listener, s58.269)
+
+`auth.onDeletionCancelled { evt in }` + `getLastDeletionCancelled()` (returns
+`DeletionCancelledEvent`) — mirrors `onDeviceTakeover` (UUID-keyed, lock-safe,
+snapshot-then-dispatch). Fires when a sign-in cancelled a pending self-service
+deletion within grace (account restored, same sub). The 4 per-path device-takeover
+fire sites were unified into `fireLifecycleSignals(from:identifiedUserId:)`, which
+parses BOTH `retiredAnonUserId` and the new `reactivatedFromDeletion` off the
+response and fires the matching listener — so every sign-in path emits both
+consistently. Pairs with backend `auth.deletion_cancelled`/`auth.deletion_scheduled`
+webhooks. `swift build` clean. Additive, not in the golden contract. Parity with
+RN 1.26.0 / web 3.10.0 / Android 4.10.0.
+
 ## 4.10.0 — identity linking on an identified session (ADR-030) + signUp() fix
 
 Non-anonymous sibling of ADR-025. New `auth.linkEmailPassword` / `linkSocial`

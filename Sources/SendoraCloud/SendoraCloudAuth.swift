@@ -79,6 +79,14 @@ public struct DeviceTakeoverEvent {
     public let at: Date
 }
 
+/// Detail handed to `onDeletionCancelled` subscribers (s58.269). Fires once
+/// per sign-in that cancelled a pending self-service account deletion within
+/// its grace window — the account is restored with the SAME user_id.
+public struct DeletionCancelledEvent {
+    public let userId: String
+    public let at: Date
+}
+
 public final class SendoraCloudAuth {
     private let client: APIClient
     private let storage: SendoraStorage
@@ -105,6 +113,9 @@ public final class SendoraCloudAuth {
     /// unsubscribe via the returned closure. Lock-protected.
     private var takeoverListeners: [UUID: (DeviceTakeoverEvent) -> Void] = [:]
     private var lastTakeover: DeviceTakeoverEvent?
+    /// Inline deletion-cancelled listeners (s58.269). UUID-keyed; lock-protected.
+    private var deletionCancelledListeners: [UUID: (DeletionCancelledEvent) -> Void] = [:]
+    private var lastDeletionCancelled: DeletionCancelledEvent?
 
     init(
         client: APIClient,
@@ -322,10 +333,7 @@ public final class SendoraCloudAuth {
                 // identity now, after the new session is confirmed, then persist.
                 if hadUser { self.wipeLocalIdentity() }
                 self.persist(user: user, tokens: tokens)
-                if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-                   !retired.isEmpty {
-                    self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-                }
+                self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
                 completion(.success(.authenticated(user)))
                 semaphore.signal()
             }
@@ -405,6 +413,53 @@ public final class SendoraCloudAuth {
         for fn in snapshot { fn(evt) }
     }
 
+    /// Subscribe to deletion-cancelled events (s58.269): fires when a sign-in
+    /// cancelled a pending self-service account deletion within its grace
+    /// window (the account is restored, same user_id). Surface "your deletion
+    /// was cancelled" + reconcile local state. Returns an unsubscribe closure.
+    @discardableResult
+    public func onDeletionCancelled(_ listener: @escaping (DeletionCancelledEvent) -> Void) -> () -> Void {
+        let key = UUID()
+        lock.lock()
+        deletionCancelledListeners[key] = listener
+        lock.unlock()
+        return { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock(); defer { self.lock.unlock() }
+            self.deletionCancelledListeners.removeValue(forKey: key)
+        }
+    }
+
+    /// The most recent deletion-cancelled event this session, or nil.
+    public func getLastDeletionCancelled() -> DeletionCancelledEvent? {
+        lock.lock(); defer { lock.unlock() }
+        return lastDeletionCancelled
+    }
+
+    /// Internal — fan out deletion-cancelled to subscribers + cache the latest.
+    func fireDeletionCancelled(userId: String) {
+        let evt = DeletionCancelledEvent(userId: userId, at: Date())
+        let snapshot: [(DeletionCancelledEvent) -> Void] = {
+            lock.lock(); defer { lock.unlock() }
+            lastDeletionCancelled = evt
+            return Array(deletionCancelledListeners.values)
+        }()
+        for fn in snapshot { fn(evt) }
+    }
+
+    /// Fire BOTH lifecycle listeners (device-takeover + deletion-cancelled)
+    /// from a backend auth response — the single place that parses the two
+    /// optional signals so every sign-in path emits them consistently (s58.269).
+    func fireLifecycleSignals(from response: [String: Any]?, identifiedUserId: String) {
+        let data = response?["data"] as? [String: Any]
+        if let retired = data?["retiredAnonUserId"] as? String, !retired.isEmpty {
+            fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: identifiedUserId)
+        }
+        if let restored = data?["reactivatedFromDeletion"] as? Bool, restored {
+            fireDeletionCancelled(userId: identifiedUserId)
+        }
+    }
+
     /// Exchange the `mfaChallengeToken` from `signInWithMfaSupport` + a
     /// 6-digit TOTP code (or a 17-char recovery code) for a real session.
     public func challengeMfa(
@@ -457,10 +512,7 @@ public final class SendoraCloudAuth {
                 self.lock.unlock()
                 if hadUser { self.wipeLocalIdentity() }
                 self.persist(user: user, tokens: tokens)
-                if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-                   !retired.isEmpty {
-                    self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-                }
+                self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
                 completion(.success(user))
                 semaphore.signal()
             }
@@ -1024,10 +1076,7 @@ public final class SendoraCloudAuth {
             return nil
         }
         persist(user: user, tokens: tokens)
-        if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-           !retired.isEmpty {
-            fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-        }
+        fireLifecycleSignals(from: response, identifiedUserId: user.id)
         return user
     }
 
@@ -1092,10 +1141,7 @@ public final class SendoraCloudAuth {
                 return
             }
             self.persist(user: user, tokens: tokens)
-            if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-               !retired.isEmpty {
-                self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-            }
+            self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
             completion(.success(user))
             semaphore.signal()
         }
