@@ -55,6 +55,13 @@ public struct SendoraCloudAuthTokens: Codable {
 
 public enum SendoraCloudAuthError: Error {
     case emailAlreadyTaken(String)
+    /// `signUp()` on a session already signed in with an identity (ADR-030 §4).
+    /// Use `linkEmailPassword()` / `linkGoogle()` / … to add a credential to
+    /// THIS account, or sign out first — do not create a second account.
+    case alreadyIdentified(String)
+    /// A credential passed to `link*()` is already attached to a DIFFERENT
+    /// account (ADR-030 §2). Sendora never auto-merges two real accounts.
+    case credentialInUse(String)
     case unauthorized(String)
     case network(String)
     case unknown(String)
@@ -198,14 +205,19 @@ public final class SendoraCloudAuth {
                 return
             }
 
-            // Fresh signup from a non-anonymous identified state — wipe
-            // BEFORE the network call so events fired during the round
-            // trip don't cling to the old identity.
+            // ADR-030 §4: already signed in with an identity. signUp() would
+            // orphan the current account by minting a second one — refuse and
+            // point at link*() (was: silently wiped + fresh-signup = duplicate
+            // account). A genuinely signed-out caller (no cachedUser) still
+            // falls through to a fresh signup below.
             let wasIdentified: Bool = {
                 self.lock.lock(); defer { self.lock.unlock() }
                 return self.cachedUser != nil && self.cachedUser?.isAnonymous == false
             }()
-            if wasIdentified { self.wipeLocalIdentity() }
+            if wasIdentified {
+                completion(.failure(.alreadyIdentified("Already signed in. Use linkEmailPassword() to add a password to this account, or sign out first.")))
+                return
+            }
 
             var body: [String: Any] = ["email": email, "password": password]
             if let name = name { body["name"] = name }
@@ -878,6 +890,127 @@ public final class SendoraCloudAuth {
         }
     }
 
+    // MARK: - Identity linking (ADR-030)
+    //
+    // Attach a SECOND credential to the CURRENT signed-in account, preserving
+    // the same user id (sub). Unlike signUp()/loginSocial(link:) — which
+    // preserve the sub only from an ANONYMOUS session — these operate on an
+    // already-identified account. Bearer-authenticated; NO token rotation (the
+    // cached user is refreshed in place). Collision → `.credentialInUse` (never
+    // merges). Primary use: one account across platforms — a Game Center player
+    // links email/Google, then signs in on Android to the SAME sub.
+
+    /// Link email + password to the current account (sub preserved).
+    public func linkEmailPassword(
+        email: String,
+        password: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        linkCredential(path: "/auth-service/me/link/email", body: ["email": email, "password": password], completion: completion)
+    }
+
+    /// Link an OAuth social identity to the current account. Pass a native
+    /// `idToken` OR a web `code` + `redirectURI`.
+    public func linkSocial(
+        provider: String,
+        idToken: String? = nil,
+        code: String? = nil,
+        redirectURI: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        var body: [String: Any] = ["provider": provider]
+        if let idToken = idToken { body["idToken"] = idToken }
+        if let code = code { body["code"] = code }
+        if let redirectURI = redirectURI { body["redirectUri"] = redirectURI }
+        linkCredential(path: "/auth-service/me/link/social", body: body, completion: completion)
+    }
+
+    /// Convenience: link a Google identity (native `idToken`, or web `code`+`redirectURI`).
+    public func linkGoogle(
+        idToken: String? = nil,
+        code: String? = nil,
+        redirectURI: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        linkSocial(provider: "google", idToken: idToken, code: code, redirectURI: redirectURI, completion: completion)
+    }
+
+    /// Convenience: link an Apple identity (native ASAuthorization `idToken`).
+    public func linkApple(
+        idToken: String? = nil,
+        code: String? = nil,
+        redirectURI: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        linkSocial(provider: "apple", idToken: idToken, code: code, redirectURI: redirectURI, completion: completion)
+    }
+
+    /// Link an Apple Game Center identity to the current account. Pass the
+    /// payload from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)`
+    /// + the app's bundle id (same inputs as `signInWithGameCenter`).
+    public func linkGameCenter(
+        publicKeyURL: String,
+        signature: String,
+        salt: String,
+        timestamp: Int,
+        teamPlayerID: String,
+        bundleID: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        let body: [String: Any] = [
+            "publicKeyUrl": publicKeyURL,
+            "signature": signature,
+            "salt": salt,
+            "timestamp": timestamp,
+            "teamPlayerId": teamPlayerID,
+            "bundleId": bundleID,
+        ]
+        linkCredential(path: "/auth-service/me/link/game-center", body: body, completion: completion)
+    }
+
+    /// Shared link executor. Resolves a fresh access token, POSTs the credential
+    /// with the Bearer header, then refreshes the cached user IN PLACE (no token
+    /// rotation — the sub is unchanged). Mirrors `deleteAccount`'s Bearer flow.
+    private func linkCredential(
+        path: String,
+        body: [String: Any],
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        getAccessToken { [weak self] token in
+            guard let self = self else { return }
+            guard let token = token else {
+                completion(.failure(.unauthorized("Sign in before linking a credential")))
+                return
+            }
+            let headers = ["Authorization": "Bearer \(token)"]
+            self.client.post(path: path, body: body, headers: headers) { [weak self] response in
+                guard let self = self else { return }
+                if let err = self.parseError(response) {
+                    completion(.failure(err))
+                    return
+                }
+                guard let user = self.parseSuccess(response) else {
+                    completion(.failure(.unknown("Malformed link response")))
+                    return
+                }
+                self.updateLocalUser(user)
+                completion(.success(user))
+            }
+        }
+    }
+
+    /// Refresh the cached user after a link — the sub is unchanged, so only the
+    /// user object + its stored copy change (no token/identity rotation).
+    private func updateLocalUser(_ user: SendoraCloudAuthUser) {
+        lock.lock()
+        cachedUser = user
+        lock.unlock()
+        if let json = try? JSONEncoder().encode(user),
+           let str = String(data: json, encoding: .utf8) {
+            storage.authUserJson = str
+        }
+    }
+
     // MARK: - Internals (Bearer)
 
     /// Internal helper used by passkey + SSO flows. Parses the
@@ -1117,6 +1250,12 @@ public final class SendoraCloudAuth {
         let error = response["error"] as? [String: Any]
         let code = error?["code"] as? String ?? ""
         let message = error?["message"] as? String ?? "Auth request failed"
+        if code == "NOT_ANONYMOUS" {
+            return .alreadyIdentified(message)
+        }
+        if code == "CREDENTIAL_IN_USE" {
+            return .credentialInUse(message)
+        }
         if code == "CONFLICT" || code == "EMAIL_ALREADY_TAKEN" {
             return .emailAlreadyTaken(message)
         }
