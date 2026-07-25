@@ -1,6 +1,8 @@
 # sdk-ios (SwiftPM)
 
-Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, iOS 15+.
+Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Package.swift` = `.iOS(.v15)`). Passkeys (`ASAuthorizationPlatformPublicKeyCredentialProvider`, iOS 16) are `@available(iOS 16)`-gated — `SendoraCloud.passkeys` + the `SendoraCloudPasskeys` class are iOS-16-only; everything else incl. `SendoraCloudLinks.create()` works on iOS 15. **History:** 2.3.0–4.5.0 forced iOS 16 (unguarded passkey provider); **4.6.0 (s58.235) restored iOS 15** by `@available`-gating passkeys — same treatment Live Activities (iOS 16.1) always had. The type-erased `_passkeys` backing store in `SendoraCloud.swift` exists because Swift forbids `@available` on a stored property.
+
+> ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 ## Public API
 
@@ -12,6 +14,10 @@ Sendora.trackEvent(_:properties:)
 Sendora.identify(userId:, traits:, options:)
 Sendora.consent.grant() / revoke()
 ```
+
+## MFA-from-anonymous device-takeover (4.1.3)
+
+`signInWithMfaSupport()` must NOT wipe the anon identity before the MFA challenge resolves — else `challengeMfa()`'s `takeoverHint()` reads a cleared `cachedUser` and forwards no `prevAnonRefreshToken`, so the backend never retires the anon row / reassigns push tokens (device ends with two user_ids + duplicate pushes). The fix captures the anon refresh BEFORE any wipe, stashes it in `pendingAnonTakeover` keyed to the `mfaChallengeToken`, and `challengeMfa()` forwards it + wipes **only on a successful mint** (a wrong code preserves the anon session for retry). Mirrors the non-MFA `signIn()` wipe-after-success ordering. Backend `/auth-service/mfa/challenge` already accepts `prevAnonRefreshToken`.
 
 ## Security
 
@@ -166,6 +172,134 @@ DELETE /api/v1/orgs/:orgId/push/live-activities/:id
 - `aps.timestamp` must be monotonic; backend uses `Math.floor(Date.now()/1000)` per send.
 - iOS 17+: APNs can also START activities (not just update). Sendora doesn't surface this yet — host app must start v1.
 
+## 4.12.0 — listLinkedIdentities() (read side of ADR-030, s58.270)
+
+`auth.listLinkedIdentities { result in }` → `Result<LinkedIdentitiesResult,
+SendoraCloudAuthError>` where `LinkedIdentitiesResult` = `{ identities:
+[LinkedIdentity(provider, email?, linkedAt)], hasPassword }`. The full set of
+credentials on the current account — the cross-device / reinstall-durable source
+of truth for a "Connected: Game Center · Google" UI (`getCurrentUser()` only
+holds the primary `signupMethod`/`lastLoginMethod`). Bearer-authenticated GET
+`/auth-service/me/identities` that resolves a fresh access token first (mirrors
+`deleteAccount`); `.unauthorized` when signed out. Firebase `user.providerData` /
+Supabase `user.identities` parity. Version in `SDKVersion.swift`. `swift build`
+clean. Additive, SDK-only (not in the golden contract). Parity with RN 1.27.0 /
+web 3.11.0 / Android 4.11.0.
+
+## 4.11.0 — onDeletionCancelled (account-restore listener, s58.269)
+
+`auth.onDeletionCancelled { evt in }` + `getLastDeletionCancelled()` (returns
+`DeletionCancelledEvent`) — mirrors `onDeviceTakeover` (UUID-keyed, lock-safe,
+snapshot-then-dispatch). Fires when a sign-in cancelled a pending self-service
+deletion within grace (account restored, same sub). The 4 per-path device-takeover
+fire sites were unified into `fireLifecycleSignals(from:identifiedUserId:)`, which
+parses BOTH `retiredAnonUserId` and the new `reactivatedFromDeletion` off the
+response and fires the matching listener — so every sign-in path emits both
+consistently. Pairs with backend `auth.deletion_cancelled`/`auth.deletion_scheduled`
+webhooks. `swift build` clean. Additive, not in the golden contract. Parity with
+RN 1.26.0 / web 3.10.0 / Android 4.10.0.
+
+## 4.10.0 — identity linking on an identified session (ADR-030) + signUp() fix
+
+Non-anonymous sibling of ADR-025. New `auth.linkEmailPassword` / `linkSocial`
+(+ `linkGoogle`/`linkApple`) / `linkGameCenter` attach a 2nd credential to an
+already-identified account (sub preserved), Bearer-authenticated (mirror
+`deleteAccount`'s `getAccessToken` → Bearer POST flow), and refresh the cached
+user in place via `updateLocalUser` — **NO token rotation**. Collision → new
+`SendoraCloudAuthError.credentialInUse`. Play Games is Android-only, so iOS ships
+`linkGameCenter` but not `linkPlayGames`. **signUp() fix:** on iOS, `signUp()`
+only hit `/upgrade` when anonymous; a non-anon signUp used to wipe + fresh-signup
+(= duplicate account). It now returns the new `.alreadyIdentified` error (no wipe,
+no second account); `parseError` also maps the backend's new `NOT_ANONYMOUS` code
+→ `.alreadyIdentified` and `CREDENTIAL_IN_USE` → `.credentialInUse`. Additive,
+SDK-only (not in the golden wire contract); no frozen key/header touched. Version
+in `SDKVersion.swift`. Parity with RN 1.25.0 / web 3.9.0.
+
+## 4.9.0 — `signupMethod` + `lastLoginMethod` on the auth user
+
+`SendoraCloudAuthUser` gains two optional read-only fields: `signupMethod` (how the account was first created, immutable) + `lastLoginMethod` (most recent auth). Free-form provider tokens (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/`magic_link`/`passkey`/`oidc`/…). Backend populates them on the login/signup/social/game response (s58.266, mig 0094). Both are `String?` on the `Codable` struct, so decoding a cached user from a pre-4.9.0 build stays safe (absent → nil); `parseSuccess` also reads them off the response dict. Display-only — never an authorization signal. No frozen key/header/wire-shape touched (ADR-023); not in the golden wire contract. Parity with RN 1.24.0 / web 3.8.0 / Android 4.8.0.
+
+## 4.8.0 — Game Center sign-in
+
+`auth.signInWithGameCenter(publicKeyURL:signature:salt:timestamp:teamPlayerID:bundleID:link:completion:)` — email-less, player-keyed sign-in. Pass the payload from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)` + the app's bundle id; forwards to `POST /auth-service/login/game-center`. Mirrors `loginSocial` exactly (opsQueue, anon-takeover hint read BEFORE wipe → `prevAnonRefreshToken`, `link:true` → `linkAnonymous` for ADR-025 link-in-place, `callAuthSync`). Additive, SDK-only (not in golden wire contract). App obtains the GameKit payload itself (no GameKit dep forced on the SDK). Ships alongside backend Phase 1 + RN 1.21.0.
+
+## 4.7.0 — anon→social link-in-place (ADR-025)
+
+`loginSocial` / `signInWithApple` / `signInWithGoogle` gain an opt-in `link: Bool = false`. When anonymous + `link: true`, the anon→social upgrade sends `linkAnonymous` so the backend promotes the anon row IN PLACE — `sub` PRESERVED (fires `auth.user_upgraded`) instead of a device-takeover (new id); Firebase `linkWithCredential` parity. No effect off-anon or on a collision. Source-compatible default (trailing-closure callers unaffected); additive. Design: `docs/decisions/025-anon-social-link-in-place.md`.
+
+## 4.5.0 — SDK/API compatibility (ADR-023)
+
+4.5.0 — ADR-023: single-source sdkVersion constant (no more hardcoded drift) +
+X-Sendora-SDK-{Name,Version} headers + sendora_schema_version=1 marker (additive).
+
+The version string used to be hardcoded as `"4.4.0"` in two places (the event
+body `context.sdk` and a `Package.swift` reference) — drift risk. Now the ONLY
+source of truth is `Internal/SDKVersion.swift` (`SendoraCloud.sdkVersion` /
+`.sdkName`); the event body reads it and `Package.swift` just carries a comment
+kept in lockstep with the git tag. Every HTTP request (`APIClient`, both the
+plain `request` and `requestWithDetails` builders) now also sends
+`X-Sendora-SDK-Name: sendora-ios` + `X-Sendora-SDK-Version: <sdkVersion>` so the
+backend gets a version signal on non-event routes too (auth/links/push) — the
+backend ignores them today. On `configure`, `Storage.initSchemaVersionIfAbsent()`
+writes UserDefaults key `sendora_schema_version = "1"` if absent (non-sensitive →
+UserDefaults tier, NOT Keychain), giving a future in-place upgrade a hook to
+branch a local-storage migration. Read nowhere yet; no existing key renamed
+(frozen per ADR-023 §3.4). All additive + backward-compatible.
+
+## 4.4.0 — appVersion in device context (ADR-022)
+
+`DeviceInfo.toDictionary()` now also emits `appVersion` (already collected from
+`CFBundleShortVersionString`) alongside the existing `type` / `os` / `osVersion`
+/ `model`. So every event's `context.device` carries the host app version,
+powering the dashboard Analytics → Audience app-version breakdown. No config or
+host-app change — auto-detected from the bundle. The native SDKs already led on
+device context; this just surfaces the app version that was being collected but
+not sent.
+
+## Engagement time (Wave 75 — 4.1.0)
+
+`SendoraCloud.trackScreen(_:properties:)` emits `screen.viewed` and flushes the
+previous screen's `app.engagement { durationMs, screen, sessionId }` (foreground
+-only). New `autoTrackEngagement` config flag (default on). `willResignActive`
+flushes + pauses; `didBecomeActive` resumes (the observer is now registered when
+lifecycle OR engagement is on). State guarded by the existing `serialQueue`;
+spans <250ms dropped, >6h clamped, emit happens outside the lock. **No
+UIViewController swizzling** — deliberately, so screen names stay accurate
+(swizzle counts container / nav / tab controllers) and there's zero added crash
+surface. Matches GA4 `engagement_time_msec`; powers `/analytics/engagement`.
+
+## Account deletion (s58.209)
+
+`auth.deleteAccount(completion:)` (Bearer) deletes the signed-in user's account
+for Apple App Store Guideline 5.1.1(v). `Result<AccountDeletionResult, Error>` —
+`status` is `"purged"` (grace 0) or `"pending"` (disabled + sessions revoked now;
+hard-deleted at `scheduledPurgeAt`, cancellable by signing back in within grace).
+Wipes local identity on success. Grace period is a per-project Auth setting.
+
+**4.3.1 — refresh-before-delete.** `deleteAccount(completion:)` now resolves a
+fresh access token via `getAccessToken` (refreshing a past-expiry cached token)
+BEFORE the `DELETE` instead of sending the raw cached token via `bearerHeaders()`.
+This is a one-shot destructive action — a 401 from a stale token (typical when a
+user taps "delete" after the app sat idle past the short access TTL) would
+silently strand them with an undeleted account (cause of prod
+`DELETE /auth-service/me 401`s). **Host-app note:** wire your delete button to
+`auth.deleteAccount()` — NOT `consent.requestDeletion()` (GDPR ledger only).
+
+## Deep Links no-app routing mode (s58.208)
+
+`LinkCreateInput` gains an optional `noAppMode: String?` (`"auto"`/`"store"`/`"web"`)
+forwarded as `noAppMode` on `POST /sdk/links`. Controls what a **mobile visitor
+without the app installed** gets: `auto` (default) = store-if-registered-else-web,
+`store` = prefer store, `web` = force the web fallback even when a store URL
+exists. `nil` inherits the project default. Additive + backwards-compatible.
+Desktop is always web.
+
 ## Publish
 
-`git tag <semver> && git push origin <semver>`. Release via `gh release create`.
+Native SDKs ship via a git tag on the **separate public mirror** `github.com/sendoracloud/sdk-ios` (SwiftPM), not npm. From a monorepo checkout:
+
+1. Guard the version: `node scripts/publish.mjs ios` (verifies `SDKVersion.swift` is consistent).
+2. Mirror it (operator, needs a clone of the mirror + push creds):
+   `node scripts/publish-native-mirror.mjs ios --mirror-dir <clone> [--push] [--delete]` — rsyncs `packages/sdk-ios/` → the mirror clone (excludes `.build`/`.swiftpm`), commits, tags `<semver>`, pushes. **DRY by default**; `--push` executes; `--delete` makes the mirror an exact copy. It refuses a wrong/monorepo mirror dir or an existing tag. First time: `git clone https://github.com/sendoracloud/sdk-ios.git <clone>`.
+
+Raw path (equivalent): rsync source into the mirror clone, then `git tag <semver> && git push origin main --tags`; release via `gh release create`.

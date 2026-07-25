@@ -28,6 +28,27 @@ final class SendoraStorage {
         set { defaults.set(newValue, forKey: "sendora_session_id") }
     }
 
+    /// ADR-023 on-device schema marker. Non-sensitive → UserDefaults (NOT
+    /// Keychain). A future in-place upgrade can branch on this to migrate the
+    /// flat key-value store. Written once on init if absent; read nowhere yet.
+    /// `nil` = pre-marker install (treat as the implicit "0" baseline).
+    var schemaVersion: String? {
+        get { defaults.string(forKey: "sendora_schema_version") }
+        set {
+            if let v = newValue { defaults.set(v, forKey: "sendora_schema_version") }
+            else { defaults.removeObject(forKey: "sendora_schema_version") }
+        }
+    }
+
+    /// Stamp the current on-device schema version exactly once. No-op if the
+    /// marker already exists, so an existing key is never overwritten (key is
+    /// frozen per ADR-023 §3.4).
+    func initSchemaVersionIfAbsent() {
+        if defaults.object(forKey: "sendora_schema_version") == nil {
+            defaults.set("1", forKey: "sendora_schema_version")
+        }
+    }
+
     // MARK: - Keychain-backed (sensitive)
 
     var cachedUserId: String? {

@@ -155,7 +155,7 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
                 "name": NSNull(),
                 "isAnonymous": false,
             ]
-            var data: [String: Any] = [
+            var authPayload: [String: Any] = [
                 "user": synthesisedUser,
                 "tokens": [
                     "accessToken": accessToken,
@@ -165,11 +165,11 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
                 ],
             ]
             if let retired = retiredAnonUserId, !retired.isEmpty {
-                data["retiredAnonUserId"] = retired
+                authPayload["retiredAnonUserId"] = retired
             }
             let synthesisedEnvelope: [String: Any] = [
                 "success": true,
-                "data": data,
+                "data": authPayload,
             ]
             if let user = self.auth.persistFromAuthResponse(synthesisedEnvelope) {
                 completion(.success(user))

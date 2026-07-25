@@ -34,6 +34,16 @@ public struct SendoraCloudAuthUser: Codable {
     public let emailVerified: Bool
     public let name: String?
     public let isAnonymous: Bool
+    /// How this account was FIRST created (`signupMethod`, immutable) and how it
+    /// MOST RECENTLY authenticated (`lastLoginMethod`). Free-form provider tokens
+    /// (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/
+    /// `magic_link`/`passkey`/`oidc`/…). Read-only, display-only — never an
+    /// authorization signal. `nil` against a backend older than s58.266, or for a
+    /// row created before it (backfilled on next sign-in). sdk-ios 4.9.0+.
+    /// Optional (Codable decodes to nil when absent) → decoding a cached user from
+    /// a pre-4.9.0 build stays safe.
+    public let signupMethod: String?
+    public let lastLoginMethod: String?
 }
 
 public struct SendoraCloudAuthTokens: Codable {
@@ -45,6 +55,13 @@ public struct SendoraCloudAuthTokens: Codable {
 
 public enum SendoraCloudAuthError: Error {
     case emailAlreadyTaken(String)
+    /// `signUp()` on a session already signed in with an identity (ADR-030 §4).
+    /// Use `linkEmailPassword()` / `linkGoogle()` / … to add a credential to
+    /// THIS account, or sign out first — do not create a second account.
+    case alreadyIdentified(String)
+    /// A credential passed to `link*()` is already attached to a DIFFERENT
+    /// account (ADR-030 §2). Sendora never auto-merges two real accounts.
+    case credentialInUse(String)
     case unauthorized(String)
     case network(String)
     case unknown(String)
@@ -62,6 +79,14 @@ public struct DeviceTakeoverEvent {
     public let at: Date
 }
 
+/// Detail handed to `onDeletionCancelled` subscribers (s58.269). Fires once
+/// per sign-in that cancelled a pending self-service account deletion within
+/// its grace window — the account is restored with the SAME user_id.
+public struct DeletionCancelledEvent {
+    public let userId: String
+    public let at: Date
+}
+
 public final class SendoraCloudAuth {
     private let client: APIClient
     private let storage: SendoraStorage
@@ -69,6 +94,13 @@ public final class SendoraCloudAuth {
     private let onAnonymousWipe: () -> Void
     private var cachedUser: SendoraCloudAuthUser?
     private var cachedExpiresAt: Int64 = 0
+    /// Anon refresh token captured at `signInWithMfaSupport` time, stashed
+    /// keyed to the issued `mfaChallengeToken` so the later `challengeMfa`
+    /// can forward it for device-takeover (s58.111). Without this, the MFA
+    /// branch wiped the anon identity before the challenge resolved → the
+    /// takeover hint was lost → one device ended with two user_ids +
+    /// duplicate pushes (audit s58.203 fix).
+    private var pendingAnonTakeover: (challengeToken: String, prevAnonRefreshToken: String)?
     private let lock = NSLock()
     /// Serial queue for public auth ops. All signIn/signUp/signOut/anonymous
     /// calls funnel through here so concurrent invocations execute one at
@@ -81,6 +113,9 @@ public final class SendoraCloudAuth {
     /// unsubscribe via the returned closure. Lock-protected.
     private var takeoverListeners: [UUID: (DeviceTakeoverEvent) -> Void] = [:]
     private var lastTakeover: DeviceTakeoverEvent?
+    /// Inline deletion-cancelled listeners (s58.269). UUID-keyed; lock-protected.
+    private var deletionCancelledListeners: [UUID: (DeletionCancelledEvent) -> Void] = [:]
+    private var lastDeletionCancelled: DeletionCancelledEvent?
 
     init(
         client: APIClient,
@@ -181,14 +216,19 @@ public final class SendoraCloudAuth {
                 return
             }
 
-            // Fresh signup from a non-anonymous identified state — wipe
-            // BEFORE the network call so events fired during the round
-            // trip don't cling to the old identity.
+            // ADR-030 §4: already signed in with an identity. signUp() would
+            // orphan the current account by minting a second one — refuse and
+            // point at link*() (was: silently wiped + fresh-signup = duplicate
+            // account). A genuinely signed-out caller (no cachedUser) still
+            // falls through to a fresh signup below.
             let wasIdentified: Bool = {
                 self.lock.lock(); defer { self.lock.unlock() }
                 return self.cachedUser != nil && self.cachedUser?.isAnonymous == false
             }()
-            if wasIdentified { self.wipeLocalIdentity() }
+            if wasIdentified {
+                completion(.failure(.alreadyIdentified("Already signed in. Use linkEmailPassword() to add a password to this account, or sign out first.")))
+                return
+            }
 
             var body: [String: Any] = ["email": email, "password": password]
             if let name = name { body["name"] = name }
@@ -240,13 +280,21 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SignInOutcome, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
-            let hadUser: Bool = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser != nil
-            }()
-            if hadUser { self.wipeLocalIdentity() }
+            // Capture the device-takeover hint BEFORE any wipe, exactly like
+            // signIn(). Do NOT wipe the anon identity here — the MFA challenge
+            // may not resolve (or may fail), so the anon session must survive
+            // until challengeMfa() actually mints a real session. On the
+            // no-MFA direct-success path we wipe-then-persist inside the
+            // success branch below (audit s58.203 device-takeover fix).
+            var prevAnonRefreshToken: String? = nil
+            self.lock.lock()
+            let hadUser = self.cachedUser != nil
+            let isAnon = self.cachedUser?.isAnonymous == true
+            self.lock.unlock()
+            if isAnon { prevAnonRefreshToken = self.storage.authRefreshToken }
 
-            let body: [String: Any] = ["email": email, "password": password]
+            var body: [String: Any] = ["email": email, "password": password]
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
             let semaphore = DispatchSemaphore(value: 0)
             self.client.post(path: "/auth-service/login", body: body) { response in
                 if let err = self.parseError(response) {
@@ -262,6 +310,13 @@ public final class SendoraCloudAuth {
                 if let mfaRequired = data["mfaRequired"] as? Bool,
                    mfaRequired,
                    let challengeToken = data["mfaChallengeToken"] as? String {
+                    // Stash the anon takeover token keyed to this challenge so
+                    // challengeMfa() can forward it. Anon identity stays intact.
+                    if let prev = prevAnonRefreshToken {
+                        self.lock.lock()
+                        self.pendingAnonTakeover = (challengeToken: challengeToken, prevAnonRefreshToken: prev)
+                        self.lock.unlock()
+                    }
                     let userDict = data["user"] as? [String: Any]
                     let userId = (userDict?["id"] as? String) ?? ""
                     completion(.success(.mfaRequired(challengeToken: challengeToken, userId: userId)))
@@ -274,11 +329,11 @@ public final class SendoraCloudAuth {
                     semaphore.signal()
                     return
                 }
+                // Direct success (account has no MFA): clear the old anon
+                // identity now, after the new session is confirmed, then persist.
+                if hadUser { self.wipeLocalIdentity() }
                 self.persist(user: user, tokens: tokens)
-                if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-                   !retired.isEmpty {
-                    self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-                }
+                self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
                 completion(.success(.authenticated(user)))
                 semaphore.signal()
             }
@@ -358,6 +413,53 @@ public final class SendoraCloudAuth {
         for fn in snapshot { fn(evt) }
     }
 
+    /// Subscribe to deletion-cancelled events (s58.269): fires when a sign-in
+    /// cancelled a pending self-service account deletion within its grace
+    /// window (the account is restored, same user_id). Surface "your deletion
+    /// was cancelled" + reconcile local state. Returns an unsubscribe closure.
+    @discardableResult
+    public func onDeletionCancelled(_ listener: @escaping (DeletionCancelledEvent) -> Void) -> () -> Void {
+        let key = UUID()
+        lock.lock()
+        deletionCancelledListeners[key] = listener
+        lock.unlock()
+        return { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock(); defer { self.lock.unlock() }
+            self.deletionCancelledListeners.removeValue(forKey: key)
+        }
+    }
+
+    /// The most recent deletion-cancelled event this session, or nil.
+    public func getLastDeletionCancelled() -> DeletionCancelledEvent? {
+        lock.lock(); defer { lock.unlock() }
+        return lastDeletionCancelled
+    }
+
+    /// Internal — fan out deletion-cancelled to subscribers + cache the latest.
+    func fireDeletionCancelled(userId: String) {
+        let evt = DeletionCancelledEvent(userId: userId, at: Date())
+        let snapshot: [(DeletionCancelledEvent) -> Void] = {
+            lock.lock(); defer { lock.unlock() }
+            lastDeletionCancelled = evt
+            return Array(deletionCancelledListeners.values)
+        }()
+        for fn in snapshot { fn(evt) }
+    }
+
+    /// Fire BOTH lifecycle listeners (device-takeover + deletion-cancelled)
+    /// from a backend auth response — the single place that parses the two
+    /// optional signals so every sign-in path emits them consistently (s58.269).
+    func fireLifecycleSignals(from response: [String: Any]?, identifiedUserId: String) {
+        let data = response?["data"] as? [String: Any]
+        if let retired = data?["retiredAnonUserId"] as? String, !retired.isEmpty {
+            fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: identifiedUserId)
+        }
+        if let restored = data?["reactivatedFromDeletion"] as? Bool, restored {
+            fireDeletionCancelled(userId: identifiedUserId)
+        }
+    }
+
     /// Exchange the `mfaChallengeToken` from `signInWithMfaSupport` + a
     /// 6-digit TOTP code (or a 17-char recovery code) for a real session.
     public func challengeMfa(
@@ -366,9 +468,55 @@ public final class SendoraCloudAuth {
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
+            // Forward the device-takeover hint: prefer the token stashed at
+            // signInWithMfaSupport() time (keyed to this challenge), falling
+            // back to the live anon refresh (covers callers who reached an
+            // MFA challenge through a path that didn't stash). Captured BEFORE
+            // any wipe. The anon identity is wiped ONLY on a successful mint
+            // below — a wrong/expired code preserves the anon session so the
+            // user can retry (audit s58.203 device-takeover fix).
+            let stashed: String? = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                if let p = self.pendingAnonTakeover, p.challengeToken == challengeToken {
+                    return p.prevAnonRefreshToken
+                }
+                return nil
+            }()
+            let prevAnonRefreshToken = stashed ?? self.takeoverHint()
+            let hadUser: Bool = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.cachedUser != nil
+            }()
+
             var body: [String: Any] = ["challengeToken": challengeToken, "code": code]
-            if let prev = self.takeoverHint() { body["prevAnonRefreshToken"] = prev }
-            self.callAuthSync(path: "/auth-service/mfa/challenge", body: body, completion: completion)
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
+
+            let semaphore = DispatchSemaphore(value: 0)
+            self.client.post(path: "/auth-service/mfa/challenge", body: body) { response in
+                if let err = self.parseError(response) {
+                    completion(.failure(err)) // anon identity preserved on failure
+                    semaphore.signal()
+                    return
+                }
+                guard let user = self.parseSuccess(response),
+                      let tokens = self.parseTokens(response) else {
+                    completion(.failure(.unknown("Malformed response")))
+                    semaphore.signal()
+                    return
+                }
+                // Success: clear the stash + old anon identity, then persist.
+                self.lock.lock()
+                if self.pendingAnonTakeover?.challengeToken == challengeToken {
+                    self.pendingAnonTakeover = nil
+                }
+                self.lock.unlock()
+                if hadUser { self.wipeLocalIdentity() }
+                self.persist(user: user, tokens: tokens)
+                self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
+                completion(.success(user))
+                semaphore.signal()
+            }
+            semaphore.wait()
         }
     }
 
@@ -412,6 +560,11 @@ public final class SendoraCloudAuth {
         codeVerifier: String? = nil,
         appleFirstName: String? = nil,
         appleLastName: String? = nil,
+        // ADR-025 link-in-place opt-in. When anonymous + `link: true`, an
+        // anon→social upgrade KEEPS the same user id (sub) — promoted in place
+        // (like Firebase linkWithCredential) instead of a device-takeover that
+        // mints a new id. No effect off-anon or on a collision.
+        link: Bool = false,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
@@ -437,6 +590,8 @@ public final class SendoraCloudAuth {
                 body["appleName"] = name
             }
             if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if link { body["linkAnonymous"] = true }
             self.callAuthSync(path: "/auth-service/login/social", body: body, completion: completion)
         }
     }
@@ -445,8 +600,9 @@ public final class SendoraCloudAuth {
     public func signInWithGoogle(
         code: String,
         redirectUri: String,
+        link: Bool = false,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "google", code: code, redirectUri: redirectUri, completion: completion) }
+    ) { loginSocial(provider: "google", code: code, redirectUri: redirectUri, link: link, completion: completion) }
 
     /// Convenience: GitHub authorization-code login.
     public func signInWithGitHub(
@@ -463,6 +619,8 @@ public final class SendoraCloudAuth {
         idToken: String,
         firstName: String? = nil,
         lastName: String? = nil,
+        // ADR-025: keep the same user id on an anon→Apple upgrade. See `loginSocial`.
+        link: Bool = false,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         loginSocial(
@@ -470,8 +628,51 @@ public final class SendoraCloudAuth {
             idToken: idToken,
             appleFirstName: firstName,
             appleLastName: lastName,
+            link: link,
             completion: completion
         )
+    }
+
+    /// Apple Game Center sign-in (email-less, player-keyed). Pass the payload
+    /// from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)`
+    /// plus your app's bundle id — obtain them via GameKit (or the Sendora
+    /// helper). `link: true` KEEPS the same user id when upgrading an anonymous
+    /// device (ADR-025 link-in-place); no effect off-anon or on a collision.
+    /// `signature`/`salt` are base64; `timestamp` is GameKit's millisecond value.
+    public func signInWithGameCenter(
+        publicKeyURL: String,
+        signature: String,
+        salt: String,
+        timestamp: UInt64,
+        teamPlayerID: String,
+        bundleID: String,
+        link: Bool = false,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        opsQueue.async {
+            // Device-takeover hint — same posture as loginSocial().
+            var prevAnonRefreshToken: String? = nil
+            self.lock.lock()
+            let hadUser = self.cachedUser != nil
+            let isAnon = self.cachedUser?.isAnonymous == true
+            self.lock.unlock()
+            if isAnon { prevAnonRefreshToken = self.storage.authRefreshToken }
+
+            if hadUser { self.wipeLocalIdentity() }
+
+            var body: [String: Any] = [
+                "publicKeyUrl": publicKeyURL,
+                "signature": signature,
+                "salt": salt,
+                "timestamp": timestamp,
+                "teamPlayerId": teamPlayerID,
+                "bundleId": bundleID,
+            ]
+            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if link { body["linkAnonymous"] = true }
+            self.callAuthSync(path: "/auth-service/login/game-center", body: body, completion: completion)
+        }
     }
 
     /// Convenience: Microsoft Azure AD authorization-code login.
@@ -689,6 +890,231 @@ public final class SendoraCloudAuth {
         client.delete(path: "/auth-service/sessions/me", headers: headers) { _ in completion() }
     }
 
+    /// Outcome of `deleteAccount`. `status` is `"purged"` (hard-deleted now,
+    /// grace = 0) or `"pending"` (deactivated + sessions revoked now, hard
+    /// delete scheduled at `scheduledPurgeAt`; cancellable by signing back in).
+    public struct AccountDeletionResult {
+        public let status: String
+        public let scheduledPurgeAt: String?
+        public let graceDays: Int
+    }
+
+    /// Delete the signed-in user's account (Apple App Store Guideline 5.1.1(v)).
+    /// Honors the project's configured grace period. Wipes local identity on
+    /// success (the server has revoked the session). Fails when no user is
+    /// signed in or the request errors.
+    ///
+    /// Resolves a FRESH access token via `getAccessToken` first (refreshing a
+    /// past-expiry cached token) — this is a one-shot destructive action, so a
+    /// 401 from a stale token would silently strand the user with an undeleted
+    /// account (the cause of the prod 401s when "delete" was tapped after the
+    /// app sat idle).
+    public func deleteAccount(completion: @escaping (Result<AccountDeletionResult, Error>) -> Void) {
+        getAccessToken { [weak self] token in
+            guard let self = self else { return }
+            guard let token = token else {
+                completion(.failure(NSError(domain: "SendoraCloud", code: 401,
+                    userInfo: [NSLocalizedDescriptionKey: "deleteAccount requires a signed-in user"])))
+                return
+            }
+            let headers = ["Authorization": "Bearer \(token)"]
+            self.client.delete(path: "/auth-service/me", headers: headers) { [weak self] response in
+                guard let response = response else {
+                    completion(.failure(NSError(domain: "SendoraCloud", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "deleteAccount failed (network error)"])))
+                    return
+                }
+                if let error = response["error"] as? [String: Any] {
+                    let msg = (error["message"] as? String) ?? "deleteAccount failed"
+                    completion(.failure(NSError(domain: "SendoraCloud", code: 500,
+                        userInfo: [NSLocalizedDescriptionKey: msg])))
+                    return
+                }
+                // Account is gone / deactivated server-side — drop local identity.
+                self?.wipeLocalIdentity()
+                let data = response["data"] as? [String: Any]
+                completion(.success(AccountDeletionResult(
+                    status: (data?["status"] as? String) ?? "pending",
+                    scheduledPurgeAt: data?["scheduledPurgeAt"] as? String,
+                    graceDays: (data?["graceDays"] as? Int) ?? 0
+                )))
+            }
+        }
+    }
+
+    // MARK: - Identity linking (ADR-030)
+    //
+    // Attach a SECOND credential to the CURRENT signed-in account, preserving
+    // the same user id (sub). Unlike signUp()/loginSocial(link:) — which
+    // preserve the sub only from an ANONYMOUS session — these operate on an
+    // already-identified account. Bearer-authenticated; NO token rotation (the
+    // cached user is refreshed in place). Collision → `.credentialInUse` (never
+    // merges). Primary use: one account across platforms — a Game Center player
+    // links email/Google, then signs in on Android to the SAME sub.
+
+    /// Link email + password to the current account (sub preserved).
+    public func linkEmailPassword(
+        email: String,
+        password: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        linkCredential(path: "/auth-service/me/link/email", body: ["email": email, "password": password], completion: completion)
+    }
+
+    /// Link an OAuth social identity to the current account. Pass a native
+    /// `idToken` OR a web `code` + `redirectURI`.
+    public func linkSocial(
+        provider: String,
+        idToken: String? = nil,
+        code: String? = nil,
+        redirectURI: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        var body: [String: Any] = ["provider": provider]
+        if let idToken = idToken { body["idToken"] = idToken }
+        if let code = code { body["code"] = code }
+        if let redirectURI = redirectURI { body["redirectUri"] = redirectURI }
+        linkCredential(path: "/auth-service/me/link/social", body: body, completion: completion)
+    }
+
+    /// Convenience: link a Google identity (native `idToken`, or web `code`+`redirectURI`).
+    public func linkGoogle(
+        idToken: String? = nil,
+        code: String? = nil,
+        redirectURI: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        linkSocial(provider: "google", idToken: idToken, code: code, redirectURI: redirectURI, completion: completion)
+    }
+
+    /// Convenience: link an Apple identity (native ASAuthorization `idToken`).
+    public func linkApple(
+        idToken: String? = nil,
+        code: String? = nil,
+        redirectURI: String? = nil,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        linkSocial(provider: "apple", idToken: idToken, code: code, redirectURI: redirectURI, completion: completion)
+    }
+
+    /// Link an Apple Game Center identity to the current account. Pass the
+    /// payload from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)`
+    /// + the app's bundle id (same inputs as `signInWithGameCenter`).
+    public func linkGameCenter(
+        publicKeyURL: String,
+        signature: String,
+        salt: String,
+        timestamp: Int,
+        teamPlayerID: String,
+        bundleID: String,
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        let body: [String: Any] = [
+            "publicKeyUrl": publicKeyURL,
+            "signature": signature,
+            "salt": salt,
+            "timestamp": timestamp,
+            "teamPlayerId": teamPlayerID,
+            "bundleId": bundleID,
+        ]
+        linkCredential(path: "/auth-service/me/link/game-center", body: body, completion: completion)
+    }
+
+    /// Shared link executor. Resolves a fresh access token, POSTs the credential
+    /// with the Bearer header, then refreshes the cached user IN PLACE (no token
+    /// rotation — the sub is unchanged). Mirrors `deleteAccount`'s Bearer flow.
+    private func linkCredential(
+        path: String,
+        body: [String: Any],
+        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    ) {
+        getAccessToken { [weak self] token in
+            guard let self = self else { return }
+            guard let token = token else {
+                completion(.failure(.unauthorized("Sign in before linking a credential")))
+                return
+            }
+            let headers = ["Authorization": "Bearer \(token)"]
+            self.client.post(path: path, body: body, headers: headers) { [weak self] response in
+                guard let self = self else { return }
+                if let err = self.parseError(response) {
+                    completion(.failure(err))
+                    return
+                }
+                guard let user = self.parseSuccess(response) else {
+                    completion(.failure(.unknown("Malformed link response")))
+                    return
+                }
+                self.updateLocalUser(user)
+                completion(.success(user))
+            }
+        }
+    }
+
+    /// Refresh the cached user after a link — the sub is unchanged, so only the
+    /// user object + its stored copy change (no token/identity rotation).
+    private func updateLocalUser(_ user: SendoraCloudAuthUser) {
+        lock.lock()
+        cachedUser = user
+        lock.unlock()
+        if let json = try? JSONEncoder().encode(user),
+           let str = String(data: json, encoding: .utf8) {
+            storage.authUserJson = str
+        }
+    }
+
+    /// One credential linked to an account (ADR-030 read side, s58.270).
+    public struct LinkedIdentity {
+        public let provider: String
+        public let email: String?
+        public let linkedAt: String
+    }
+
+    /// Result of `listLinkedIdentities` — the full connected-account set.
+    public struct LinkedIdentitiesResult {
+        public let identities: [LinkedIdentity]
+        public let hasPassword: Bool
+    }
+
+    /// List the auth methods/identities linked to the current account (ADR-030
+    /// read side, s58.270): every social/gaming identity plus a `hasPassword`
+    /// flag — the cross-device / reinstall-durable source of truth for a
+    /// "Connected: Game Center · Google" UI (an on-device tracker misses a link
+    /// made on another device). Bearer-authenticated network read that resolves
+    /// a fresh access token first (mirrors `deleteAccount`). Firebase
+    /// `user.providerData` / Supabase `user.identities` parity.
+    public func listLinkedIdentities(
+        completion: @escaping (Result<LinkedIdentitiesResult, SendoraCloudAuthError>) -> Void
+    ) {
+        getAccessToken { [weak self] token in
+            guard let self = self else { return }
+            guard let token = token else {
+                completion(.failure(.unauthorized("Sign in before listing linked identities")))
+                return
+            }
+            let headers = ["Authorization": "Bearer \(token)"]
+            self.client.get(path: "/auth-service/me/identities", headers: headers) { [weak self] response in
+                guard let self = self else { return }
+                if let err = self.parseError(response) {
+                    completion(.failure(err))
+                    return
+                }
+                guard let data = response?["data"] as? [String: Any] else {
+                    completion(.failure(.unknown("Malformed identities response")))
+                    return
+                }
+                let rows = data["identities"] as? [[String: Any]] ?? []
+                let identities = rows.compactMap { row -> LinkedIdentity? in
+                    guard let provider = row["provider"] as? String, !provider.isEmpty,
+                          let linkedAt = row["linkedAt"] as? String else { return nil }
+                    return LinkedIdentity(provider: provider, email: row["email"] as? String, linkedAt: linkedAt)
+                }
+                let hasPassword = data["hasPassword"] as? Bool ?? false
+                completion(.success(LinkedIdentitiesResult(identities: identities, hasPassword: hasPassword)))
+            }
+        }
+    }
+
     // MARK: - Internals (Bearer)
 
     /// Internal helper used by passkey + SSO flows. Parses the
@@ -702,10 +1128,7 @@ public final class SendoraCloudAuth {
             return nil
         }
         persist(user: user, tokens: tokens)
-        if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-           !retired.isEmpty {
-            fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-        }
+        fireLifecycleSignals(from: response, identifiedUserId: user.id)
         return user
     }
 
@@ -770,10 +1193,7 @@ public final class SendoraCloudAuth {
                 return
             }
             self.persist(user: user, tokens: tokens)
-            if let retired = (response?["data"] as? [String: Any])?["retiredAnonUserId"] as? String,
-               !retired.isEmpty {
-                self.fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: user.id)
-            }
+            self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
             completion(.success(user))
             semaphore.signal()
         }
@@ -928,6 +1348,12 @@ public final class SendoraCloudAuth {
         let error = response["error"] as? [String: Any]
         let code = error?["code"] as? String ?? ""
         let message = error?["message"] as? String ?? "Auth request failed"
+        if code == "NOT_ANONYMOUS" {
+            return .alreadyIdentified(message)
+        }
+        if code == "CREDENTIAL_IN_USE" {
+            return .credentialInUse(message)
+        }
         if code == "CONFLICT" || code == "EMAIL_ALREADY_TAKEN" {
             return .emailAlreadyTaken(message)
         }
@@ -947,7 +1373,9 @@ public final class SendoraCloudAuth {
             email: userDict["email"] as? String,
             emailVerified: userDict["emailVerified"] as? Bool ?? false,
             name: userDict["name"] as? String,
-            isAnonymous: userDict["isAnonymous"] as? Bool ?? false
+            isAnonymous: userDict["isAnonymous"] as? Bool ?? false,
+            signupMethod: userDict["signupMethod"] as? String,   // s58.266
+            lastLoginMethod: userDict["lastLoginMethod"] as? String
         )
     }
 
@@ -990,6 +1418,7 @@ public final class SendoraCloudAuth {
         lock.lock()
         cachedUser = nil
         cachedExpiresAt = 0
+        pendingAnonTakeover = nil
         lock.unlock()
         storage.clearAuthTokens()
         stopProactiveRefreshCron()

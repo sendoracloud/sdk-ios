@@ -35,6 +35,7 @@ public enum SendoraCloudPasskeyError: Error {
     case missingPresenter
 }
 
+@available(iOS 16.0, *)
 public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
     private let client: APIClient
     private let auth: SendoraCloudAuth

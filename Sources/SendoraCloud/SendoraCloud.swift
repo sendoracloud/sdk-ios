@@ -44,6 +44,15 @@ public final class SendoraCloud {
     private static var currentIdentityToken: String?
     private static var isConfigured = false
 
+    // --- Engagement time (foreground-only, Wave 75) ---
+    // All access serialised on `serialQueue`.
+    private static var engScreen: String?
+    private static var engAccumMs: Double = 0
+    /// Foreground segment start; nil = paused (backgrounded).
+    private static var engSegmentStart: Date?
+    private static let minEngagementMs: Double = 250        // drop screen flicker
+    private static let maxEngagementMs: Double = 6 * 60 * 60 * 1000 // 6h clamp
+
     /// Consent gate. Events queue but do not send until `grant()` is called
     /// (unless `config.defaultConsent = true`).
     public static let consent = SendoraCloudConsent(initial: false)
@@ -56,10 +65,23 @@ public final class SendoraCloud {
     /// alongside `auth` on configure(). Use as
     /// `SendoraCloud.passkeys?.register(presentingWindow: window) { ... }`.
     #if canImport(UIKit)
-    public private(set) static var passkeys: SendoraCloudPasskeys?
+    // Backing storage is type-erased so this declaration compiles on the iOS 15
+    // deployment floor (Swift forbids @available on a STORED property, and
+    // SendoraCloudPasskeys references iOS-16-only ASAuthorizationPlatform-
+    // PublicKeyCredentialProvider). The public accessor is gated to iOS 16; on
+    // iOS 15 `SendoraCloud.passkeys` is simply not available (compile-time),
+    // which is correct — passkeys are an iOS 16 feature. Everything else in the
+    // SDK (deep links, analytics, push, auth, SSO) works on iOS 15.
+    private static var _passkeys: Any?
+    @available(iOS 16.0, *)
+    public static var passkeys: SendoraCloudPasskeys? { _passkeys as? SendoraCloudPasskeys }
     /// OIDC SSO via ASWebAuthenticationSession (iOS only). Use as
     /// `SendoraCloud.sso?.signInWithOidc(returnTo:from:completion:)`.
     public private(set) static var sso: SendoraCloudSso?
+    /// Wave 66 — open the worker-hosted contact widget in a modal
+    /// WKWebView. iOS only (UIKit gate). Use as
+    /// `SendoraCloud.support?.presentContactWidget(widgetId:, from:)`.
+    public private(set) static var support: SendoraCloudSupport?
     #endif
 
     /// iOS Live Activities helper (iOS 16.1+, ActivityKit). Wired on
@@ -127,6 +149,9 @@ public final class SendoraCloud {
 
             let store = SendoraStorage()
             self.storage = store
+            // ADR-023: stamp the on-device schema-version marker on first init.
+            // Additive + idempotent (never overwrites an existing value).
+            store.initSchemaVersionIfAbsent()
             self.currentUserId = store.cachedUserId
 
             let device = DeviceContext.collect()
@@ -141,9 +166,15 @@ public final class SendoraCloud {
             self.apiClient = client
 
             let queue = EventQueue(storage: store, flushAt: finalConfig.flushAt, maxSize: finalConfig.maxQueueSize)
-            queue.setFlushHandler { events in
-                if !consent.isGranted { return } // gate flushes on consent
-                flushEvents(events, client: client)
+            queue.setFlushHandler { events, completion in
+                // Gate flushes on consent. Report `true` so the queue treats a
+                // consent-gated chunk as handled (it's intentionally not sent;
+                // re-queuing forever would never drain).
+                if !consent.isGranted {
+                    completion(true)
+                    return
+                }
+                flushEvents(events, client: client, completion: completion)
             }
             queue.startTimer(interval: finalConfig.flushInterval)
             self.eventQueue = queue
@@ -186,9 +217,14 @@ public final class SendoraCloud {
             // for the macOS slice of the package.
             #if canImport(UIKit)
             if let auth = self.auth {
-                self.passkeys = SendoraCloudPasskeys(client: client, auth: auth)
+                // Passkeys need iOS 16 (ASAuthorizationPlatformPublicKeyCredential).
+                // Wire only where available; SSO + the rest work on iOS 15.
+                if #available(iOS 16.0, *) {
+                    self._passkeys = SendoraCloudPasskeys(client: client, auth: auth)
+                }
                 self.sso = SendoraCloudSso(client: client, auth: auth)
             }
+            self.support = SendoraCloudSupport()
             #endif
 
             #if canImport(ActivityKit)
@@ -246,6 +282,9 @@ public final class SendoraCloud {
             object: nil, queue: .main
         ) { _ in
             eventQueue?.persistToDisk()
+            // Flush engagement for the current screen BEFORE session-end so it
+            // carries the just-ended foreground span; then pause accumulation.
+            if finalConfig.autoTrackEngagement { engFlush() }
             trackSessionEnd()
             if finalConfig.autoTrackLifecycle {
                 trackEvent("app.backgrounded", properties: [
@@ -259,13 +298,20 @@ public final class SendoraCloud {
             trackEvent("app.opened", properties: [
                 "sessionId": storage?.sessionId ?? ""
             ])
+        }
+        // didBecomeActive drives both the lifecycle event and engagement
+        // resume, so register it whenever either is enabled.
+        if finalConfig.autoTrackLifecycle || finalConfig.autoTrackEngagement {
             NotificationCenter.default.addObserver(
                 forName: UIApplication.didBecomeActiveNotification,
                 object: nil, queue: .main
             ) { _ in
-                trackEvent("app.foregrounded", properties: [
-                    "sessionId": storage?.sessionId ?? ""
-                ])
+                if finalConfig.autoTrackLifecycle {
+                    trackEvent("app.foregrounded", properties: [
+                        "sessionId": storage?.sessionId ?? ""
+                    ])
+                }
+                if finalConfig.autoTrackEngagement { engResume() }
             }
         }
         #endif
@@ -370,15 +416,86 @@ public final class SendoraCloud {
             "properties": properties ?? [:],
             "context": [
                 "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": "sendora-ios", "version": "4.0.5"],
+                "sdk": ["name": sdkName, "version": sdkVersion],
             ],
             "sessionId": storage?.sessionId ?? "",
-            "consent": ["analytics"],
+            // Reflect the SDK's actual (boolean) consent state rather than
+            // stamping a constant claim. The flush gate only sends events
+            // while granted, so this is just an honest in-payload record.
+            "consent": consent.isGranted ? ["analytics"] : [],
         ]
-        if let uid = currentUserId { event["userId"] = uid }
+        if let uid = currentUserId {
+            event["userId"] = uid
+        } else if let anonId = storage?.deviceId {
+            // No identified user yet — attach the stable Keychain device id
+            // as anonymousId so the backend can stitch pre-identify activity
+            // to the user once identify() runs (events.ts `anonymousId`).
+            event["anonymousId"] = anonId
+        }
         if let tok = currentIdentityToken { event["identityToken"] = tok }
 
         queue.add(event: event)
+    }
+
+    /// Record a screen view. Emits `screen.viewed` and (when
+    /// `autoTrackEngagement` is on) flushes the foreground engagement time of
+    /// the previously-viewed screen as an `app.engagement` event. Call this on
+    /// every navigation from your `UIViewController.viewDidAppear` /
+    /// SwiftUI `.onAppear`. There is no swizzling — you name real screens so
+    /// the data stays clean.
+    public static func trackScreen(_ name: String, properties: [String: Any]? = nil) {
+        guard isConfigured, let config = config else { return }
+        // Flush the previous screen's foreground span, then start the new one.
+        if config.autoTrackEngagement { engFlush() }
+        var props = properties ?? [:]
+        props["screenName"] = name
+        trackEvent("screen.viewed", properties: props)
+        if config.autoTrackEngagement { engEnter(name) }
+    }
+
+    // --- Engagement timer (foreground-only, Wave 75) ---
+
+    /// Bank the in-flight foreground segment + pause. Caller already on
+    /// the main queue (lifecycle) or any queue (trackScreen) — guarded by
+    /// `serialQueue` for the shared-state mutation.
+    private static func engFlush() {
+        var emit: Double?
+        var screen: String?
+        serialQueue.sync {
+            if let start = engSegmentStart {
+                engAccumMs += Date().timeIntervalSince(start) * 1000.0
+                engSegmentStart = nil
+            }
+            guard let s = engScreen else { engAccumMs = 0; return }
+            var ms = engAccumMs
+            engAccumMs = 0
+            if ms < minEngagementMs { return }
+            if ms > maxEngagementMs { ms = maxEngagementMs }
+            emit = ms
+            screen = s
+        }
+        if let ms = emit, let s = screen {
+            trackEvent("app.engagement", properties: [
+                "durationMs": Int(ms.rounded()),
+                "screen": s,
+                "sessionId": storage?.sessionId ?? "",
+            ])
+        }
+    }
+
+    private static func engEnter(_ name: String) {
+        serialQueue.sync {
+            engScreen = name
+            engAccumMs = 0
+            engSegmentStart = Date()
+        }
+    }
+
+    private static func engResume() {
+        serialQueue.sync {
+            guard engScreen != nil, engSegmentStart == nil else { return }
+            engSegmentStart = Date()
+        }
     }
 
     /// Identify the current user. Pass an HMAC `identityToken` from your backend
@@ -437,12 +554,28 @@ public final class SendoraCloud {
         trackEvent("session.ended", properties: ["sessionId": storage?.sessionId ?? ""])
     }
 
-    private static func flushEvents(_ events: [[String: Any]], client: APIClient) {
-        guard !events.isEmpty else { return }
+    /// Send one chunk of events (already capped at <=100 by EventQueue) and
+    /// report whether the backend ACCEPTED it. The queue only drops events on
+    /// `true`; `false` keeps them buffered for the next flush so nothing is
+    /// lost on an offline / 4xx / 5xx response.
+    private static func flushEvents(
+        _ events: [[String: Any]],
+        client: APIClient,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard !events.isEmpty else {
+            completion(true)
+            return
+        }
         if events.count == 1, let event = events.first {
-            client.post(path: "/events", body: event) { _ in }
+            client.post(path: "/events", body: event) { response in
+                let success = (response?["success"] as? Bool) ?? false
+                completion(success)
+            }
         } else {
-            client.postBatch(path: "/events/batch", events: events) { _ in }
+            client.postBatch(path: "/events/batch", events: events) { success in
+                completion(success)
+            }
         }
     }
 }

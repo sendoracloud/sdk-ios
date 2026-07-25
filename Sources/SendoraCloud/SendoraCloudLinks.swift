@@ -84,6 +84,13 @@ public final class SendoraCloudLinks {
         /// **Optional as of 3.9.0** — backend defaults from the project's
         /// apps registry (web origin > iOS App Store URL > Android Play Store URL).
         public var fallbackUrl: String?
+        /// How a **mobile visitor without the app installed** is routed
+        /// (Adjust / Branch parity). `"auto"` (default) opens the app store
+        /// when one is registered for the platform, else the web
+        /// `fallbackUrl`; `"store"` prefers the store; `"web"` forces the web
+        /// `fallbackUrl` even when a store URL exists. `nil` inherits the
+        /// project default. Desktop is always web.
+        public var noAppMode: String?
         public var iosDeepLinkPath: String?
         public var androidDeepLinkPath: String?
         /// Typed linkData. Use `decodeLinkData<T>` on the receiving event
@@ -105,6 +112,7 @@ public final class SendoraCloudLinks {
         public init(
             title: String,
             fallbackUrl: String? = nil,
+            noAppMode: String? = nil,
             iosDeepLinkPath: String? = nil,
             androidDeepLinkPath: String? = nil,
             linkData: [String: Any]? = nil,
@@ -122,6 +130,7 @@ public final class SendoraCloudLinks {
         ) {
             self.title = title
             self.fallbackUrl = fallbackUrl
+            self.noAppMode = noAppMode
             self.iosDeepLinkPath = iosDeepLinkPath
             self.androidDeepLinkPath = androidDeepLinkPath
             self.linkData = linkData
@@ -231,6 +240,12 @@ public final class SendoraCloudLinks {
     private var prewarmCache: [String: PrewarmEntry] = [:]
     private let prewarmTtl: TimeInterval = 5 * 60
     private let prewarmMax = 50
+    /// Wave 28 — concurrent-mint cap. A runaway loop calling `prewarm()`
+    /// (eg in a SwiftUI List row body) would otherwise burn through the
+    /// backend's per-key rate limit + customer's plan quota. 5 inflight
+    /// matches real share-row UIs.
+    private var prewarmInflight = 0
+    private let prewarmMaxInflight = 5
 
     internal init(apiClient: APIClient, bundleId: String?, linkHosts: [String]) {
         self.apiClient = apiClient
@@ -306,6 +321,7 @@ public final class SendoraCloudLinks {
     private func buildCreateBody(_ input: LinkCreateInput) -> [String: Any] {
         var body: [String: Any] = ["title": input.title]
         if let v = input.fallbackUrl { body["fallbackUrl"] = v }
+        if let v = input.noAppMode { body["noAppMode"] = v }
         if let v = input.iosDeepLinkPath { body["iosDeepLinkPath"] = v }
         if let v = input.androidDeepLinkPath { body["androidDeepLinkPath"] = v }
         if let v = input.linkData { body["linkData"] = v }
@@ -329,12 +345,20 @@ public final class SendoraCloudLinks {
     }
 
     /// Background-mint a link + cache the promise. Fire-and-forget.
+    ///
+    /// Wave 28 — silently drops the call when more than
+    /// `prewarmMaxInflight` mints are already in flight. Prewarm is
+    /// fire-and-forget by contract; an overflow `prewarm()` is fine
+    /// to skip because the next matching `create()` will do the mint
+    /// inline.
     public func prewarm(_ input: LinkCreateInput, key: String? = nil) {
         guard !input.title.isEmpty else { return }
         lock.lock()
         evictExpired()
         let cacheKey = cacheKey(input, override: key)
         if prewarmCache[cacheKey] != nil { lock.unlock(); return }
+        if prewarmInflight >= prewarmMaxInflight { lock.unlock(); return }
+        prewarmInflight += 1
         prewarmCache[cacheKey] = PrewarmEntry(result: nil, waiters: [], createdAt: Date())
         lock.unlock()
         doCreate(input) { [weak self] result in
@@ -347,6 +371,7 @@ public final class SendoraCloudLinks {
             } else {
                 self.prewarmCache[cacheKey] = PrewarmEntry(result: result, waiters: [], createdAt: Date())
             }
+            self.prewarmInflight -= 1
             self.lock.unlock()
             for w in waiters { w(result) }
         }

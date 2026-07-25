@@ -40,6 +40,15 @@ public struct SendoraCloudConfig {
     /// own lifecycle telemetry.
     public var autoTrackLifecycle: Bool
 
+    /// Auto-measure foreground engagement time per screen. When `true`
+    /// (default), `trackScreen(_:)` emits an `app.engagement` event carrying
+    /// foreground-only `durationMs` for the previous screen. Time while the
+    /// app is backgrounded is never counted (GA4 engagement_time_msec model).
+    /// Only measures screens you name via `trackScreen(_:)` — there is no
+    /// UIViewController swizzling (deliberately, to keep screen names accurate
+    /// and avoid counting container / nav / tab controllers).
+    public var autoTrackEngagement: Bool
+
     public init(
         apiKey: String,
         projectId: String? = nil,
@@ -52,7 +61,8 @@ public struct SendoraCloudConfig {
         defaultConsent: Bool = false,
         autoStartAttribution: Bool = true,
         pinnedSPKIHashes: [String] = [],
-        autoTrackLifecycle: Bool = true
+        autoTrackLifecycle: Bool = true,
+        autoTrackEngagement: Bool = true
     ) {
         self.apiKey = apiKey
         self.projectId = projectId
@@ -66,6 +76,7 @@ public struct SendoraCloudConfig {
         self.autoStartAttribution = autoStartAttribution
         self.pinnedSPKIHashes = pinnedSPKIHashes
         self.autoTrackLifecycle = autoTrackLifecycle
+        self.autoTrackEngagement = autoTrackEngagement
     }
 }
 

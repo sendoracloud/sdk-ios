@@ -29,10 +29,9 @@ struct DeviceContext {
         }
         model = device.model
 
-        if let screen = UIScreen.value(forKey: "mainScreen") as? UIScreen {
-            screenWidth = Int(screen.bounds.width * screen.scale)
-            screenHeight = Int(screen.bounds.height * screen.scale)
-        }
+        let screen = UIScreen.main
+        screenWidth = Int(screen.bounds.width * screen.scale)
+        screenHeight = Int(screen.bounds.height * screen.scale)
         #endif
 
         return DeviceContext(
@@ -54,6 +53,9 @@ struct DeviceContext {
             "os": os,
             "osVersion": osVersion,
             "model": model,
+            // ADR-022: app version (CFBundleShortVersionString) so the
+            // dashboard can break analytics down by release.
+            "appVersion": appVersion,
         ]
     }
 }
