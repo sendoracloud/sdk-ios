@@ -14,7 +14,6 @@ final class APIClient: NSObject, URLSessionDelegate {
     private var consecutiveFailures = 0
     private var nextAllowedAfter: Date = .distantPast
 
-    private let maxFailures = 10
     private let maxBackoff: TimeInterval = 60
 
     init(baseUrl: String, apiKey: String, pinnedSPKIHashes: [String] = []) {
@@ -31,9 +30,18 @@ final class APIClient: NSObject, URLSessionDelegate {
     }
 
     /// Circuit breaker: returns true if the caller should skip this call entirely.
+    /// Purely time-based, so it is half-open by construction: each failure
+    /// pushes `nextAllowedAfter` forward with exponential backoff, and once
+    /// that window elapses ONE probe is allowed through — a success resets the
+    /// breaker, a failure re-arms it.
+    ///
+    /// It deliberately does NOT hard-trip on `consecutiveFailures` alone. A
+    /// count-only block can never reset: no request is attempted, so no
+    /// success is ever recorded, so the count never clears — a few minutes in
+    /// airplane mode wedged the entire client for the rest of the process
+    /// lifetime. (sdk-android removed the same trip for the same reason.)
     private func shouldSkip() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if consecutiveFailures > maxFailures { return true }
         return Date() < nextAllowedAfter
     }
 
@@ -73,6 +81,19 @@ final class APIClient: NSObject, URLSessionDelegate {
 
     func delete(path: String, headers: [String: String]?, completion: @escaping ([String: Any]?) -> Void) {
         request(method: "DELETE", path: path, body: nil, headers: headers, completion: completion)
+    }
+
+    /// Stamp the HTTP status onto the envelope's `error` object so a caller can
+    /// classify a failure the backend gave no `code` for (a bare 5xx, a gateway
+    /// page). Deliberately does NOT synthesise an `error` when the body carries
+    /// none — its absence is what makes a caller fall back to its own default
+    /// code, and shipped apps match on those.
+    private static func stampErrorStatus(_ body: [String: Any], status: Int) -> [String: Any] {
+        guard var error = body["error"] as? [String: Any] else { return body }
+        error["status"] = status
+        var out = body
+        out["error"] = error
+        return out
     }
 
     private func request(
@@ -119,15 +140,28 @@ final class APIClient: NSObject, URLSessionDelegate {
 
         let task = session.dataTask(with: req) { [weak self] data, response, _ in
             guard let self = self else { return }
-            if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-               let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                self.recordSuccess()
-                completion(json)
-            } else {
+            guard let http = response as? HTTPURLResponse else {
+                // No response at all — a genuine transport failure.
                 self.recordFailure()
                 completion(nil)
+                return
             }
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? nil
+            if (200..<300).contains(http.statusCode) {
+                self.recordSuccess()
+                completion(json)
+                return
+            }
+            // A non-2xx is the backend answering, not the transport failing.
+            // Returning nil here discarded `error.code` and
+            // `error.details.retryAfterSeconds`, so every 4xx/5xx reached the
+            // caller as an indistinguishable generic network failure — which
+            // is why a wrong password, a 409 and a dead radio all looked the
+            // same, and why the dead-refresh-token branch could never fire.
+            // The breaker guards the TRANSPORT, so only a 5xx counts here; a
+            // 4xx must never cost the caller its retry budget.
+            if http.statusCode >= 500 { self.recordFailure() } else { self.recordSuccess() }
+            completion(json.map { Self.stampErrorStatus($0, status: http.statusCode) })
         }
         task.resume()
     }

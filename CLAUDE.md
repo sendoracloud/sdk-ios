@@ -172,6 +172,173 @@ DELETE /api/v1/orgs/:orgId/push/live-activities/:id
 - `aps.timestamp` must be monotonic; backend uses `Math.floor(Date.now()/1000)` per send.
 - iOS 17+: APNs can also START activities (not just update). Sendora doesn't surface this yet — host app must start v1.
 
+## 4.14.0 — anonymous-session reuse, total error coercion, + 4 MFA/delete defects (s58.271d)
+
+Parity with RN 1.29.0 / web 3.13.0 / Android 4.14.0.
+
+- **A corrupt user blob is now actually recoverable.** Keeping the refresh token
+  when the cached user fails to parse was only half a fix: nothing could turn
+  that token back into an identity, because the refresh discarded the `user` the
+  backend returns in the very same response — so the session sat live with a
+  permanently null user and the next sign-in orphaned the account anyway. The
+  refresh now adopts that user, but **only when there is none** (a refresh is a
+  token rotation, not an identity change), only when it is well-formed (the
+  route tolerates a missing user row), and it emits `signed_in` because
+  recovering an identity IS a transition — while a plain rotation with a user
+  already present still emits nothing.
+
+- **`signInAnonymously(forceNew:)` reuses an existing anonymous session.** It
+  minted a brand-new user unconditionally, and `persist` overwrote the stored
+  refresh token — the previous anonymous account's ONLY durable handle — with no
+  takeover, no webhook and no state event. An app calling it defensively on
+  every cold launch fragmented the player across a new `user_id` per launch:
+  the same lost-progress outcome as a failed sign-in wiping the session, except
+  on a **healthy** network. Now short-circuits when the cached user is anonymous
+  AND a refresh token is in the Keychain (Firebase's `signInAnonymously` does
+  exactly this). `forceNew: Bool = false` is a defaulted parameter, so every
+  existing call site compiles unchanged.
+- **Every rejection carries a `kind`.** The default must stay non-fatal — that
+  is what makes the one-code `isDeadRefreshError` allow-list safe rather than
+  lucky: an unmapped failure can only become session-fatal through a deliberate
+  edit.
+
+**⚠ Four real defects surfaced while doing the coercion pass — all fixed:**
+
+- `deleteAccount` threw bare `NSError`s, so the destructive path had literally
+  no `.kind` at all.
+- `enrollMfa` reported a **timeout** as `.unknown("Malformed enrollment
+  response")` — non-retryable, so the app would not retry a call that had
+  simply timed out.
+- `confirmMfa` reported a **timeout** as `.success(false)` — i.e. "your code is
+  wrong". The user retypes a correct code and is told it is wrong.
+- `disableMfa` reported a **timeout** as `.success(())` **while MFA was still
+  armed** — the app tells the user MFA is off when it is on. That is a
+  security-relevant lie, not just a UX bug.
+- Related: the dictionary `parseError` collapsed EVERY unmapped code into
+  `.unknown`, so a 429 or 503 on magic-link, email-OTP, password-reset,
+  verify-email, `link*` and `listLinkedIdentities` could never classify as
+  `.rateLimited` / `.server`.
+
+**⚠ TWO CARRIER CHANGES (same additive class as 4.13.0's `.rejected`):**
+
+1. `deleteAccount`'s completion type is unchanged (`Result<AccountDeletionResult,
+   Error>`) but the value inside is now `SendoraCloudAuthError`, not `NSError`.
+   An app reading `(error as NSError).code == 401 / -1 / 500` must move to
+   `.kind` / `.status`. Message strings are byte-identical, and a new
+   `LocalizedError` conformance keeps them on `error.localizedDescription`
+   (which previously printed Foundation's generic "operation couldn't be
+   completed" for the enum).
+2. On the plain `post`/`get` auth paths an unmapped backend code now surfaces as
+   `.rejected(code:message:status:retryAfterSeconds:)` instead of
+   `.unknown("CODE: message")` — that is what gives it a real `kind`. Codes with
+   a dedicated case (`CONFLICT`/`EMAIL_ALREADY_TAKEN`, `NOT_ANONYMOUS`,
+   `CREDENTIAL_IN_USE`, `UNAUTHORIZED`/`HTTP_401`) still produce exactly the
+   same case as before, pinned by a test. Side effect: `.message` no longer
+   carries the `"CODE: "` prefix on those paths — the code is available
+   structurally instead.
+
+`swift build` clean; `swift test` **22/22** (was 16/16).
+
+## 4.14.0 — token refresh + transport: the remaining loss routes (s58.271b)
+
+Parity with RN 1.29.0 / web 3.13.0 / Android 4.14.0. See the RN CLAUDE.md
+1.29.0 section for the full write-up.
+
+- **⚠ `/token/refresh` shape (CRITICAL, pre-existing).** Refresh read the flat
+  `data.*` the backend abandoned in s58.76 — the rotated trio is under
+  `data.tokens`. It silently returned nil forever, so the session died at
+  access-token expiry and the app minted a fresh guest. Both levels accepted now.
+- **`APIClient.request` no longer discards a non-2xx body** (the same defect
+  fixed in sdk-android 4.13.0). It nil'd every error response, so the 4.13.0
+  taxonomy could not classify anything and `.signedOut(.sessionExpired)` was
+  unreachable. The body is returned, the HTTP status is stamped onto the error
+  envelope, and only a 5xx or a transport failure trips the breaker.
+- **The circuit breaker no longer latches permanently.** `shouldSkip` hard-tripped
+  on `consecutiveFailures > maxFailures`, which can never reset — no request is
+  attempted, so no success is recorded — wedging the whole SDK for the process
+  lifetime after ~6 minutes offline. Now purely time-based (half-open by
+  construction), matching sdk-android.
+- **A generic 401 no longer wipes the session** (`isDeadRefreshError` narrowed to
+  `INVALID_REFRESH_TOKEN`), and the refresh race is gated both directions by
+  `tokenStillCurrent(sent)`.
+
+## 4.13.0 — a failed sign-in can no longer destroy the account (s58.271)
+
+**The bug (customer-reported, HIGH — silent permanent data loss).** Five
+credentialed sign-in paths cleared local identity — `wipeLocalIdentity()`,
+which drops the Keychain tokens AND fires `onAnonymousWipe` (device/session id
+rotation + event-queue drop) — BEFORE their network call, and no failure path
+restored it. For an anonymous user the stored refresh token is the ONLY durable
+handle on the account, so once the wipe landed and the call failed the account
+was unreachable from the device forever; offline it was not a race but a
+**guarantee**. Word Hurdle lost a real production account this way (30
+purchases incl. an active subscription, 3,355-gem balance) through Game Center
+sign-in on a flaky network. Affected: `signIn`, `loginSocial` (and all seven
+`signInWith*` wrappers), `signInWithGameCenter`, `verifyMagicLink`,
+`verifyEmailOtp` — the last three wiped before ANY input was validated, so a
+mistyped OTP or a stale tapped magic link cost the account too.
+
+**The invariant now, everywhere: a failed auth attempt leaves the caller
+exactly as it found them.** Each path captures the anon refresh via
+`takeoverHint()` (no wipe), calls, and hands the clear to `callAuthSync`'s new
+`replacesIdentity:` flag, which runs `wipeReplacedIdentityIfPresent()` **only
+from the success branch, glued to the `persist`** — the shape
+`signInWithMfaSupport` / `challengeMfa` already used since the s58.203 fix (see
+"4.1.3" above) and which was never propagated to their siblings. `signUp`
+(in-place `/upgrade`) and `signInAnonymously` pass false: nothing to replace.
+Same fix in RN 1.28.0 / web 3.12.0 / Android 4.12.0.
+
+Three things ship alongside it, because the fix changes what a rejection
+*means* and an app must be able to act on it:
+
+- **Error taxonomy — `.kind` / `.retryable` / `.retryAfterSeconds` / `.status`**
+  as computed properties on `SendoraCloudAuthError`, plus the
+  `SendoraCloudAuthErrorKind` closed set (`network` · `server` · `rate_limited`
+  · `invalid_credential` · `account_locked` · `credential_in_use` ·
+  `already_identified` · `cancelled` · `config` · `unknown`, raw values
+  identical to `@sendora/shared` `AuthErrorKind` so `kind.rawValue` logs the
+  same token on all 4 SDKs). `retryAfterSeconds` comes from
+  `error.details.retryAfterSeconds` (429 backoff + the new backend
+  `ACCOUNT_LOCKED` 403; **absent = the lock needs support**).
+  **⚠ Two carrier changes to know about:** (1) a NEW enum case
+  `.rejected(code:message:status:retryAfterSeconds:)` — a Swift enum can't carry
+  per-instance data otherwise; every pre-4.13.0 case is still produced for the
+  exact same codes (mapping centralised in `mapKnownErrorCode`), but an app that
+  switches over the enum **exhaustively** must add a `default:` (same class of
+  additive change as 4.10.0's `.alreadyIdentified`/`.credentialInUse`). (2) the
+  sign-in paths now POST through `APIClient.requestWithDetails` instead of
+  `post`, which collapsed EVERY non-2xx to `nil` — that is why a wrong password,
+  a 409 and a dead radio all surfaced as `.network("Network request failed")`
+  and why `parseError`'s code branches were effectively dead. Auth 4xx also no
+  longer trips the client-wide circuit breaker (only a status-0 transport
+  failure does).
+- **`onAuthStateChanged(listener) -> unsubscribe`** — one stream:
+  `.signedIn` / `.signedOut(reason: .user | .sessionExpired | .accountDeleted)`
+  / `.deviceTakeover` / `.deletionCancelled`. The load-bearing case is
+  `.sessionExpired`: a session that died in the background (dead refresh token)
+  previously emitted **nothing**, so an app couldn't tell it from a deliberate
+  sign-out and only noticed when `getAccessToken` returned nil. Replays the
+  current state on subscribe once the Keychain hydrate has run (`hydrated` flag,
+  set at the end of `init`) — never before, which would report "signed out"
+  during restore — and emits nothing for a signed-out cold start. **A
+  `.replaced` wipe (the internal pre-`persist` clear) emits NOTHING**, else every
+  sign-in would look like a logout/login pair. A failed sign-in emits nothing at
+  all: no state changed. `onDeviceTakeover` / `onDeletionCancelled` unchanged.
+- **A rate limit is no longer treated as a dead session.**
+  `isDeadRefreshError` dropped `RATE_LIMIT` / `RATE_LIMIT_EXCEEDED`: a 429 is
+  transient throttling (shared NAT/CGN egress, refresh burst) and says nothing
+  about token validity, yet it was wiping live sessions from the background
+  refresh path. Relatedly, `init`'s corrupt-cache guard no longer calls
+  `storage.clearAuthTokens()` when only the cached USER blob failed to decode —
+  it drops the user + access token and **keeps the refresh token**, the only
+  thing that can recover that account.
+
+Tests: `Tests/SendoraCloudTests/SendoraCloudAuthErrorTests.swift` (taxonomy
+table + source guards pinning wipe-after-validate — the wipe must be glued to
+the persist, and every wipe must state its reason). `swift build` + `swift test`
+16/16 clean. Additive: no frozen Keychain key / header / route / wire shape
+touched (ADR-023), no error code renamed, no method signature changed.
+
 ## 4.12.0 — listLinkedIdentities() (read side of ADR-030, s58.270)
 
 `auth.listLinkedIdentities { result in }` → `Result<LinkedIdentitiesResult,
