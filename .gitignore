@@ -1,0 +1,9 @@
+# Exists for the PUBLIC MIRROR (github.com/sendoracloud/sdk-ios), not for the
+# monorepo — the root .gitignore already covers these here. `publish-native-
+# mirror.mjs` rsyncs this directory into the mirror clone, so without a
+# package-level file the mirror tracks no ignore rules at all (s58.272: a
+# `--delete` push removed the one it had).
+.build/
+.swiftpm/
+*.xcodeproj/
+.DS_Store

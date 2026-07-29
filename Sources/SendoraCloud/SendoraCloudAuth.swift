@@ -266,18 +266,25 @@ public final class SendoraCloudAuth {
     /// What a credentialed sign-in should do when the credential you present
     /// already belongs to an account (4.15.0).
     ///
-    /// - `.adopt` (the default when this is omitted, and what every earlier
-    ///   release did unconditionally): sign in to that account. This is the
-    ///   reinstall-recovery path — a Game Center player identity survives a
-    ///   reinstall server-side, so the "collision" is usually the SAME person's
-    ///   earlier account. If this device is anonymous, that anonymous account is
-    ///   retired: **its row is deleted** and `onDeviceTakeover` fires with its id.
-    /// - `.reject`: fail with `.credentialInUse` and change nothing at all.
-    ///   Use it when the local anonymous session holds progress you are not
-    ///   willing to trade. Mirrors Firebase `linkWithCredential`
-    ///   (`auth/credential-already-in-use`) and Supabase `linkIdentity`.
+    /// **You usually want the default — pass nothing.** Since 4.17.0 the default
+    /// is safe by construction: it adopts the other account silently when
+    /// nothing would be destroyed, and refuses when something would be.
     ///
-    /// `.reject` blocks the switch; it does not merge the two accounts. To offer
+    /// - **Fresh install / no guest session** → nothing to lose, so it adopts.
+    ///   This is the reinstall-recovery path — a Game Center identity survives a
+    ///   reinstall server-side, so the collision is usually the SAME person's
+    ///   earlier account, and they get it back. Never refused.
+    /// - **Live guest session** → adopting would retire it (**its row is
+    ///   deleted** and `onDeviceTakeover` fires). Refused with
+    ///   `.credentialInUse` so you can ask the player.
+    ///
+    /// Override in either direction:
+    ///
+    /// - `.adopt` — always adopt, even when it deletes the guest account. What
+    ///   every release before 4.15.0 did unconditionally.
+    /// - `.reject` — always fail on a collision, even a harmless one.
+    ///
+    /// ⚠ A refusal blocks the switch; it does not merge the two accounts. To offer
     /// "use my other account", catch the error and re-call with `.adopt`, then
     /// migrate your own data from `onDeviceTakeover`'s `retiredAnonUserId`.
     public enum CredentialCollisionPolicy: String {
@@ -873,8 +880,8 @@ public final class SendoraCloudAuth {
         // mints a new id. No effect off-anon or on a collision.
         link: Bool = false,
         /// What to do if this social identity (or its verified email) already
-        /// belongs to an account. Default `nil` = the server's `adopt` = every
-        /// prior release. `.reject` throws `.credentialInUse` and changes nothing.
+        /// belongs to an account. **Leave it nil** — the default refuses only
+        /// when a live guest session would be deleted.
         onCredentialInUse: CredentialCollisionPolicy? = nil,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
@@ -957,9 +964,9 @@ public final class SendoraCloudAuth {
         teamPlayerID: String,
         bundleID: String,
         link: Bool = false,
-        /// What to do if this Game Center player identity already belongs to an
-        /// account. Default `nil` = the server's `adopt` = every prior release.
-        /// `.reject` throws `.credentialInUse` and changes nothing.
+        /// What to do if this Game Center player identity already belongs to
+        /// an account. **Leave it nil** — the default refuses only when a live
+        /// guest session would be deleted. See `CredentialCollisionPolicy`.
         onCredentialInUse: CredentialCollisionPolicy? = nil,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
