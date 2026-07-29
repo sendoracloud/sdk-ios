@@ -87,6 +87,8 @@ public enum SendoraCloudAuthErrorKind: String {
     case accountLocked = "account_locked"
     /// The credential belongs to a different account (409).
     case credentialInUse = "credential_in_use"
+    // NOTE: `CredentialCollisionPolicy` (4.15.0) lives below on
+    // `SendoraCloudAuth` — it is a request option, not an error kind.
     /// The session is already identified — use `link*()`.
     case alreadyIdentified = "already_identified"
     /// The user dismissed a native / browser sheet. Not an error condition.
@@ -261,6 +263,28 @@ public struct DeletionCancelledEvent {
 }
 
 public final class SendoraCloudAuth {
+    /// What a credentialed sign-in should do when the credential you present
+    /// already belongs to an account (4.15.0).
+    ///
+    /// - `.adopt` (the default when this is omitted, and what every earlier
+    ///   release did unconditionally): sign in to that account. This is the
+    ///   reinstall-recovery path — a Game Center player identity survives a
+    ///   reinstall server-side, so the "collision" is usually the SAME person's
+    ///   earlier account. If this device is anonymous, that anonymous account is
+    ///   retired: **its row is deleted** and `onDeviceTakeover` fires with its id.
+    /// - `.reject`: fail with `.credentialInUse` and change nothing at all.
+    ///   Use it when the local anonymous session holds progress you are not
+    ///   willing to trade. Mirrors Firebase `linkWithCredential`
+    ///   (`auth/credential-already-in-use`) and Supabase `linkIdentity`.
+    ///
+    /// `.reject` blocks the switch; it does not merge the two accounts. To offer
+    /// "use my other account", catch the error and re-call with `.adopt`, then
+    /// migrate your own data from `onDeviceTakeover`'s `retiredAnonUserId`.
+    public enum CredentialCollisionPolicy: String {
+        case adopt
+        case reject
+    }
+
     private let client: APIClient
     private let storage: SendoraStorage
     private let onIdentityChange: (String?) -> Void
@@ -837,6 +861,10 @@ public final class SendoraCloudAuth {
         // (like Firebase linkWithCredential) instead of a device-takeover that
         // mints a new id. No effect off-anon or on a collision.
         link: Bool = false,
+        /// What to do if this social identity (or its verified email) already
+        /// belongs to an account. Default `nil` = the server's `adopt` = every
+        /// prior release. `.reject` throws `.credentialInUse` and changes nothing.
+        onCredentialInUse: CredentialCollisionPolicy? = nil,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
@@ -861,6 +889,8 @@ public final class SendoraCloudAuth {
             if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
             // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
             if link { body["linkAnonymous"] = true }
+            // See signInWithGameCenter — omitted means the server's "adopt".
+            if let policy = onCredentialInUse { body["onCredentialInUse"] = policy.rawValue }
             self.callAuthSync(path: "/auth-service/login/social", body: body, replacesIdentity: true, completion: completion)
         }
     }
@@ -916,6 +946,10 @@ public final class SendoraCloudAuth {
         teamPlayerID: String,
         bundleID: String,
         link: Bool = false,
+        /// What to do if this Game Center player identity already belongs to an
+        /// account. Default `nil` = the server's `adopt` = every prior release.
+        /// `.reject` throws `.credentialInUse` and changes nothing.
+        onCredentialInUse: CredentialCollisionPolicy? = nil,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
     ) {
         opsQueue.async {
@@ -938,6 +972,9 @@ public final class SendoraCloudAuth {
             if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
             // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
             if link { body["linkAnonymous"] = true }
+            // Only sent when explicitly chosen — omitted is the backend's
+            // "adopt" default, i.e. exactly what every prior release did.
+            if let policy = onCredentialInUse { body["onCredentialInUse"] = policy.rawValue }
             self.callAuthSync(path: "/auth-service/login/game-center", body: body, replacesIdentity: true, completion: completion)
         }
     }
@@ -1333,6 +1370,20 @@ public final class SendoraCloudAuth {
                 }
                 guard let user = self.parseSuccess(response) else {
                     completion(.failure(.unknown("Malformed link response")))
+                    return
+                }
+                // 4.15.0 — linking a provider identity from an ANONYMOUS session
+                // promotes this account in place (sub preserved) and the server
+                // rotates the session, because the `is_anonymous` JWT claim just
+                // changed. The old refresh token is revoked server-side, so
+                // installing the returned pair is NOT optional: skip it and this
+                // device is signed out at the next refresh. An identified link
+                // returns no tokens and keeps the ADR-030 in-place behaviour.
+                let data = (response?["data"] as? [String: Any]) ?? [:]
+                if data["upgraded"] as? Bool == true, let tokens = self.parseTokens(response) {
+                    self.persist(user: user, tokens: tokens)
+                    self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
+                    completion(.success(user))
                     return
                 }
                 self.updateLocalUser(user)
