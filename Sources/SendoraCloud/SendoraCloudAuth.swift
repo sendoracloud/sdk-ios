@@ -606,9 +606,20 @@ public final class SendoraCloudAuth {
     /// `auth_service_users` + `push_tokens` are already cleaned up
     /// server-side. Returns an unsubscribe closure.
     ///
-    /// Listeners fire on every identified-signin path:
-    /// signIn / loginSocial / verifyMagicLink / verifyEmailOtp /
-    /// challengeMfa / passkey authenticate / OIDC SSO callback.
+    /// Listeners fire on EVERY identified-signin path:
+    /// signIn / loginSocial / **signInWithGameCenter** / challengeMfa /
+    /// verifyMagicLink / verifyEmailOtp / passkey authenticate / OIDC SSO
+    /// callback — fired centrally from `fireLifecycleSignals` whenever the
+    /// response carries `retiredAnonUserId`.
+    ///
+    /// ⚠ `signInWithGameCenter` is the one that matters most here, and was
+    /// missing from this list before 4.16.0. When the presented player
+    /// identity already belongs to another account, the sign-in ADOPTS that
+    /// account and the anonymous account on this device is retired — its row
+    /// is DELETED server-side — while the call itself still SUCCEEDS. This
+    /// listener is the only client-side signal. Pass
+    /// `onCredentialInUse: .reject` if you would rather it not happen.
+    ///
     /// Local-only — survives webhook receiver downtime. For
     /// server-pipeline cleanup also subscribe `auth.device_takeover`
     /// webhook.
