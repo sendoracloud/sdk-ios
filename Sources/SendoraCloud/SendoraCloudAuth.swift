@@ -257,6 +257,24 @@ public struct DeviceTakeoverEvent {
 /// Detail handed to `onDeletionCancelled` subscribers (s58.269). Fires once
 /// per sign-in that cancelled a pending self-service account deletion within
 /// its grace window — the account is restored with the SAME user_id.
+/// What happened to the guest ("anonymous") account this device presented, on a
+/// sign-in that produced an identified session (s58.278).
+///
+/// ⚠ The `nothingToRetire` case carries the wire value `"none"`. It is NOT
+/// named `none` on purpose: a Swift enum case called `none` collides with
+/// `Optional.none` at every comparison site, so `outcome == .none` would be
+/// ambiguous between "no guest was presented" and "no value at all" — exactly
+/// the conflation this whole field exists to remove.
+public enum AnonRetirementOutcome: String {
+    /// The guest row was deleted. Its id arrives via `onDeviceTakeover`.
+    case retired = "retired"
+    /// A guest token WAS presented and the guest was NOT retired — that
+    /// account still exists, so offering "recover your other account" is real.
+    case preserved = "preserved"
+    /// No guest token was presented; nothing to reconcile.
+    case nothingToRetire = "none"
+}
+
 public struct DeletionCancelledEvent {
     public let userId: String
     public let at: Date
@@ -320,6 +338,7 @@ public final class SendoraCloudAuth {
     /// Inline deletion-cancelled listeners (s58.269). UUID-keyed; lock-protected.
     private var deletionCancelledListeners: [UUID: (DeletionCancelledEvent) -> Void] = [:]
     private var lastDeletionCancelled: DeletionCancelledEvent?
+    private var lastAnonRetirement: AnonRetirementOutcome?
     /// Inline auth-state listeners (4.13.0). UUID-keyed; lock-protected.
     private var authStateListeners: [UUID: (SendoraCloudAuthStateChange) -> Void] = [:]
     /// True once the Keychain re-hydrate in `init` has run. Distinguishes "no
@@ -701,6 +720,17 @@ public final class SendoraCloudAuth {
         return lastDeletionCancelled
     }
 
+    /// What the last sign-in did with this device's guest account, or nil if no
+    /// sign-in has happened this session (s58.278).
+    ///
+    /// The one worth acting on is `.preserved`: a guest account was presented,
+    /// was NOT retired, and is therefore still alive server-side — so "recover
+    /// your other account" is a real offer rather than a guess.
+    public func getLastAnonRetirement() -> AnonRetirementOutcome? {
+        lock.lock(); defer { lock.unlock() }
+        return lastAnonRetirement
+    }
+
     /// Internal — fan out deletion-cancelled to subscribers + cache the latest.
     func fireDeletionCancelled(userId: String) {
         let evt = DeletionCancelledEvent(userId: userId, at: Date())
@@ -771,6 +801,13 @@ public final class SendoraCloudAuth {
         let data = response?["data"] as? [String: Any]
         if let retired = data?["retiredAnonUserId"] as? String, !retired.isEmpty {
             fireDeviceTakeover(retiredAnonUserId: retired, identifiedUserId: identifiedUserId)
+        }
+        // s58.278 — record the guest-account outcome. Only when the server
+        // states it; an older backend leaves the previous value untouched
+        // rather than asserting "nothing was retired".
+        if let raw = data?["anonRetirement"] as? String,
+           let outcome = AnonRetirementOutcome(rawValue: raw) {
+            lock.lock(); lastAnonRetirement = outcome; lock.unlock()
         }
         if let restored = data?["reactivatedFromDeletion"] as? Bool, restored {
             fireDeletionCancelled(userId: identifiedUserId)

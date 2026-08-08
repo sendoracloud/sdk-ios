@@ -6,6 +6,34 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 
 
 
+## 4.18.0 — getLastAnonRetirement(): did my guest account survive? (s58.278)
+
+Parity: RN 1.33.0 / web 3.17.0 / Android 4.18.0. Additive; no behaviour change to any existing call.
+
+`retiredAnonUserId` is present-or-absent, and the absence covered two
+situations that need opposite handling: the guest account was retired but not
+named, versus nothing was retired and the guest is still alive and claimable.
+A customer hit exactly that — saw no `retiredAnonUserId` after an adopt and
+had to ask us which it was, because it is not answerable from outside (the
+device-takeover's no-ops are silent by design).
+
+Sign-in responses now carry `anonRetirement`, and `getLastAnonRetirement()`
+returns the last value (cleared on sign-out):
+
+- `retired` — the guest row was deleted; its id arrives via `onDeviceTakeover`.
+- `preserved` — a guest token WAS sent and the guest was NOT retired. That
+  account still exists, so "recover your other account" is a real offer.
+- `none` — no guest token was sent; nothing to reconcile.
+
+⚠ The value is recorded ONLY when the server states it. An older backend omits
+the field entirely, and treating that as `none` would assert a fact we were
+never told — absent and `none` are different answers.
+
+⚠ The third case is named `nothingToRetire` (wire value `"none"`), NOT `none`.
+A Swift enum case called `none` collides with `Optional.none`, so
+`outcome == .none` would be ambiguous between "no guest was presented" and "no
+value at all" — reintroducing the exact conflation this field removes.
+
 ## 4.17.0 — the collision default is now safe by construction (s58.274)
 
 Parity: RN 1.32.0 / web 3.16.0 / Android 4.17.0. **Behaviour change to the DEFAULT** — see below for who it affects (in practice: nobody with real users).
