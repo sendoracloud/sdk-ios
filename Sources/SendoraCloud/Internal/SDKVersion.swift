@@ -9,7 +9,7 @@ import Foundation
 // Keep this in lockstep with the `Package.swift` comment + git tag on release.
 extension SendoraCloud {
     /// Canonical SDK version. The ONLY place the version string lives.
-    internal static let sdkVersion = "4.18.0"
+    internal static let sdkVersion = "4.19.0"
 
     /// Canonical SDK name, shared by the event body + request headers.
     internal static let sdkName = "sendora-ios"

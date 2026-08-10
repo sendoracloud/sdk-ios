@@ -316,6 +316,20 @@ public final class SendoraCloudAuth {
     private let onAnonymousWipe: () -> Void
     private var cachedUser: SendoraCloudAuthUser?
     private var cachedExpiresAt: Int64 = 0
+    /// Set once we have PROOF the device clock runs fast: a token the server
+    /// minted SECONDS AGO already reads past its own `exp`. A fresh token is
+    /// never genuinely expired, so the clock we measured it with is the liar.
+    /// Releases the `exp` guard for this process.
+    ///
+    /// - Warning: Never persist this. It is re-learned for the cost of one
+    ///   refresh, and a stored "clock is fast" belief would outlive the
+    ///   correction that made it false — the same stale-frame bug this guard
+    ///   closes, one level up.
+    /// - Warning: Without it the `exp` guard alone is a REFRESH LOOP on any
+    ///   clock fast by more than the token TTL: every freshly-minted token
+    ///   reads as already expired, so every call refreshes. Measured on the
+    ///   React Native reference implementation at 10 reads -> 10 refreshes.
+    private var clockSkewConfirmed = false
     /// Anon refresh token captured at `signInWithMfaSupport` time, stashed
     /// keyed to the issued `mfaChallengeToken` so the later `challengeMfa`
     /// can forward it for device-takeover (s58.111). Without this, the MFA
@@ -409,17 +423,91 @@ public final class SendoraCloudAuth {
     /// refresh instead of returning nil. Pre-s58.47 we bailed
     /// immediately, which left the host app reading nil and
     /// triggering a fresh anonymous mint on every cold launch.
-    public func getAccessToken(completion: @escaping (String?) -> Void) {
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    /// The cached-token guard, and the only place the two deadlines are
+    /// combined. Both must agree before a cached token is served:
+    ///
+    /// 1. the locally-tracked deadline (`now + expiresIn` at mint) — immune to
+    ///    a constantly-wrong clock, blind to a clock that MOVES;
+    /// 2. the token's own `exp` — immune to a clock that moves, wrong by the
+    ///    full offset on a constantly-wrong clock.
+    ///
+    /// Guard 2 is released once `clockSkewConfirmed` proves which failure mode
+    /// we are in.
+    ///
+    /// The gap this closes: `authAccessExpiresAt` is written in the device's
+    /// clock frame at mint and persisted to the Keychain. Step the clock
+    /// backwards between mint and read — automatic time landing after a long
+    /// power-off, a restore, a manual set — and the deadline is stale by the
+    /// size of the correction, surviving relaunches. The SDK then serves a
+    /// provably dead token, every request 401s, and the app still looks signed
+    /// in. Reported by Word Hurdle with a token 1929s past its `exp`.
+    private func canServeToken(_ token: String?, expiresAt: Int64, nowMs: Int64) -> Bool {
+        guard let token = token, !token.isEmpty, expiresAt > 0 else { return false }
+        if nowMs >= expiresAt - refreshSafetyMs { return false }
+        lock.lock()
+        let skewKnown = clockSkewConfirmed
+        lock.unlock()
+        if skewKnown { return true }
+        return accessTokenExpIsFuture(token, nowMs: nowMs)
+    }
+
+    /// Guard 1 alone: does the locally-tracked deadline still claim life?
+    private func trackedDeadlineAlive(nowMs: Int64) -> Bool {
+        guard let token = storage.authAccessToken, !token.isEmpty else { return false }
         let exp = cachedExpiresAt
-        if let token = storage.authAccessToken, exp > 0, nowMs < exp - refreshSafetyMs {
+        return exp > 0 && nowMs < exp - refreshSafetyMs
+    }
+
+    /// True when a cached token is unusable ONLY because `exp` contradicts a
+    /// tracked deadline that still claims life.
+    private func deadlinesDisagree(nowMs: Int64) -> Bool {
+        return trackedDeadlineAlive(nowMs: nowMs)
+            && !canServeToken(storage.authAccessToken, expiresAt: cachedExpiresAt, nowMs: nowMs)
+    }
+
+    private func learnClockSkewFrom(_ freshToken: String, nowMs: Int64) {
+        guard !accessTokenExpIsFuture(freshToken, nowMs: nowMs) else { return }
+        lock.lock()
+        clockSkewConfirmed = true
+        lock.unlock()
+    }
+
+    /// Refresh — and when the two deadlines disagree, let the token that comes
+    /// back say which one was lying.
+    ///
+    /// - Warning: THE TIMING IS THE MECHANISM, and the obvious placement is
+    ///   wrong. Probing at every mint site looks equivalent and is not: in the
+    ///   reported failure the token was MINTED while the clock was fast and
+    ///   only read after the correction, so a mint-time probe records "clock is
+    ///   fast" and then waves through the very token the guard exists to
+    ///   refuse. Probing only on a refresh performed BECAUSE `exp` contradicted
+    ///   a live tracked deadline separates the cases.
+    private func refreshAndReconcile(nowMs: Int64, completion: @escaping (String?) -> Void) {
+        let reconciling = deadlinesDisagree(nowMs: nowMs)
+        refreshAccessToken { [weak self] token in
+            if reconciling, let self = self, let token = token, !token.isEmpty {
+                self.learnClockSkewFrom(token, nowMs: Int64(Date().timeIntervalSince1970 * 1000))
+            }
+            completion(token)
+        }
+    }
+
+    /// Pass `forceRefresh: true` when the caller has out-of-band evidence that
+    /// the tracked deadline is wrong (it decoded `exp` itself, or ate a 401).
+    /// It skips the cache but NOT the single-flight or the backoff cooldown, so
+    /// an app that force-refreshes on every 401 cannot turn a server outage
+    /// into a hot loop against `/token/refresh`.
+    public func getAccessToken(forceRefresh: Bool = false, completion: @escaping (String?) -> Void) {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if !forceRefresh, let token = storage.authAccessToken,
+           canServeToken(token, expiresAt: cachedExpiresAt, nowMs: nowMs) {
             completion(token)
             return
         }
-        // Either no access token at all, or it's past (expiry - safety).
-        // refreshAccessToken handles both: it short-circuits when no
-        // refresh token is in storage either, returning nil.
-        refreshAccessToken(completion: completion)
+        // Either no usable access token, or the two deadlines disagree.
+        // refreshAccessToken handles both, and short-circuits to nil when there
+        // is no refresh token in storage either.
+        refreshAndReconcile(nowMs: nowMs, completion: completion)
     }
 
     /// Return this device's anonymous session, minting one only if it has none.
@@ -1639,9 +1727,15 @@ public final class SendoraCloudAuth {
             // before we acquired isRefreshing), return it directly.
             // Saves a redundant /refresh round-trip.
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            // Same guard as the fast path, same reason — this token is "fresh"
+            // only in that a sibling task stashed it; we have no idea how long
+            // ago, so it is a cached token like any other. It shipped with a
+            // bare `> nowMs`: no safety margin AND no `exp` check, on the very
+            // path meant to REPAIR an expired token. Do not learn clock skew
+            // here — nothing proves this token just arrived from the server.
             if let stashedAccess = self.storage.authAccessToken,
                !stashedAccess.isEmpty,
-               self.storage.authAccessExpiresAt > nowMs {
+               self.canServeToken(stashedAccess, expiresAt: self.storage.authAccessExpiresAt, nowMs: nowMs) {
                 self.lock.lock()
                 self.cachedExpiresAt = self.storage.authAccessExpiresAt
                 self.lock.unlock()
@@ -1761,6 +1855,15 @@ public final class SendoraCloudAuth {
             guard let _ = self.storage.authAccessToken else { return }
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             let expMs = self.storage.authAccessExpiresAt
+            // Repair, not just anticipate. Everything below reasons from the
+            // tracked deadline, so one left stale by a backwards clock step
+            // reads as "an hour of life left" and this never fires — the SDK
+            // sits on a dead token for a full TTL while the timer ticks past
+            // it. The combined guard is the only thing here that can see that.
+            if !self.canServeToken(self.storage.authAccessToken, expiresAt: expMs, nowMs: nowMs) {
+                self.refreshAndReconcile(nowMs: nowMs) { _ in }
+                return
+            }
             let remainingMs = expMs - nowMs
             if remainingMs <= 0 { return }
             // Assume 15-min default access-TTL when we can't observe the
@@ -2004,6 +2107,9 @@ public final class SendoraCloudAuth {
         lock.lock()
         cachedUser = nil
         cachedExpiresAt = 0
+        // Drop the clock-skew finding with everything else: one refresh to
+        // re-learn, and a wipe is exactly when to inherit no beliefs.
+        clockSkewConfirmed = false
         pendingAnonTakeover = nil
         lock.unlock()
         storage.clearAuthTokens()
@@ -2053,4 +2159,42 @@ public final class SendoraCloudAuth {
     private static func isDeadRefreshError(_ code: String) -> Bool {
         return code == "INVALID_REFRESH_TOKEN"
     }
+}
+
+
+// MARK: - Access-token expiry
+
+/// True when the token's OWN `exp` claim is still in the future by the device
+/// clock — or when the token carries no readable `exp` at all.
+///
+/// - Warning: Unreadable → `true` is deliberate, and it is what makes this safe
+///   to layer UNDER the tracked-deadline check rather than in place of it. An
+///   opaque or non-JWT access token keeps exactly the behaviour it had before
+///   this guard existed; the pair can only ever refresh earlier, never later.
+/// - Warning: Never derive the tracked deadline FROM `exp`. The two guards fail
+///   in opposite directions and that is the point — `now + expiresIn` is
+///   skew-INVARIANT (a permanently wrong clock cancels on both sides) and blind
+///   to a clock that MOVES, while `exp` is written in the server's frame and
+///   survives a clock step but is wrong by the full offset on a permanently
+///   wrong clock. Collapsing them leaves one failure mode instead of two that
+///   cover each other.
+internal func accessTokenExpIsFuture(_ token: String, nowMs: Int64) -> Bool {
+    guard let expSeconds = decodeJwtExp(token) else { return true }
+    return Double(nowMs) < expSeconds * 1000.0
+}
+
+/// Read `exp` out of a JWT payload. Signature is never verified client-side —
+/// the server is the only authority on validity; this is a freshness hint.
+internal func decodeJwtExp(_ token: String) -> Double? {
+    let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 3 else { return nil }
+    var b64 = String(parts[1])
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    while b64.count % 4 != 0 { b64 += "=" }
+    guard let data = Data(base64Encoded: b64),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let exp = obj["exp"] as? Double,
+          exp.isFinite else { return nil }
+    return exp
 }
