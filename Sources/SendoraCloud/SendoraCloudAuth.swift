@@ -87,6 +87,10 @@ public enum SendoraCloudAuthErrorKind: String {
     case accountLocked = "account_locked"
     /// The credential belongs to a different account (409).
     case credentialInUse = "credential_in_use"
+    /// Refusing to unlink the ONLY way into this account (409). The account
+    /// would still exist and still hold the user's data with nothing able to
+    /// authenticate into it — permanent lockout. Add another credential first.
+    case lastCredential = "last_credential"
     // NOTE: `CredentialCollisionPolicy` (4.15.0) lives below on
     // `SendoraCloudAuth` — it is a request option, not an error kind.
     /// The session is already identified — use `link*()`.
@@ -197,6 +201,8 @@ public extension SendoraCloudAuthError {
             return .accountLocked
         case "CREDENTIAL_IN_USE":
             return .credentialInUse
+        case "LAST_CREDENTIAL":
+            return .lastCredential
         case "NOT_ANONYMOUS", "FORBIDDEN_NON_ANONYMOUS":
             return .alreadyIdentified
         case "PASSKEY_USER_CANCELLED", "GAME_CENTER_CANCELLED", "PLAY_GAMES_CANCELLED", "SSO_CANCELLED":
@@ -1595,6 +1601,68 @@ public final class SendoraCloudAuth {
                 }
                 let hasPassword = data["hasPassword"] as? Bool ?? false
                 completion(.success(LinkedIdentitiesResult(identities: identities, hasPassword: hasPassword)))
+            }
+        }
+    }
+
+    /// Result of `unlink(provider:)`.
+    ///
+    /// `removed` can exceed 1: an account may hold more than one row for a
+    /// provider (distinct provider user ids across projects), and unlinking
+    /// takes all of them.
+    public struct UnlinkResult {
+        public let provider: String
+        public let removed: Int
+        public let remaining: Int
+    }
+
+    /// Remove one linked provider from the signed-in account — what a
+    /// "Disconnect" button beside each entry on a Connected Accounts screen
+    /// calls. The write half of `listLinkedIdentities`.
+    ///
+    /// - Warning: The server REFUSES to remove the last way into the account,
+    ///   with code `LAST_CREDENTIAL` / kind `.lastCredential`. An account with
+    ///   no credentials still exists and still holds the user's data, but
+    ///   nothing can ever authenticate into it again — permanent lockout, not
+    ///   an inconvenience. A password counts as a credential.
+    ///
+    /// Prefer preventing the tap to explaining the refusal: read
+    /// `listLinkedIdentities` and disable Disconnect when
+    /// `identities.count + (hasPassword ? 1 : 0) <= 1`. The error is the
+    /// backstop, not the UX.
+    ///
+    /// Fails with `.unauthorized` when signed out, and with the server's
+    /// `NOT_FOUND` when the provider is not linked — an absent provider is NOT
+    /// reported as a successful removal, because a screen saying "disconnected"
+    /// about a credential that is still attached tells the user something
+    /// untrue about their account.
+    public func unlink(
+        provider: String,
+        completion: @escaping (Result<UnlinkResult, SendoraCloudAuthError>) -> Void
+    ) {
+        getAccessToken { [weak self] token in
+            guard let self = self else { return }
+            guard let token = token else {
+                completion(.failure(.unauthorized("Sign in before unlinking an identity")))
+                return
+            }
+            let escaped = provider.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? provider
+            let headers = ["Authorization": "Bearer \(token)"]
+            self.client.delete(path: "/auth-service/me/identities/\(escaped)", headers: headers) { [weak self] response in
+                guard let self = self else { return }
+                if let err = self.parseError(response) {
+                    completion(.failure(err))
+                    return
+                }
+                guard let data = response?["data"] as? [String: Any] else {
+                    completion(.failure(.unknown("Malformed unlink response")))
+                    return
+                }
+                completion(.success(UnlinkResult(
+                    provider: data["provider"] as? String ?? provider,
+                    removed: data["removed"] as? Int ?? 0,
+                    remaining: data["remaining"] as? Int ?? 0
+                )))
             }
         }
     }
