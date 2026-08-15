@@ -177,9 +177,26 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
         }
     }
 
-    public func deletePasskey(_ passkeyId: String, completion: @escaping () -> Void) {
-        guard let headers = auth.bearerHeaders() else { completion(); return }
-        client.delete(path: "/auth-service/passkeys/\(passkeyId)", headers: headers) { _ in completion() }
+    /// Delete one of the caller's passkeys.
+    ///
+    /// ⚠ BREAKING in 5.0.0: the completion carried no failure channel, so a 403
+    /// `RECENT_AUTH_REQUIRED` (the route is step-up gated, s58.319) and a 404
+    /// (the id is not the caller's) were both indistinguishable from a 200 —
+    /// the app removed the row while the credential stayed live on the account.
+    public func deletePasskey(
+        _ passkeyId: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        guard let headers = auth.bearerHeaders() else {
+            completion(.failure(.unauthorized("Sign in before deleting a passkey")))
+            return
+        }
+        let escaped = passkeyId.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? passkeyId
+        client.delete(path: "/auth-service/passkeys/\(escaped)", headers: headers) { [weak self] response in
+            guard let self = self else { return }
+            if let err = self.auth.parseError(response) { completion(.failure(err)); return }
+            completion(.success(()))
+        }
     }
 
     // MARK: - ASAuthorizationControllerDelegate

@@ -1,7 +1,7 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
-// Published version: 4.14.0 (git tag is the SwiftPM source of truth).
+// Published version: 5.0.0 (git tag is the SwiftPM source of truth).
 // The runtime version constant lives in
 // `Sources/SendoraCloud/Internal/SDKVersion.swift` — keep both in lockstep
 // with the release git tag (ADR-023: no hardcoded version drift).

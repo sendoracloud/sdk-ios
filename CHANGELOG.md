@@ -1,5 +1,56 @@
 # Changelog
 
+## 5.0.0 — three methods stopped reporting failure as success
+
+⚠⚠ **BREAKING.** Three completion handlers change from `() -> Void` to
+`(Result<Void, SendoraCloudAuthError>) -> Void`. Swift rejects a zero-argument closure literal in a
+one-argument closure context, so this will not compile until you update the call sites — which is the
+point: the old signature had **no failure channel at all**, and every one of these could fail
+silently.
+
+- `SendoraCloudPasskeys.deletePasskey(_:completion:)`
+- `SendoraCloudAuth.revokeSession(sessionId:completion:)`
+- `SendoraCloudAuth.revokeAllSessions(completion:)`
+
+**Why they could not stay.** `APIClient.request`'s completion is non-throwing and deliberately
+delivers the response body on a non-2xx. So a discarded result is the ONLY place a refusal could ever
+have surfaced, and these three discarded it. Concretely:
+
+- `deletePasskey` is **step-up gated** since the backend added `requireRecentAuth`. A 403
+  `RECENT_AUTH_REQUIRED` — and a 404 when the id is not the caller's — both looked exactly like a
+  200. The app removed the row from the list while the credential stayed **live on the account**.
+- `revokeSession` / `revokeAllSessions` back a "sign out this device" button. That is the one place a
+  user acts on the claim and then stops worrying about a device they no longer control.
+
+Migration:
+
+```swift
+// before
+auth.revokeAllSessions { self.reload() }
+
+// after
+auth.revokeAllSessions { result in
+    switch result {
+    case .success:            self.reload()
+    case .failure(let error): self.show(error.message)
+    }
+}
+```
+
+**New error kind: `.recentAuthRequired`** (`SendoraCloudAuthErrorKind`, raw value
+`"recent_auth_required"`). The credential is valid; the *authentication behind it* is too old to
+authorise a credential change. ⚠ It is **not** a request for new input — re-run whatever sign-in the
+user already has and retry the same call. For Game Center that re-assertion is silent.
+`details.maxAgeSeconds` is the window. Without this it classified as `.invalidCredential`, whose own
+documentation says "needs NEW input" — the opposite of the truth.
+
+`SendoraCloudAuth.parseError` is now `internal` rather than `private` so `SendoraCloudPasskeys`, a
+separate file, can surface the refusal.
+
+⚠ `disableMfa` was already correct here (fixed in 4.14.0, its comment names this exact defect class).
+The equivalent web/React-Native/Android methods were not.
+
+
 ## 4.20.0 — unlink(provider): remove a linked sign-in method
 
 Parity: RN 1.35.0 / web 3.19.0 / iOS 4.20.0 / Android 4.20.0. Additive.

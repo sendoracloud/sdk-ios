@@ -91,6 +91,12 @@ public enum SendoraCloudAuthErrorKind: String {
     /// would still exist and still hold the user's data with nothing able to
     /// authenticate into it — permanent lockout. Add another credential first.
     case lastCredential = "last_credential"
+    /// The credential is VALID; the authentication behind it is too old to
+    /// authorise a credential change (403 `RECENT_AUTH_REQUIRED`). NOT a bad
+    /// credential — re-run whatever sign-in the user already has and retry the
+    /// SAME call. For Game Center that re-assertion is silent.
+    /// `details.maxAgeSeconds` is the freshness window.
+    case recentAuthRequired = "recent_auth_required"
     // NOTE: `CredentialCollisionPolicy` (4.15.0) lives below on
     // `SendoraCloudAuth` — it is a request option, not an error kind.
     /// The session is already identified — use `link*()`.
@@ -203,6 +209,13 @@ public extension SendoraCloudAuthError {
             return .credentialInUse
         case "LAST_CREDENTIAL":
             return .lastCredential
+        // ⚠ A CODE case, not a status one. The status tail below maps any 4xx
+        // to `.invalidCredential` ("needs new input"), which is the opposite of
+        // what a step-up refusal means. Also do NOT add this to
+        // `mapKnownErrorCode` — returning `.unauthorized` there re-collapses it
+        // onto a dead credential.
+        case "RECENT_AUTH_REQUIRED":
+            return .recentAuthRequired
         case "NOT_ANONYMOUS", "FORBIDDEN_NON_ANONYMOUS":
             return .alreadyIdentified
         case "PASSKEY_USER_CANCELLED", "GAME_CENTER_CANCELLED", "PLAY_GAMES_CANCELLED", "SSO_CANCELLED":
@@ -1348,14 +1361,42 @@ public final class SendoraCloudAuth {
         }
     }
 
-    public func revokeSession(sessionId: String, completion: @escaping () -> Void) {
-        guard let headers = bearerHeaders() else { completion(); return }
-        client.delete(path: "/auth-service/sessions/me/\(sessionId)", headers: headers) { _ in completion() }
+    /// Revoke one of the caller's own sessions ("sign out that device").
+    ///
+    /// ⚠ BREAKING in 5.0.0: the completion was `() -> Void` — no failure
+    /// channel at all. `APIClient.request`'s completion is non-throwing and
+    /// deliberately delivers the body on a non-2xx, so a failure was
+    /// indistinguishable from success. A "sign out this device" button that
+    /// reports success on a failure is the one place a user acts on the claim
+    /// and then stops worrying about a device they no longer control.
+    public func revokeSession(
+        sessionId: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        guard let headers = bearerHeaders() else {
+            completion(.failure(.unauthorized("Sign in before revoking a session")))
+            return
+        }
+        let escaped = sessionId.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? sessionId
+        client.delete(path: "/auth-service/sessions/me/\(escaped)", headers: headers) { [weak self] response in
+            guard let self = self else { return }
+            if let err = self.parseError(response) { completion(.failure(err)); return }
+            completion(.success(()))
+        }
     }
 
-    public func revokeAllSessions(completion: @escaping () -> Void) {
-        guard let headers = bearerHeaders() else { completion(); return }
-        client.delete(path: "/auth-service/sessions/me", headers: headers) { _ in completion() }
+    /// Revoke every session for the caller. Same 5.0.0 signature change and the
+    /// same reason as `revokeSession`.
+    public func revokeAllSessions(completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        guard let headers = bearerHeaders() else {
+            completion(.failure(.unauthorized("Sign in before signing out other devices")))
+            return
+        }
+        client.delete(path: "/auth-service/sessions/me", headers: headers) { [weak self] response in
+            guard let self = self else { return }
+            if let err = self.parseError(response) { completion(.failure(err)); return }
+            completion(.success(()))
+        }
     }
 
     /// Outcome of `deleteAccount`. `status` is `"purged"` (hard-deleted now,
@@ -1983,7 +2024,9 @@ public final class SendoraCloudAuth {
         for cb in callbacks { cb(token) }
     }
 
-    private func parseError(_ response: [String: Any]?) -> SendoraCloudAuthError? {
+    // `internal`, not `private`: `SendoraCloudPasskeys` is a separate file and
+    // needs this to surface a step-up refusal on `deletePasskey`.
+    internal func parseError(_ response: [String: Any]?) -> SendoraCloudAuthError? {
         guard let response = response else {
             // No body at all — the request never produced one: offline, TLS
             // failure, request timed out, breaker open. Message kept verbatim,
