@@ -39,7 +39,6 @@ public final class SendoraCloud {
     private static var storage: SendoraStorage?
     private static var eventQueue: EventQueue?
     private static var deviceContext: DeviceContext?
-    private static var fingerprintHash: String?
     internal static var currentUserId: String?
     private static var currentIdentityToken: String?
     private static var isConfigured = false
@@ -156,7 +155,12 @@ public final class SendoraCloud {
 
             let device = DeviceContext.collect()
             self.deviceContext = device
-            self.fingerprintHash = FingerprintGenerator.generate(device: device)
+            // ⚠ No device fingerprint is computed. Apple prohibits deriving a
+            // device identifier from device signals for attribution (App Store
+            // 5.1.2 / DPLA §3.3.9) regardless of ATT, and this SDK used to compute
+            // and auto-transmit sha256(model|osVersion|screen|locale|timezone) on
+            // first launch. Attribution now rides deterministic signals only
+            // (deviceId; Android's Play Install Referrer). See the 5.x CLAUDE note.
 
             let client = APIClient(
                 baseUrl: finalConfig.apiBaseUrl,
@@ -188,23 +192,25 @@ public final class SendoraCloud {
                         store.cachedUserId = userId
                     }
                 },
-                onAnonymousWipe: {
-                    // Switching identities — rotate device-side state
-                    // so events from the new user can't carry over the
-                    // prior anonymous attribution. Also drain the
-                    // event queue: pending events were captured under
-                    // the prior currentUserId and shouldn't surface
-                    // under the next.
+                onAnonymousWipe: { rotateDeviceId in
+                    // Clear the user identity on every wipe. The device (anonymous
+                    // analytics) id rotates ONLY at a person-boundary — an explicit
+                    // signOut or account deletion (rotateDeviceId=true). On a
+                    // sign-in/upgrade or an involuntary session death it SURVIVES:
+                    // same person, so pre-auth analytics link to the now-real user
+                    // (parity with RN 1.38.0; the industry norm). Rotating on logout
+                    // keeps two people on a shared device from merging.
                     self.serialQueue.sync {
                         self.currentUserId = nil
                         self.currentIdentityToken = nil
                         store.cachedUserId = nil
-                        store.regenerateDeviceId()
-                        // Force-mint a fresh device id immediately so
-                        // any concurrent track() that races the wipe
-                        // sees the new id rather than a transiently
-                        // missing one.
-                        _ = store.deviceId
+                        if rotateDeviceId {
+                            store.regenerateDeviceId()
+                            // Force-mint a fresh device id immediately so any
+                            // concurrent track() that races the wipe sees the new
+                            // id rather than a transiently missing one.
+                            _ = store.deviceId
+                        }
                         store.sessionId = UUID().uuidString
                     }
                     self.eventQueue?.dropAll()
@@ -374,7 +380,6 @@ public final class SendoraCloud {
 
         DispatchQueue.global(qos: .utility).async {
             var body: [String: Any] = ["projectId": config.projectId]
-            if let fp = fingerprintHash { body["fingerprintHash"] = fp }
             body["deviceId"] = storage.deviceId
 
             client.post(path: "/attribution/deferred", body: body) { response in
@@ -533,10 +538,13 @@ public final class SendoraCloud {
         guard let storage = storage, storage.isFirstLaunch,
               let client = apiClient, let config = config else { return }
         storage.isFirstLaunch = false
+        // No fingerprintHash — the auto install report carries deterministic
+        // signals only (see the compliance note at init). Removing it here is the
+        // silent-default fix; App Review scrutinises exactly this on-first-launch,
+        // pre-ATT transmission.
         let body: [String: Any] = [
             "projectId": config.projectId,
             "deviceId": storage.deviceId,
-            "fingerprintHash": fingerprintHash ?? "",
             "appVersion": deviceContext?.appVersion ?? "",
             "os": "iOS",
             "osVersion": deviceContext?.osVersion ?? "",

@@ -6,6 +6,52 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 
 
 
+## 5.2.0 — no device fingerprinting (App Store compliance, SudokuHurdle)
+
+**Removed the capability, not just gated it.** `FingerprintGenerator` (which hashed
+`model|osVersion|screen|locale|timezone`) is **deleted**, and the SDK no longer
+computes or transmits a device fingerprint anywhere. This closes the silent,
+default-on exposure the research flagged: `configure()` (with the default
+`autoStartAttribution = true`) used to compute a fingerprint at init and POST it to
+`/attribution/install` **on first launch, before any ATT prompt**, bypassing the
+consent queue. Apple prohibits deriving a device identifier from device signals for
+attribution (App Store 5.1.2 / DPLA §3.3.9) regardless of ATT, and App Review actively
+rejects on it.
+
+- The auto install report (`reportInstallIfNeeded`) now carries deterministic signals
+  only — `deviceId`, `appVersion`, `os`, `osVersion`. **`autoStartAttribution` stays
+  `true`** deliberately (it also gates `trackSessionStart()`, which fires inside the
+  same guard while `session.ended` fires outside it — flipping the default would
+  silently kill session-start analytics).
+- `/attribution/deferred` drops the fingerprint too (it matched on fingerprint
+  equality only — no IP fallback — so it now transmits nothing device-derived and
+  simply won't match on that path; use `SendoraCloud.links?.matchDeferred` for
+  deferred routing, and note iOS has no deterministic deferred signal — see RN 1.37.0).
+- ADR-023 safe: no frozen key/header/route touched; a body field was removed, which the
+  backend already treats as optional. `swift build` clean.
+
+⚠ Parity: RN shipped the `matchDeferred` half in 1.37.0; **Android 4.23.0** ships this
+native removal in lockstep. Publish + on-device smoke before release.
+
+## 5.1.0 — deviceId survives identify/upgrade (SudokuHurdle r6)
+
+Parity with RN 1.38.0 (full write-up there). The device (anonymous analytics) id
+rotated on EVERY auth transition — including the anon→identified upgrade where the
+server preserves the `sub`. It now survives identify/upgrade and rotates only at a
+person-boundary. `onAnonymousWipe` gained a `Bool` (rotateDeviceId);
+`wipeLocalIdentity` passes `true` only for `.signedOut(.user)` / `.signedOut(.accountDeleted)`,
+so `.replaced` (sign-in/upgrade) and `.sessionExpired` clear the userId but KEEP the
+`deviceId` (same person → pre-auth analytics link to them), while an explicit
+`signOut()` and the public `reset()` still rotate it (shared-device isolation:
+`coalesce(user_id, anonymous_id)` makes the anon id the identity only while signed
+out). ADR-023 safe: the `sendora_*` Keychain key is unchanged, only the value's
+regeneration frequency drops. Alias/merge stays server-authoritative
+(`prevAnonRefreshToken` → `user_upgraded`/`user_merged`). `swift build` clean.
+⚠ **Separate pre-existing note (NOT changed here):** the `deviceId` is Keychain-stored
+with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so it survives REINSTALL —
+more persistent than the industry norm (FID/Amplitude die on uninstall) and the one
+thing Apple pushes back on. That's orthogonal to this change; revisit separately.
+
 ## 4.18.0 — getLastAnonRetirement(): did my guest account survive? (s58.278)
 
 Parity: RN 1.33.0 / web 3.17.0 / Android 4.18.0. Additive; no behaviour change to any existing call.

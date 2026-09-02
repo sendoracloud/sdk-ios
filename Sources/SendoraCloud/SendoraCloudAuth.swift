@@ -332,7 +332,10 @@ public final class SendoraCloudAuth {
     private let client: APIClient
     private let storage: SendoraStorage
     private let onIdentityChange: (String?) -> Void
-    private let onAnonymousWipe: () -> Void
+    // Bool = rotateDeviceId: true only at a person-boundary (explicit signOut /
+    // account deletion), so the anonymous id survives a sign-in/upgrade
+    // (SudokuHurdle r6; parity with RN 1.38.0 / web 3.22.0 / Android 4.22.0).
+    private let onAnonymousWipe: (Bool) -> Void
     private var cachedUser: SendoraCloudAuthUser?
     private var cachedExpiresAt: Int64 = 0
     /// Set once we have PROOF the device clock runs fast: a token the server
@@ -392,7 +395,7 @@ public final class SendoraCloudAuth {
         client: APIClient,
         storage: SendoraStorage,
         onIdentityChange: @escaping (String?) -> Void,
-        onAnonymousWipe: @escaping () -> Void
+        onAnonymousWipe: @escaping (Bool) -> Void
     ) {
         self.client = client
         self.storage = storage
@@ -2225,7 +2228,17 @@ public final class SendoraCloudAuth {
         lock.unlock()
         storage.clearAuthTokens()
         stopProactiveRefreshCron()
-        onAnonymousWipe()
+        // Rotate the device (anonymous analytics) id ONLY at a person-boundary —
+        // an explicit signOut or account deletion. A sign-in/upgrade (.replaced) or
+        // an involuntary session death (.sessionExpired) is the SAME person, so the
+        // id survives and pre-auth analytics link to them (SudokuHurdle r6; the
+        // industry norm). Rotating on logout keeps two people on a shared device
+        // from merging.
+        var rotateDeviceId = false
+        if case .signedOut(let r) = reason {
+            rotateDeviceId = (r == .user || r == .accountDeleted)
+        }
+        onAnonymousWipe(rotateDeviceId)
         if case .signedOut(let signedOutReason) = reason {
             emitAuthState(.signedOut(reason: signedOutReason))
         }
