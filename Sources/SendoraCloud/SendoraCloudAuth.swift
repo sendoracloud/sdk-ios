@@ -543,8 +543,20 @@ public final class SendoraCloudAuth {
     /// account loss as a pre-call wipe on a failed sign-in, except it happens on
     /// a *healthy* network.
     ///
-    /// Pass `forceNew: true` to deliberately abandon the current anonymous
-    /// session and mint a separate one.
+    /// ⚠ Returns the CURRENT session when one exists — anonymous OR identified
+    /// (5.3.0). The guard used to be `user.isAnonymous`, so a plain
+    /// `signInAnonymously()` over a live account session fell through, minted
+    /// a guest and overwrote the account's tokens locally with no state event
+    /// (this path never wipes; it persists over the top). The account survives
+    /// server-side, recoverable by its credential, but the device became a
+    /// stranger to it. Returning the identified session is a no-op for a
+    /// defensive caller and the honest answer to "make sure I have a session";
+    /// read `isAnonymous` to know which kind you got. Reported by RopoLabs on
+    /// the RN SDK; same code here.
+    ///
+    /// Pass `forceNew: true` to deliberately abandon the current session —
+    /// whichever kind — and mint a separate anonymous one. That is the only
+    /// way this replaces an identified session, and it does so silently.
     public func signInAnonymously(
         name: String? = nil,
         metadata: [String: Any]? = nil,
@@ -565,7 +577,6 @@ public final class SendoraCloudAuth {
             // of one account each.
             if !forceNew,
                let user = existing,
-               user.isAnonymous,
                self.storage.authRefreshToken != nil {
                 completion(.success(user))
                 return

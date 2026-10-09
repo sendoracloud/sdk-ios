@@ -6,6 +6,18 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 
 
 
+## 5.3.0 — signInAnonymously() over an identified session is a no-op (RopoLabs A2, parity RN 1.40.0)
+
+Full write-up in the RN CLAUDE.md 1.40.0 section. The reuse guard
+(`SendoraCloudAuth.swift` `signInAnonymously`) required `user.isAnonymous`, so over a LIVE
+ACCOUNT session it fell through, minted a guest and persisted over the account's Keychain
+tokens with no state event. The `user.isAnonymous` clause is dropped: an identified session
+with a refresh token in the Keychain is returned as-is; `forceNew: true` is the single
+explicit replace. All four SDKs carried the identical guard and ship the fix in lockstep
+(RN 1.40.0 / web 3.23.0 / Android 4.25.0). Version in `SDKVersion.swift` only (5.3.0).
+⚠ No Swift compile gate exists in this repo — `swift build` + the on-device smoke are the
+operator's pre-mirror step, as with every native release. ⚠ Not yet mirror-published.
+
 ## 5.2.0 — no device fingerprinting (App Store compliance, SudokuHurdle)
 
 **Removed the capability, not just gated it.** `FingerprintGenerator` (which hashed
