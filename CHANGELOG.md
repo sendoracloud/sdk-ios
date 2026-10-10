@@ -1,5 +1,31 @@
 # Changelog
 
+## 5.4.1 — a dead session is `.sessionExpired` again; the server's detail is `lastSignedOutEndReason()`
+
+**Fix to a 5.4.0 behaviour change (ADR-023: a new value is additive only for a NEW situation).**
+A session that died on a server-rejected refresh was reported as `.sessionExpired` through
+5.3.0. 5.4.0 reported the server's own verdict as the reason instead (`.revoked` / `.deleted`),
+which gave two old situations new names: "account deleted on another device" and "sessions
+revoked". Adding a value to a union is additive for the compiler, not for a listener that
+matched the old value. A listener that acted only on `.sessionExpired` (the documented pattern, and
+the RopoLabs template's session-death handler) silently ignored both, leaving the app on a
+signed-in screen where every request fails. Reported by RopoLabs against the published
+tarball before any production install.
+
+- `.signedOut(reason:)` is `.sessionExpired` for EVERY server-rejected refresh, exactly as 5.3.0.
+- New `SendoraCloudAuth.lastSignedOutEndReason() -> SendoraCloudRefreshEndReason?`: the server's
+  verdict (`revoked` / `deleted` / `expired` / `reuse` / `unknown`), set BEFORE the event is
+  delivered so a listener reads it inside its `.signedOut` arm (same pattern as
+  `lastSignedInCause()` — the case's payload is frozen for source compatibility). `nil` after
+  `signOut()` / `deleteAccount()` / `discardWithheld()` and from an older backend.
+- `.revoked` / `.evicted` / `.deleted` stay in `SendoraCloudAuthSignedOutReason` so code written
+  against 5.4.0 compiles; they are never emitted again.
+- Nothing else changed (storage, wipe effects, held-slot release rules).
+
+Parity: RN 1.41.1 / web 3.24.1 / Android 4.26.1. Guard: `AuthMachineRowScenarios2`
+`scenario_refresh_dead_current` (every endReason → `.sessionExpired`; the accessor read INSIDE a
+listener equals the server's verdict; limbo death; `signOut` clears it).
+
 ## 5.4.0 — sign-in no longer retires the guest — it is held on the device (ADR-033 wave 1)
 
 **Two behaviour changes, both strictly less destructive than before; everything else is additive

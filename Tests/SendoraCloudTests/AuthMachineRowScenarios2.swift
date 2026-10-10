@@ -115,10 +115,18 @@ extension AuthMachineConformanceTests {
     }
 
     func scenario_refresh_dead_current() {
-        for (endReason, expected): (String?, SendoraCloudAuthSignedOutReason) in [("revoked", .revoked), ("deleted", .deleted), ("expired", .sessionExpired), ("reuse", .sessionExpired), (nil, .sessionExpired)] {
+        // 5.4.1: `reason` is sessionExpired for EVERY dead verdict (5.3.0's value — a listener
+        // matching it must still see "deleted elsewhere" / "revoked"); the server's detail is
+        // `lastSignedOutEndReason()`, set before delivery, nil iff the server sent none.
+        for (endReason, expected): (String?, SendoraCloudAuthSignedOutReason) in [("revoked", .sessionExpired), ("deleted", .sessionExpired), ("evicted", .sessionExpired), ("expired", .sessionExpired), ("reuse", .sessionExpired), ("unknown", .sessionExpired), (nil, .sessionExpired)] {
             let h = anonymousHarness()
             h.seedSlot(0, AuthHarness.slot(userId: "g", refresh: "rt-g", heldAt: 1))
             h.boot()
+            var seenInListener: SendoraCloudRefreshEndReason?? = .none
+            let unsubscribe = h.auth.onAuthStateChanged { change in
+                if case .signedOut = change { seenInListener = .some(h.auth.lastSignedOutEndReason()) }
+            }
+            defer { unsubscribe() }
             h.transport.stub("POST", "/auth-service/token/refresh", Stub.refreshDead(endReason: endReason))
             XCTAssertNil(h.getAccessToken(forceRefresh: true))
             XCTAssertEqual(h.auth.status(), .signedOut, "\(endReason ?? "absent")")
@@ -126,7 +134,9 @@ extension AuthMachineConformanceTests {
             XCTAssertNotNil(h.heldSlot(0), "held slots untouched by the current session's death")
             XCTAssertFalse(h.auth.cronArmed)
             XCTAssertEqual(h.transitionEventNames, ["signed_out"])
-            if case .signedOut(let reason)? = h.events.last { XCTAssertEqual(reason, expected, "\(endReason ?? "absent")") }
+            guard case .signedOut(let reason)? = h.events.last else { XCTFail("signed_out last"); continue }
+            XCTAssertEqual(reason, expected, "\(endReason ?? "absent")")
+            XCTAssertEqual(seenInListener, .some(endReason.flatMap(SendoraCloudRefreshEndReason.init(rawValue:))), "endReason readable INSIDE the listener: \(endReason ?? "absent")")
             XCTAssertEqual(h.clearEffects.last?.rotateDeviceId, false, "no anon-id rotation on an involuntary death")
         }
         // from unknown (the gap-fill refresh died) → signed_out, never a mint
@@ -137,6 +147,20 @@ extension AuthMachineConformanceTests {
         XCTAssertNil(limbo.getAccessToken())
         XCTAssertEqual(limbo.auth.status(), .signedOut)
         XCTAssertEqual(limbo.transport.requests(to: "/auth-service/anonymous").count, 0)
+        guard case .signedOut(let limboReason)? = limbo.events.last else { return XCTFail("limbo death emits signed_out") }
+        XCTAssertEqual(limboReason, .sessionExpired, "limbo death: reason stays sessionExpired (5.4.1)")
+        XCTAssertEqual(limbo.auth.lastSignedOutEndReason(), .revoked, "limbo death: endReason carried separately")
+        // A later deliberate signOut must not inherit the previous death's endReason.
+        let fresh = anonymousHarness()
+        fresh.boot()
+        fresh.transport.stub("POST", "/auth-service/token/refresh", Stub.refreshDead(endReason: "deleted"))
+        XCTAssertNil(fresh.getAccessToken(forceRefresh: true))
+        XCTAssertEqual(fresh.auth.lastSignedOutEndReason(), .deleted)
+        fresh.transport.stub("POST", "/auth-service/anonymous", Stub.session(user: Stub.user(id: "fresh", isAnonymous: true), tokens: Stub.tokens(access: TestJWT.make(sub: "fresh"), refresh: "rt-f"), status: 201))
+        guard case .success = fresh.mint() else { return XCTFail("mint after the death") }
+        fresh.waitVoid { done in fresh.auth.signOut(completion: done) }
+        guard case .signedOut(.user)? = fresh.events.last else { return XCTFail("signOut emits signed_out{user}") }
+        XCTAssertNil(fresh.auth.lastSignedOutEndReason(), "signOut clears the previous death's endReason")
     }
 
     func scenario_refresh_dead_held_slot() {

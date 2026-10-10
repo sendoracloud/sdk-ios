@@ -327,23 +327,30 @@ public extension SendoraCloudAuthError {
 /// apart from an expired refresh token, and only discovered the difference when
 /// `getAccessToken` started returning nil.
 ///
-/// 5.4.0 (ADR-033 B11, additive): the server's own `endReason` on an
-/// `INVALID_REFRESH_TOKEN` rejection maps onto `revoked` / `evicted` / `deleted`;
-/// `expired`, `reuse`, `unknown` or an absent reason stay `sessionExpired`,
-/// exactly as before. Consumers default-branch.
+/// 5.4.1: EVERY dead refresh verdict is `sessionExpired`, exactly as through
+/// 5.3.0. The server's own `endReason` (ADR-033 B11) is read from
+/// `SendoraCloudAuth.lastSignedOutEndReason()` inside the listener (the case's
+/// payload is frozen for source compatibility).
+///
+/// ⚠ `revoked` / `evicted` / `deleted` were emitted by 5.4.0 ONLY. 5.4.0 put the
+/// server's `endReason` here, which renamed "account deleted elsewhere" and
+/// "sessions revoked" (both `sessionExpired` through 5.3.0) and silently broke
+/// listeners matching `sessionExpired`. The cases stay so code written against
+/// 5.4.0 still compiles. Consumers default-branch.
 public enum SendoraCloudAuthSignedOutReason: String {
     /// The app called `signOut`.
     case user
     /// The server rejected the stored refresh token (revoked, expired, rotated
-    /// away). Transient network failures and rate limits do NOT produce this.
+    /// away, account deleted elsewhere — read `lastSignedOutEndReason()` for
+    /// which). Transient network failures and rate limits do NOT produce this.
     case sessionExpired = "session_expired"
     /// `deleteAccount` succeeded.
     case accountDeleted = "account_deleted"
-    /// The server revoked the session (sign-out elsewhere, admin action).
+    /// 5.4.0 only — never emitted since 5.4.1 (now `sessionExpired` + `lastSignedOutEndReason() == .revoked`).
     case revoked
-    /// Reserved: a session-cap eviction. Not emitted by the backend yet.
+    /// 5.4.0 only — reserved, never emitted.
     case evicted
-    /// The account behind the session no longer exists.
+    /// 5.4.0 only — never emitted since 5.4.1 (now `sessionExpired` + `lastSignedOutEndReason() == .deleted`).
     case deleted
 }
 
@@ -540,6 +547,7 @@ public final class SendoraCloudAuth {
     private var proactiveTimer: Timer?
     private var proactiveAppActiveObserver: NSObjectProtocol?
     internal var lastSignedInCauseValue: SendoraCloudAuthSignedInCause?
+    internal var lastSignedOutEndReasonValue: SendoraCloudRefreshEndReason?
 
     internal struct LimboRecord {
         var refreshToken: String
@@ -626,6 +634,18 @@ public final class SendoraCloudAuth {
     public func lastSignedInCause() -> SendoraCloudAuthSignedInCause? {
         lock.lock(); defer { lock.unlock() }
         return lastSignedInCauseValue
+    }
+
+    /// The server's own verdict behind the most recent `.signedOut` (5.4.1):
+    /// `revoked` / `deleted` / `expired` / `reuse` / `unknown` when the session
+    /// died on a rejected refresh and the server named a reason; `nil` after
+    /// `signOut()` / `deleteAccount()` / `discardWithheld()` or from an older
+    /// backend. Set BEFORE the event is delivered, so a listener may read it
+    /// inside its `.signedOut(reason:)` arm. The `reason` itself stays
+    /// `sessionExpired` for every dead verdict.
+    public func lastSignedOutEndReason() -> SendoraCloudRefreshEndReason? {
+        lock.lock(); defer { lock.unlock() }
+        return lastSignedOutEndReasonValue
     }
 
     // MARK: - Hydrate (the HYDRATE rows, boot entry from `unknown`)
@@ -925,18 +945,6 @@ public final class SendoraCloudAuth {
         guard let details = error?["details"] as? [String: Any],
               let raw = details["endReason"] as? String else { return nil }
         return SendoraCloudRefreshEndReason(rawValue: raw)
-    }
-
-    /// `signed_out.reason` off a dead verdict (B11): `revoked` / `evicted` /
-    /// `deleted` pass through; `expired`, `reuse`, `unknown` and an absent reason
-    /// are `sessionExpired` — exactly what every build before 5.4.0 emitted.
-    internal static func signedOutReason(for endReason: SendoraCloudRefreshEndReason?) -> SendoraCloudAuthSignedOutReason {
-        switch endReason {
-        case .revoked?: return .revoked
-        case .evicted?: return .evicted
-        case .deleted?: return .deleted
-        default: return .sessionExpired
-        }
     }
 
     /// Block the current op (on `opsQueue`) until any in-flight refresh lands —

@@ -289,10 +289,11 @@ extension SendoraCloudAuth {
             limbo = nil
             clockSkewConfirmed = false
             storage.clearAuthTokens()
+            lastSignedOutEndReasonValue = endReason
             lock.unlock()
             stopProactiveRefreshCron()
             onIdentityCleared(ClearEffects(rotateDeviceId: false, clearQueue: false))
-            emitAuthState(.signedOut(reason: Self.signedOutReason(for: endReason)))
+            emitAuthState(.signedOut(reason: .sessionExpired))
             return true
         }
         lock.unlock()
@@ -336,6 +337,7 @@ extension SendoraCloudAuth {
         stopProactiveRefreshCron()
         let effects: ClearEffects
         let event: SendoraCloudAuthStateChange
+        var endReasonForEvent: SendoraCloudRefreshEndReason?
         switch reason {
         case .user:
             // Rotate the analytics device id at a person-boundary; keep the queue
@@ -344,13 +346,19 @@ extension SendoraCloudAuth {
             event = .signedOut(reason: .user)
         case .sessionDeath(let endReason):
             effects = ClearEffects(rotateDeviceId: false, clearQueue: false)
-            event = .signedOut(reason: Self.signedOutReason(for: endReason))
+            // ALWAYS sessionExpired (5.4.1): the server's detail is
+            // `lastSignedOutEndReason()`, never the reason — see the enum's doc.
+            event = .signedOut(reason: .sessionExpired)
+            endReasonForEvent = endReason
         case .accountDeleted:
             // The s58.353 rule as a table column: the deleted account's queued
             // events never surface.
             effects = ClearEffects(rotateDeviceId: true, clearQueue: true)
             event = .signedOut(reason: .accountDeleted)
         }
+        lock.lock()
+        lastSignedOutEndReasonValue = endReasonForEvent
+        lock.unlock()
         onIdentityCleared(effects)
         emitAuthState(event)
         return true
@@ -366,6 +374,7 @@ extension SendoraCloudAuth {
         guard let w = withheldState else { lock.unlock(); return nil }
         withheldState = nil
         storage.clearAuthTokens()
+        lastSignedOutEndReasonValue = nil
         lock.unlock()
         onIdentityCleared(ClearEffects(rotateDeviceId: false, clearQueue: false))
         emitAuthState(.signedOut(reason: .user))

@@ -5,6 +5,18 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+## 5.4.1 — dead session is `.sessionExpired` again; server detail in `lastSignedOutEndReason()` (set under the lock BEFORE `emitAuthState`, like `lastSignedInCause()`; the enum payload is frozen) (RopoLabs, 2026-10-10)
+
+5.4.0 mapped the B11 `endReason` onto `signed_out.reason` (`revoked` / `deleted`). Those are two
+OLD situations ("account deleted elsewhere", "sessions revoked") that 5.3.0 reported as
+`.sessionExpired`, so a listener matching `.sessionExpired` stopped seeing them — RopoLabs' template
+(`auth-store.ts:665`) and our own `/docs/auth-errors` example both did. ⚠ **A new union value is
+additive only for a NEW situation; re-labelling an existing one is a behaviour change**
+(ADR-023), even though it compiles. Fix: `reason` is `.sessionExpired` for EVERY dead verdict; the
+detail is `lastSignedOutEndReason()` (set under the lock BEFORE `emitAuthState`, like `lastSignedInCause()`; the enum payload is frozen). The three values stay in the type (never emitted) so 1.41.0-era code compiles.
+Shared table row `refresh_dead.current` now emits `signed_out{reason:'session_expired', endReason}`.
+Guard `scenario_refresh_dead_current` (reads the accessor INSIDE a listener; limbo death; signOut resets it); mutations: map revoked/deleted back onto `reason` → 2 red; drop the endReason → 7 red; set the accessor AFTER delivery → 6 red.
+
 ## ADR-033 wave 1 (5.4.0) — "One Slot, Two Verbs": held guests, single commit, project guard
 
 Law: `docs/decisions/033-sdk-auth-mechanism.md` §3.2–§3.5, §5 wave 1 (a)–(f); the table is
