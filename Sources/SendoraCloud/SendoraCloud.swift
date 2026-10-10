@@ -127,12 +127,20 @@ public final class SendoraCloud {
             defaultConsent: cfg.defaultConsent,
             autoStartAttribution: cfg.autoStartAttribution,
             pinnedSPKIHashes: cfg.pinnedSPKIHashes,
-            autoTrackLifecycle: cfg.autoTrackLifecycle
+            autoTrackLifecycle: cfg.autoTrackLifecycle,
+            // 5.4.0: this used to be dropped here (the field was re-defaulted to
+            // `true`), so `autoTrackEngagement: false` was silently ignored.
+            autoTrackEngagement: cfg.autoTrackEngagement,
+            expectedProjectId: cfg.expectedProjectId,
+            autoRestoreHeldGuest: cfg.autoRestoreHeldGuest
         )
 
         do {
             try SendoraCloudValidator.validateApiKey(finalConfig.apiKey)
             try SendoraCloudValidator.validateApiUrl(finalConfig.apiBaseUrl)
+            // ADR-033 §3.3: a UUID, equal to `projectId` when both are set. A typo
+            // would withhold every session on first launch — refuse to configure.
+            try SendoraCloudValidator.validateExpectedProjectId(finalConfig.expectedProjectId, projectId: finalConfig.projectId)
         } catch {
             SendoraCloudLogger.shared.error("\(error)")
             return
@@ -183,53 +191,7 @@ public final class SendoraCloud {
             queue.startTimer(interval: finalConfig.flushInterval)
             self.eventQueue = queue
 
-            self.auth = SendoraCloudAuth(
-                client: client,
-                storage: store,
-                onIdentityChange: { userId in
-                    self.serialQueue.sync {
-                        self.currentUserId = userId
-                        store.cachedUserId = userId
-                    }
-                },
-                onAnonymousWipe: { rotateDeviceId in
-                    // Clear the user identity on every wipe. The device (anonymous
-                    // analytics) id rotates ONLY at a person-boundary — an explicit
-                    // signOut or account deletion (rotateDeviceId=true). On a
-                    // sign-in/upgrade or an involuntary session death it SURVIVES:
-                    // same person, so pre-auth analytics link to the now-real user
-                    // (parity with RN 1.38.0; the industry norm). Rotating on logout
-                    // keeps two people on a shared device from merging.
-                    self.serialQueue.sync {
-                        self.currentUserId = nil
-                        self.currentIdentityToken = nil
-                        store.cachedUserId = nil
-                        if rotateDeviceId {
-                            store.regenerateDeviceId()
-                            // Force-mint a fresh device id immediately so any
-                            // concurrent track() that races the wipe sees the new
-                            // id rather than a transiently missing one.
-                            _ = store.deviceId
-                        }
-                        store.sessionId = UUID().uuidString
-                    }
-                    self.eventQueue?.dropAll()
-                }
-            )
-
-            // Wire passkeys against the same client + auth instance so
-            // the WebAuthn flows can read the bearer token + share the
-            // network stack. iOS only — UIKit gate keeps this clean
-            // for the macOS slice of the package.
             #if canImport(UIKit)
-            if let auth = self.auth {
-                // Passkeys need iOS 16 (ASAuthorizationPlatformPublicKeyCredential).
-                // Wire only where available; SSO + the rest work on iOS 15.
-                if #available(iOS 16.0, *) {
-                    self._passkeys = SendoraCloudPasskeys(client: client, auth: auth)
-                }
-                self.sso = SendoraCloudSso(client: client, auth: auth)
-            }
             self.support = SendoraCloudSupport()
             #endif
 
@@ -265,6 +227,76 @@ public final class SendoraCloud {
                 linkHosts: finalConfig.linkHosts
             )
 
+        }
+
+        // The auth machine is constructed OUTSIDE `serialQueue.sync`: its Keychain
+        // hydrate runs in `init` and calls the identity hooks below, which take
+        // `serialQueue.sync` themselves — nesting that inside the block above is a
+        // guaranteed deadlock for any launch with a cached session.
+        if let store = self.storage, let client = self.apiClient {
+            let auth = SendoraCloudAuth(
+                client: client,
+                storage: store,
+                config: SendoraCloudAuth.MachineConfig(
+                    expectedProjectId: finalConfig.expectedProjectId,
+                    configProjectId: finalConfig.projectId,
+                    autoRestoreHeldGuest: finalConfig.autoRestoreHeldGuest
+                ),
+                onIdentityChange: { userId in
+                    self.serialQueue.sync {
+                        self.currentUserId = userId
+                        store.cachedUserId = userId
+                    }
+                },
+                onIdentityCleared: { effects in
+                    // The device (anonymous analytics) id rotates ONLY at a
+                    // person-boundary — an explicit signOut / reset or an account
+                    // deletion. A sign-in switch (the guest is HELD, not wiped) or an
+                    // involuntary session death is the SAME person, so the id
+                    // survives and pre-auth analytics link to them (SudokuHurdle r6).
+                    // The queue is dropped only when the table says so (DELETE / reset).
+                    self.serialQueue.sync {
+                        self.currentUserId = nil
+                        self.currentIdentityToken = nil
+                        store.cachedUserId = nil
+                        if effects.rotateDeviceId {
+                            store.regenerateDeviceId()
+                            // Force-mint a fresh device id immediately so any
+                            // concurrent track() that races the wipe sees the new
+                            // id rather than a transiently missing one.
+                            _ = store.deviceId
+                        }
+                        store.sessionId = UUID().uuidString
+                    }
+                    if effects.clearQueue { self.eventQueue?.dropAll() }
+                },
+                onIdentityWithheld: {
+                    // ADR-033 [2c] analytics quarantine: null the user id IN MEMORY
+                    // only — the persisted `sendora_user_id` is untouched (a withheld
+                    // hydrate performs zero writes).
+                    self.serialQueue.sync {
+                        self.currentUserId = nil
+                        self.currentIdentityToken = nil
+                    }
+                }
+            )
+            self.auth = auth
+
+            // Wire passkeys against the same client + auth instance so
+            // the WebAuthn flows can read the bearer token + share the
+            // network stack. iOS only — UIKit gate keeps this clean
+            // for the macOS slice of the package.
+            #if canImport(UIKit)
+            // Passkeys need iOS 16 (ASAuthorizationPlatformPublicKeyCredential).
+            // Wire only where available; SSO + the rest work on iOS 15.
+            if #available(iOS 16.0, *) {
+                self._passkeys = SendoraCloudPasskeys(client: client, auth: auth)
+            }
+            self.sso = SendoraCloudSso(client: client, auth: auth)
+            #endif
+        }
+
+        serialQueue.sync {
             self.isConfigured = true
         }
 
@@ -519,8 +551,27 @@ public final class SendoraCloud {
         trackEvent("user.identified", properties: traits)
     }
 
-    /// Reset the current user identity. Regenerates device id and session.
+    /// Reset the current ANALYTICS identity. Regenerates device id and session.
+    ///
+    /// ⚠ This is NOT an auth call, and 5.4.0 keeps it that way: since the first
+    /// release iOS `reset()` cleared only the analytics user id / device id /
+    /// session id — it never touched the auth session, the Keychain tokens or the
+    /// event queue (unlike RN/web `reset()`, which always signed out). ADR-033's
+    /// RESET row ("SIGN_OUT + clear queue") therefore has NO public entry on
+    /// iOS; changing `reset()` to sign out would be a behaviour change a MINOR
+    /// cannot ship (lockstep ruling). Use `SendoraCloud.auth?.signOut` to end the
+    /// auth session — it keeps held guests.
     public static func reset() {
+        reset(includeHeldGuests: false)
+    }
+
+    /// `reset()` with the ADR-033 option, accepted for parity with RN/web
+    /// `reset({ includeHeldGuests })`. On iOS `reset()` is not an auth-clearing
+    /// call, so held guests are NEVER released by it — the flag is accepted and
+    /// has no effect (release a guest explicitly with `restoreHeldGuest(id:)` /
+    /// `discardHeldGuest(id:)` / `claimHeldGuest(id:)`). A separate overload so
+    /// the pre-5.4.0 `reset()` declaration survives verbatim.
+    public static func reset(includeHeldGuests: Bool) {
         guard isConfigured else { return }
         serialQueue.sync {
             currentUserId = nil

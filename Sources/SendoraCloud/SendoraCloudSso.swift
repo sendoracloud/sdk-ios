@@ -29,6 +29,9 @@ public enum SendoraCloudSsoError: Error {
     case missingTokenInCallback
     case exchangeFailed(String)
     case missingPresenter
+    /// 5.4.0 (ADR-033): a typed refusal from the auth machine (`SESSION_WITHHELD`,
+    /// `PROJECT_MISMATCH`, a dropped result). Branch on `.kind` / `.code`.
+    case authError(SendoraCloudAuthError)
 }
 
 public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationContextProviding {
@@ -54,13 +57,18 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
         from window: UIWindow,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudSsoError>) -> Void
     ) {
+        // ADR-033 §3.2: in `withheld` every sign-in verb rejects before any network.
+        if let refusal = auth.withheldRefusal() {
+            completion(.failure(.authError(refusal)))
+            return
+        }
         self.presentingWindow = window
-        // Phase 1 — get the authorization URL.
-        var startBody: [String: Any] = ["returnTo": returnTo]
-        // Device-takeover (s58.115): forward the anon refresh so the
-        // OIDC callback can retire the anon row + reassign push
-        // tokens after minting the identified session.
-        if let prev = auth.takeoverHint() { startBody["prevAnonRefreshToken"] = prev }
+        // The attempt's identity CAS is taken NOW, before the browser: a result
+        // that lands after a signOut()/switch made meanwhile is dropped (INV-2).
+        let startedFrom = auth.externalAttemptStart()
+        // Phase 1 — get the authorization URL. ADR-033 INV-3: NO guest hint —
+        // the device's guest is HELD by the SIGN_IN commit, never retired.
+        let startBody: [String: Any] = ["returnTo": returnTo]
         client.post(path: "/auth-service/sso/oidc/start", body: startBody) { [weak self] response in
             guard let self = self else { return }
             guard let data = response?["data"] as? [String: Any],
@@ -88,7 +96,7 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
                         completion(.failure(.sessionStartFailed("No callback URL")))
                         return
                     }
-                    self.handleCallback(callback, completion: completion)
+                    self.handleCallback(callback, startedFrom: startedFrom, completion: completion)
                 }
                 session.presentationContextProvider = self
                 // ephemeralWebBrowserSession=false so the user's
@@ -106,6 +114,7 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
 
     private func handleCallback(
         _ callback: URL,
+        startedFrom: SendoraCloudAuth.IdentityCAS? = nil,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudSsoError>) -> Void
     ) {
         // Sendora delivers the refresh token in the fragment so it
@@ -134,21 +143,23 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
         // wiring already; we delegate.
         client.post(path: "/auth-service/token/refresh", body: ["refreshToken": refreshToken]) { [weak self] response in
             guard let self = self else { return }
-            guard let data = response?["data"] as? [String: Any],
-                  let accessToken = data["accessToken"] as? String,
+            // The rotated trio is NESTED under `data.tokens` (s58.76; the flat
+            // read this path shipped with never matched — s58.271 lesson). Accept
+            // both levels.
+            let data = response?["data"] as? [String: Any]
+            let fields = (data?["tokens"] as? [String: Any]) ?? data
+            guard let accessToken = fields?["accessToken"] as? String,
                   !accessToken.isEmpty,
-                  let newRefresh = data["refreshToken"] as? String,
+                  let newRefresh = fields?["refreshToken"] as? String,
                   !newRefresh.isEmpty,
-                  let expiresIn = data["expiresIn"] as? Int,
+                  let expiresIn = fields?["expiresIn"] as? Int,
                   expiresIn > 0 else {
                 completion(.failure(.exchangeFailed("Could not exchange OIDC token")))
                 return
             }
-            // We synthesise a minimal user shape from the JWT payload
-            // since the refresh endpoint doesn't echo the user. Auth
-            // already has the JWT-decode logic in persistFromAuth-
-            // Response — we feed it a synthesised envelope.
-            let synthesisedUser: [String: Any] = [
+            // Prefer the user the route returns (B17); fall back to a minimal
+            // shape synthesised from the JWT when the row is absent.
+            let userPayload: [String: Any] = (data?["user"] as? [String: Any]) ?? [
                 "id": Self.subjectFromJwt(accessToken) ?? "",
                 "email": NSNull(),
                 "emailVerified": true,
@@ -156,12 +167,12 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
                 "isAnonymous": false,
             ]
             var authPayload: [String: Any] = [
-                "user": synthesisedUser,
+                "user": userPayload,
                 "tokens": [
                     "accessToken": accessToken,
                     "refreshToken": newRefresh,
                     "expiresIn": expiresIn,
-                    "tokenType": "Bearer",
+                    "tokenType": (fields?["tokenType"] as? String) ?? "Bearer",
                 ],
             ]
             if let retired = retiredAnonUserId, !retired.isEmpty {
@@ -171,10 +182,12 @@ public final class SendoraCloudSso: NSObject, ASWebAuthenticationPresentationCon
                 "success": true,
                 "data": authPayload,
             ]
-            if let user = self.auth.persistFromAuthResponse(synthesisedEnvelope) {
-                completion(.success(user))
-            } else {
-                completion(.failure(.exchangeFailed("Persist failed")))
+            // The SIGN_IN commit: holds the device's guest, sid-CAS, ProjectGuard.
+            self.auth.completeExternalSignIn(response: synthesisedEnvelope, startedFrom: startedFrom) { result in
+                switch result {
+                case .success(let user): completion(.success(user))
+                case .failure(let error): completion(.failure(.authError(error)))
+                }
             }
         }
     }

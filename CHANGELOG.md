@@ -1,5 +1,99 @@
 # Changelog
 
+## 5.4.0 — sign-in no longer retires the guest — it is held on the device (ADR-033 wave 1)
+
+**Two behaviour changes, both strictly less destructive than before; everything else is additive
+(MINOR under ADR-023). Lockstep with RN 1.41.0 / web 3.24.0 / Android 4.26.0.**
+
+1. **Sign-in no longer retires the guest — it is held on the device.** A credentialed sign-in
+   (`signIn`, `loginSocial` and every `signInWith*`, `signInWithGameCenter`, `verifyMagicLink`,
+   `verifyEmailOtp`, `challengeMfa`, passkey, SSO) from a guest no longer sends the guest's refresh
+   token (`prevAnonRefreshToken` / `linkAnonymous` / `onCredentialInUse` are never sent). The guest
+   is HELD in one of 5 fixed Keychain slots (`sendora_auth_held_0…4`) and the server row survives.
+   `onAuthStateChanged` emits `.guestHeld(userId:count:)` then ONE `.signedIn` — no `.signedOut`.
+   Read `heldGuests()` / `heldGuest()`, then `restoreHeldGuest(id:)` (sign back in as the guest),
+   `claimHeldGuest(id:)` (merge it INTO the current account — destructive, optional) or
+   `discardHeldGuest(id:)` (real server delete). `signInAnonymously()` / `ensureSession()` in the
+   signed-out state restores the newest eligible held guest before minting (`autoRestoreHeldGuest`,
+   default on) — visibly: `.signedIn` with `lastSignedInCause() ==
+   .restore` (re-register push) then `.guestReleased(.restored)` — the same order on every restore path. `onDeviceTakeover` / `getLastAnonRetirement()` / `.deviceTakeover`
+   stay callable and never fire for this SDK's sign-ins.
+2. **`link: true` over an identified session attaches or errors — it never switches.**
+   `loginSocial(link: true)`, `signInWithApple/Google(link: true)` and `signInWithGameCenter(link:
+   true)` from `anonymous` AND `identified` go to `/me/link/*` on the current Bearer: a promotion keeps
+   the `sub`; an identity already on this account is a quiet success (no event); an identity owned
+   elsewhere is `.credentialInUse` (pass `onCredentialInUse: .adopt` to fall through to a plain
+   sign-in bound to the SAME credential — the guest is held); a stale session is `RECENT_AUTH_REQUIRED`
+   (kind `.recentAuthRequired`). In the signed-out state `link: true` is a plain sign-in.
+
+**New (additive):**
+- `status()` → `SendoraCloudAuthStatus` (`unknown | signedOut | anonymous | identified | withheld`) and
+  `authStateReady(completion:)`. ⚠ NORMATIVE: default-branch on it (`default:` / no exhaustive
+  switch); a later value is a MAJOR. `status()` is the ONLY way to tell `withheld` from `signedOut`
+  (`currentUser` is nil in both). `getRefreshToken()`, `lastSignedInCause()`.
+- `SendoraCloudAuthStateChange` gains `.initial(status:user:withheld:)` (replayed once per subscriber,
+  INCLUDING signed-out / unknown / withheld — the `.signedIn` replay is kept too), `.userUpdated(user:cause:)`,
+  `.guestHeld`, `.guestReleased(userId:reason:endReason:)`, `.sessionWithheld`. `eventName` gives the
+  shared snake_case token. `SendoraCloudAuthSignedOutReason` gains `revoked | evicted | deleted` (B11).
+  ⚠ An exhaustive `switch` over either enum needs a `default:` (same additive class as 4.13.0).
+- Typed verbs: `signIn(with: SendoraCloudCredential)` → `SendoraCloudSignInResult`
+  (`.done(user:previous:reactivated:)` / `.mfaRequired(challenge)` with `verify(code:)`), and
+  `link(_:)` → `SendoraCloudLinkResult` (`.done(user:upgraded:alreadyLinked:)` /
+  `.credentialInUse(ctx)` with `ctx.switchAccount(refetch:completion:)` + `ctx.keepCurrent()` /
+  `.recentAuthRequired`). `switchAccount()` is bound to the refused credential: same payload under 5
+  minutes, otherwise `refetch` must hand back a fresh native credential and a changed `teamPlayerID`
+  aborts with `.credentialChanged`.
+- Project guard (opt-in): `SendoraCloudConfig(expectedProjectId:)` — a UUID, equal to `projectId` when
+  both are set (`configure()` logs + aborts otherwise). A stored session whose JWT `project` claim
+  disagrees is `status() == .withheld`: nothing wiped, NOTHING written (byte-identical Keychain),
+  `withheld()` populated, every identity verb refuses `AuthError(kind: .config, code: "SESSION_WITHHELD")`
+  with no network; `discardWithheld()` (= `signOut()` in that state) clears exactly the session keys,
+  revokes server-side and keeps the held guests, queue and analytics id. A fresh mint under the wrong
+  key rejects `PROJECT_MISMATCH` and revokes the minted token — no relaunch loop.
+- `deleteAccount(alsoDiscardHeldGuests:)` → `AccountDeletionResult.heldGuests` /
+  `heldGuestsDiscardFailed`. Held guests SURVIVE a delete (device + server) and are never auto-restored
+  afterwards (explicit `restoreHeldGuest(id:)` only).
+- `SendoraCloud.reset(includeHeldGuests:)` — accepted for parity with RN/web. iOS `reset()` keeps its
+  5.3.0 semantics exactly: it resets the analytics identity only and never signs out (RN/web `reset()`
+  always signed out; iOS never did, and changing that is not a MINOR). The flag therefore has no effect
+  on iOS; `signOut()` is the auth call and keeps held guests.
+- New typed errors: `.sessionWithheld`, `.projectMismatch`, `.heldGuestLimit`, `.heldGuestProjectMismatch`,
+  `.ambiguousHeldGuest` (kind `.config`), `.heldGuestGone`, `.credentialChanged` (`.invalidCredential`),
+  `.restoreFailed` (`.server`, retryable) — all with `.code`. `SendoraCloudAuthUser.project` (B17).
+  `SendoraCloudPasskeyError.authError` / `SendoraCloudSsoError.authError`.
+- `refreshAccessToken(completion:)` is public (the README documented it for years); `getAccessToken(forceRefresh: true)`
+  now genuinely bypasses the cached token (it was short-circuited by the stashed-token check).
+- On-device: `sendora_auth_session` is dual-written beside the four frozen keys (a 5.3.0 reads the
+  session after a downgrade; the slots are simply ignored), `sendora_schema_version` → `"2"` on the
+  first install commit, `sendora_auth_mint_key` (B10 idempotent mint, non-secret, cleared on success).
+
+**Fixed en route:** `SendoraCloudConfig.autoTrackEngagement: false` was silently dropped by
+`configure()`; the OIDC SSO callback read `/token/refresh`'s tokens from the flat level (they are
+nested under `data.tokens` since s58.76) so it could never complete. The event queue is now dropped
+ONLY by `deleteAccount` (the shared table); 5.3.0 dropped it on every identity wipe — sign-out, a
+sign-in that replaced a guest, a session death — losing events already tracked. iOS `reset()` never
+touched the queue and still does not.
+
+**Passkey + OIDC sign-ins are CAS-guarded from the moment the sheet opens:** a result that lands after
+a `signOut()` (or another sign-in) made while the system sheet / browser was up is dropped and its
+server session revoked, instead of installed over the newer state.
+
+**Downgrade-cycle safety:** a 5.3.0 `signOut()` / `deleteAccount()` clears only the four frozen keys,
+so after 5.4.0 → 5.3.0 → sign-out → 5.4.0 the `sendora_auth_session` record of the signed-out (or
+deleted) account is still on disk. 5.4.0 trusts that record ONLY when its refresh token equals the
+frozen one; a record with no matching frozen counterpart is a leftover and is cleared silently (no
+event beyond the boot `.initial`, no network) — it is never reinstalled. Installs write the four frozen
+keys before the record, so a crash can never leave a record-only disk.
+
+**Kept from 5.3.0 verbatim:** `deleteAccount(completion:)` and `SendoraCloud.reset()` are separate
+overloads beside the new `deleteAccount(alsoDiscardHeldGuests:completion:)` /
+`reset(includeHeldGuests:)` (not defaulted parameters), and `onAuthStateChanged` still replays
+`.signedIn(user:)` after the new `.initial` when a session exists.
+
+**Known gap (backend):** `POST /me/link/email` accepts `email` + `password` only, so
+`signUp(name:)` from a guest drops `name` (the pre-5.4.0 `/upgrade` path kept it).
+
+
 ## 5.3.0 — signInAnonymously() no longer replaces a signed-in account
 
 **Behaviour change.** Parity with RN 1.40.0 (reported by RopoLabs on the RN SDK; the

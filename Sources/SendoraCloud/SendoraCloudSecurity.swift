@@ -9,6 +9,9 @@ public enum SendoraError: Error, CustomStringConvertible {
     case payloadTooLarge(Int)
     case payloadTooDeep(Int)
     case forbiddenKey(String)
+    /// ADR-033 wave 1 (5.4.0): `expectedProjectId` must be a UUID and must
+    /// equal `projectId` when both are set.
+    case invalidExpectedProjectId(String)
 
     public var description: String {
         switch self {
@@ -18,6 +21,7 @@ public enum SendoraError: Error, CustomStringConvertible {
         case .payloadTooLarge(let n): return "[SendoraCloud] payload too large: \(n) bytes"
         case .payloadTooDeep(let n): return "[SendoraCloud] payload nested too deep: \(n) levels"
         case .forbiddenKey(let k): return "[SendoraCloud] forbidden property key: \(k)"
+        case .invalidExpectedProjectId(let m): return "[SendoraCloud] invalid expectedProjectId: \(m)"
         }
     }
 }
@@ -44,6 +48,21 @@ enum SendoraCloudValidator {
         if url.hasPrefix("http://localhost") || url.hasPrefix("http://127.0.0.1") { return }
         if !url.hasPrefix("https://") {
             throw SendoraError.invalidApiUrl("must be https:// (http://localhost ok in dev)")
+        }
+    }
+
+    /// ADR-033 §3.3 `commit()` header: "init validates expectedProjectId: UUID
+    /// string, equal to config.projectId when both set". A typo here would
+    /// otherwise withhold every session on first launch.
+    static func validateExpectedProjectId(_ expected: String?, projectId: String?) throws {
+        guard let expected = expected else { return }
+        guard UUID(uuidString: expected) != nil else {
+            throw SendoraError.invalidExpectedProjectId("must be a UUID, got \"\(expected)\"")
+        }
+        if let projectId = projectId, !projectId.isEmpty, projectId.lowercased() != expected.lowercased() {
+            throw SendoraError.invalidExpectedProjectId(
+                "must equal projectId when both are set (expectedProjectId=\(expected), projectId=\(projectId))"
+            )
         }
     }
 

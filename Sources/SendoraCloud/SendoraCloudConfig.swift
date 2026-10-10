@@ -49,6 +49,22 @@ public struct SendoraCloudConfig {
     /// and avoid counting container / nav / tab controllers).
     public var autoTrackEngagement: Bool
 
+    /// ADR-033 wave 1 (5.4.0) — opt-in project guard. When set, every session
+    /// the SDK installs (hydrate, refresh, mint, sign-in, restore, claim) is
+    /// judged against the JWT `project` claim: a stored session whose claim
+    /// disagrees is reported as `status() == .withheld` (nothing wiped, nothing
+    /// written) and a fresh mint under the wrong key is rejected with
+    /// `PROJECT_MISMATCH`. Must be a UUID and must equal `projectId` when both
+    /// are set — `configure()` logs and aborts otherwise. `nil` = guard off.
+    public var expectedProjectId: String?
+
+    /// ADR-033 wave 1 (5.4.0) — when `signInAnonymously()` / `ensureSession()`
+    /// runs in `signedOut` and a held guest is eligible, restore the newest one
+    /// instead of minting (visible as `guestReleased(.restored)` +
+    /// `signedIn(cause: .restore)`). `false` mints while fewer than 5 guests are
+    /// held and still restores at the cap. Default `true` (§8-Q1).
+    public var autoRestoreHeldGuest: Bool
+
     public init(
         apiKey: String,
         projectId: String? = nil,
@@ -62,7 +78,9 @@ public struct SendoraCloudConfig {
         autoStartAttribution: Bool = true,
         pinnedSPKIHashes: [String] = [],
         autoTrackLifecycle: Bool = true,
-        autoTrackEngagement: Bool = true
+        autoTrackEngagement: Bool = true,
+        expectedProjectId: String? = nil,
+        autoRestoreHeldGuest: Bool = true
     ) {
         self.apiKey = apiKey
         self.projectId = projectId
@@ -77,6 +95,8 @@ public struct SendoraCloudConfig {
         self.pinnedSPKIHashes = pinnedSPKIHashes
         self.autoTrackLifecycle = autoTrackLifecycle
         self.autoTrackEngagement = autoTrackEngagement
+        self.expectedProjectId = expectedProjectId
+        self.autoRestoreHeldGuest = autoRestoreHeldGuest
     }
 }
 

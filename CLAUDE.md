@@ -5,6 +5,197 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+## ADR-033 wave 1 (5.4.0) — "One Slot, Two Verbs": held guests, single commit, project guard
+
+Law: `docs/decisions/033-sdk-auth-mechanism.md` §3.2–§3.5, §5 wave 1 (a)–(f); the table is
+`packages/shared/src/auth-machine/transitions.ts` and this port is an INTERPRETER of it. Lockstep:
+RN 1.41.0 / web 3.24.0 / Android 4.26.0. Backend contract = prod `7aa740a0` (B1–B17). Not yet
+mirror-published; the mirror tag is operator-gated behind the staging live-run marker (B9).
+
+**The machine.** Five states (`SendoraCloudAuthStatus`: `unknown | signedOut | anonymous | identified
+| withheld`; NORMATIVE default-branch, `status()` is the only way to tell `withheld` from `signedOut`).
+Files:
+- `SendoraCloudAuth.swift` — public types + the class core: hydrate (read-first `sendora_auth_session`,
+  the four frozen keys as the authority on WHETHER a session exists — after a downgrade→upgrade cycle
+  they are the fresher source, so a differing legacy refresh token rebuilds the record and
+  write-forwards; the record is trusted ONLY when its refresh token equals the frozen one — a record
+  with no frozen counterpart is a downgrade-cycle LEFTOVER and is cleared silently, see below), the token layer (`performRefresh` → `routeRefreshResult` by the SENT token, the
+  s58.281 two-deadline rule unchanged, `forceRefresh` now really bypasses the stashed-token
+  short-circuit), listeners, the Bearer session verbs, parsing. `revokeSession` / `revokeAllSessions`
+  / `listLinkedIdentities` / `onDeviceTakeover` / `fireLifecycleSignals` MUST stay in this file —
+  `auth-error-kind-parity`, `identities.test.ts`, `credential-collision.test.ts`,
+  `anon-retirement.test.ts` and `sdk-contract-golden` read it by name (the golden needs the first
+  `"/auth-service/token/refresh"` literal followed by `data["tokens"]` — no optional chaining there).
+- `SendoraCloudAuth+Commit.swift` — **`commit*`, the ONLY writer** (INV-1): every assignment to
+  `current` / `limbo` / `withheldState` / `slots`, every Keychain write, cron arm/stop and parent hook.
+  `commitInstall` = sid-CAS or sent-token CAS → `projectVerdict` → dual-write (four frozen keys +
+  record, schema → `"2"`) → cron → `onIdentityChange`. `commitClear` is the one local-first exception.
+  Source guard: `test_authStorageKeyNamesAppearOnlyInStorageSwift` (no `"sendora_auth_` literal outside
+  `Storage.swift`).
+- `SendoraCloudAuth+Engines.swift` — one engine per event family (`performSwitch` / `performLink` /
+  `performMint` / `performRestoreCore` / `performClaim` / `performDiscard` / `refreshHeld`), all ON
+  `opsQueue`, all awaiting an in-flight refresh at start (and at commit for a switch), all handing a
+  PROPOSAL to the funnel. `installSwitchResponse` is shared with passkeys + SSO
+  (`completeExternalSignIn`). No engine assigns state.
+- `SendoraCloudAuth+Verbs.swift` — the public verbs: every pre-5.4.0 signature unchanged; `signUp`
+  routes by status (anonymous → `/me/link/email`, never `/upgrade`; signedOut → `/signup`; identified →
+  local `.alreadyIdentified`; unknown → settle); the legacy wrappers map typed outcomes onto their
+  historical shapes (`signUp` keeps `.emailAlreadyTaken` for the 409; `link:true` over identified
+  THROWS `.credentialInUse` / `RECENT_AUTH_REQUIRED`, `alreadyLinked` resolves quietly).
+- `Internal/AuthMachineTypes.swift` (status / cause / reason enums, `SendoraCloudCredential`,
+  `SendoraCloudSignInResult`, `SendoraCloudLinkResult` with `SendoraCloudCredentialInUse.switchAccount(refetch:)`
+  + `keepCurrent()` as METHODS, `SendoraCloudMfaChallenge.verify(code:)`, the `AuthSessionRecord` and
+  `HeldSlotRecord` disk shapes), `Internal/ProjectVerdict.swift` (verbatim port, own base64url + strict
+  UTF-8 decoder, no signature check; absent claim = `unknown`, explicit null = `mismatch`).
+
+**Keychain.** Four frozen keys unchanged (a 5.3.0 reads them after a downgrade) + `sendora_auth_session`
+(dual-written on every install, carries `sid` and the B15 `heldReportPending` list — never held
+material) + the K = 5 FIXED slots `sendora_auth_held_0…4` (LITERAL names in `Storage.heldSlotKeys`;
+`Storage.secureKeys` is the closed allow-list the recording double enforces — a per-guest dynamic key
+fails the suite). Slot record = shared `HeldGuest` v1 (`project` encoded as explicit JSON null). An
+unreadable slot is KEPT and ignored, never cleared. `sendora_auth_mint_key` (UserDefaults) is the B10
+per-attempt idempotent mint key, cleared on MINT_OK or a fresh-mint mismatch.
+
+**Hooks to the parent.** `onIdentityChange(id)` (unchanged); `onIdentityCleared(ClearEffects)` replaces
+`onAnonymousWipe(Bool)`: rotate the device id ONLY on `signOut` / `deleteAccount` (and the internal RESET
+row); drop the queue ONLY on `deleteAccount` (the table — 5.3.0 dropped it on EVERY wipe, incl. a
+sign-in that replaced a guest and a session death);
+`onIdentityWithheld()` nulls `currentUserId` in memory only. ⚠ `configure()` now builds the auth
+surface AFTER `serialQueue.sync` — the hydrate hooks `sync` that queue, and nesting them was a
+deadlock for any launch with a cached session.
+
+**iOS readings of the ADR (document, do not re-litigate):**
+- `signedIn.cause` cannot ride the frozen `case signedIn(user:)` payload (adding an associated value
+  breaks `case .signedIn(let user)` at every call site) → `lastSignedInCause()`, set before the emit.
+- The subscribe-time replay is `.initial(...)` AND the pre-5.4.0 `.signedIn(user:)` replay (dropping
+  the latter would break installed Home-on-signedIn listeners).
+- `unknown` queues MINT / SIGN_IN / LINK / RESTORE by driving the gap-fill refresh inline
+  (`settleUnknownIfNeeded`); offline the verb fails `.network` (retryable) instead of hanging a
+  completion forever. ⚠ **Known divergence from RN** (which keeps such verbs queued until the status
+  settles): both never mint and never wipe in `unknown` — the iOS one returns a retryable error the
+  app can re-issue, RN holds the promise. Not destructive; kept deliberately. `getAccessToken()` in `unknown` drives the gap-fill too, with the stashed access
+  token as the offline fallback. CLAIM / DISCARD / `discardWithheld` are NOT queued (rows
+  `claim.identified_only`, `discard.held_guest`).
+- Restore emission order is ONE order on every path (the regenerated fixture, lockstep): install, then
+  `signedIn` (`lastSignedInCause() == .restore`), then `guestReleased(.restored)` as the slot goes —
+  MINT auto-restore, `restoreHeldGuest()` and restore-over-a-guest alike (mutation M31).
+- A fresh response whose claim is unreadable installs (not a mismatch); hydrate / gap-fill with an
+  unreadable claim stay `unknown` (persisting a rotation only).
+- `onCredentialInUse` on a PLAIN sign-in is accepted and ignored (no hint is sent, so the server cannot
+  refuse a collision; the guest is held, never deleted). `.adopt` is consulted only on a `link:true`
+  409, where it falls through to a sign-in bound to the same credential.
+- `switchAccount(refetch:)`: the SDK has no GameKit dependency, so after 5 minutes the APP re-fetches
+  and the SDK compares `teamPlayerID` (`credentialChanged` on mismatch); without `refetch` a stale
+  payload is refused.
+- `signOut()` in `unknown` clears the limbo keys + revokes; in `signedOut` it is a quiet no-op (both
+  `UNSPECIFIED_BY_ADR`).
+- **`SendoraCloud.reset()` keeps its 5.3.0 semantics (lockstep ruling 2): iOS is the "reset() never
+  signed out" case.** It has always reset ONLY the analytics identity (user id, device id, session id)
+  — no auth session, no Keychain tokens, no event queue (RN/web `reset()` always signed out). So the
+  ADR RESET row has no public entry on iOS: `resetFromParent(includeHeldGuests:)` implements it for
+  the conformance replay only, and the public `reset(includeHeldGuests:)` overload accepts the flag for
+  parity and ignores it (held guests are released only by the explicit verbs).
+- **Subscribe replay (lockstep ruling 1):** `onAuthStateChanged` replays `.initial(status:user:withheld:)`
+  and THEN — when a session exists — the 5.3.0 `.signedIn(user:)`, per subscriber; no session →
+  `.initial` only. Pinned by `test_subscribeReplaysInitialThenTheLegacySignedInWhenASessionExists` +
+  `…OnlyInitialWithoutASession` (mutation M27).
+- **Downgrade cycle (lockstep, RN-found):** a 5.3.0 `signOut()` / `deleteAccount()` clears only the
+  four frozen keys, so the 5.4 record survives 5.4→5.3→sign-out→5.4. Hydrate trusts the record ONLY
+  when `record.refreshToken == frozen refresh`: no frozen refresh → the record is cleared with the
+  stale blob (`signedOut`, boot `initial` only, no network); a different frozen refresh in LIMBO_A →
+  the record is dropped (`commitHydrateLimbo(clearLeftoverRecord:)`); `writeRotationOnly` rotates the
+  record only when it belongs to the same session, else drops it (a withhold-on-refresh must not
+  graft C's tokens onto A's user). Frozen keys are written BEFORE the record (`writeCurrentRecord`).
+  Mutations M28–M30, M32.
+- **Passkey + OIDC take the identity CAS when the sheet OPENS** (`externalAttemptStart()` →
+  `completeExternalSignIn(startedFrom:)`): a result landing after a `signOut()` / switch made during the
+  native sheet is dropped + revoked (row 19). Before this the CAS was snapshotted when the response
+  arrived, which compared the state with itself (mutation M24). A standalone callback with no known
+  start snapshots at arrival.
+- **5.3.0 declarations kept verbatim:** `deleteAccount(completion:)` and `SendoraCloud.reset()` are
+  separate overloads, not defaulted parameters (an unapplied reference to either still compiles —
+  `test_preWaveDeclarationsAreStillThere`).
+- B15: a pending `/guest/held` report is retried on the next hydrate, never in `withheld` (no network
+  of any kind there).
+
+**Guards.** `Tests/SendoraCloudTests/AuthMachineConformanceTests.swift` (+ `AuthMachineRowScenarios*.swift`,
+`AuthTestHarness.swift`): loads `packages/shared/src/auth-machine/auth-transitions.conformance.json`
+by path (never copied), replays ALL 36 transition rows (a fixture row without a scenario fails) and
+all 19 verdict cases (the 5 transition-context cases drive the install path), and pins the constants
+(slot keys, dead codes, release reasons, withheld reject list, states). Doubles: recording Keychain /
+UserDefaults + a scripted transport with per-path one-shot gates (the "refresh rotates during the
+native sheet" interleaving) + a frozen-clock seam (`MachineConfig.clock`).
+`AuthMachineBehaviourTests.swift`: §5 integrator test 10 (two guests → count 1 then 2, newest first),
+two holds at a frozen clock never tie, the B15 report retry (and none in `withheld`), the native-sheet
+CAS, the subscribe replay (ruling 1), the downgrade-cycle leftover record (three shapes), frozen keys
+written before the record, the 5.3.0 declarations. `SendoraCloudAuthErrorTests.swift`: the taxonomy +
+the FORMER source-text pins rewritten behaviourally. `swift test` **46 tests, 0 failures**
+(13 behaviour + 8 conformance + 16 error-taxonomy + 9 validator). Scenario files never force-unwrap
+an event / write index (`h.event(at:)`, guard-let) — a crash would abort every scenario after it and
+hide the real failure count (it did, under M05/M08, before this was fixed).
+
+**Mutation record (each: `cp` backup → apply → `swift test` → `cp` restore → anchor grep-proven both
+ways; scripts `scratchpad/mutate.py` (M01–M21) + `scratchpad/mutate-w1b.py` (M22–M33); final run
+against the 46-test suite, no crashes):**
+
+| # | Mutation | Red (assertions) |
+|---|---|---|
+| M01 | delete the sid-CAS (engine guard AND `commitInstall`) | 9 |
+| M02 | re-add `prevAnonRefreshToken` to the sign-in body | 4 |
+| M03 | mint in `unknown` (drop the settle) | 4 |
+| M04 | second `signedIn` on upgrade via `link()`/`link*()` | 1 |
+| M05 | drop the dual-write (four frozen keys) | 20 |
+| M06 | delete the await-refresh-before-hold (start + commit) | 3 |
+| M07 | route `link:true` + identified to `/login` | 1 |
+| M08 | build a held key name dynamically (per guest) | 26 |
+| M09 | RESET row default wipes held | 3 |
+| M10 | no-arg destructive verb with 2 held | 4 |
+| M11 | mint at T == K | 3 |
+| M12 | dead newest slot aborts `ensureSession()` | 1 |
+| M13 | claim without persisting the rotation into its slot | 4 |
+| M14 | release held on `reuse` / absent `endReason` | 12 |
+| M15 | auto-restore after `account_deleted` | 4 |
+| M16 | delete the withheld gate on the access-token getter (+ snapshot) | 2 |
+| M17 | `signUp` reads the refresh key in `withheld` | 1 |
+| M18 | evaluate the verdict only at hydrate | 15 |
+| M19 | treat an absent claim as `match` | 10 |
+| M20 | write `auth_session` in a withheld hydrate | 2 |
+| M21 | resolve `withheld` via RESET / wipe a slot on `discardWithheld` | 5 |
+| M22 | drop the `switchAccount` credential comparison | 1 |
+| M23a | revoke the session on `alreadyLinked` (client side) | 1 |
+| M23b | emit `userUpdated` on `alreadyLinked` | 1 |
+| M24 | snapshot the passkey/OIDC CAS at the response, not the sheet opening | 5 |
+| M25 | retry the hold report in a withheld hydrate | 1 |
+| M26 | never retry a pending hold report on hydrate | 3 |
+| M27 | drop the legacy `.signedIn` subscribe replay | 9 |
+| M28 | reinstall from a record whose frozen keys are gone (downgrade cycle) | 12 |
+| M29 | keep a mismatched record in LIMBO_A | 1 |
+| M30 | rotate any record on a withhold rotation | 2 |
+| M31 | auto-restore emits `guestReleased(.restored)` before `signedIn` | 5 |
+| M32 | write the record before the frozen keys | 4 |
+| M33 | let two holds tie on `heldAt` | 4 |
+
+(A first M01 that deleted only the engine guard stayed GREEN — `commitInstall` re-checks the CAS, so the
+mutation had to remove both. "1" rows are scenarios that `guard … else { return XCTFail }` at the first
+divergence. ⚠ An earlier version of this table recorded several rows as "then the suite crashed": the
+runner's regex only matched the plural "failures", so a 1-failure run was misread as a crash; the
+two real crashes (M05/M08, a force-unwrapped write index) are fixed in the scenarios.)
+
+**Pins converted (source-text → behavioural):** `test_signInPathsDelegateTheWipeToTheSuccessBranch`,
+`test_replacementWipeIsAlwaysImmediatelyFollowedByPersist` → `test_aFailedSignInLeavesTheCallerExactlyAsFound`
+(byte-identical Keychain across six paths × five failures) + `test_noSignInBodyCarriesTheGuestHint`;
+`test_anonymousSignInReusesTheExistingSessionBeforeMinting`, `test_refreshRecoversAnIdentityItDoesNotHave`,
+`test_rateLimitIsNotADeadRefreshToken` → driven on the real machine.
+
+**Upgrade / downgrade.** 5.3.0 → 5.4.0: first launch reads the four keys, writes `sendora_auth_session`
++ schema `"2"`, no network, same status. 5.4.0 → 5.3.0: the four keys are current, the session
+survives; the slots are ignored (orphans server-side, readable again on re-upgrade); a 5.3.0 `signOut`
+clears the four keys only, which the 5.4.0 hydrate treats as signed-out (keys are the authority).
+
+**Known gaps / for the caller:** `linkEmailSchema` is `email` + `password` only, so `signUp(name:)`
+from a guest drops `name` (backend follow-up). Play Games is Android-only — `SendoraCloudCredential` has no
+`playGames` case.
+
 
 ## 5.3.0 — signInAnonymously() over an identified session is a no-op (RopoLabs A2, parity RN 1.40.0)
 

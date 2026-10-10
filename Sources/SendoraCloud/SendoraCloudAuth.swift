@@ -5,38 +5,34 @@ import UIKit
 
 /// Auth Service surface for the iOS SDK.
 ///
-/// Three flows mirroring the web + RN SDKs:
-///   - `signInAnonymously(...)`            — returns the anonymous session
-///                                           this device already has, else
-///                                           POST /auth-service/anonymous
-///   - `signUp(email:password:...)`        — upgrades the same row in
-///                                           place when called from an
-///                                           anonymous session; otherwise
-///                                           creates a fresh account.
-///   - `signIn(email:password:...)`        — logs into an existing account.
-///                                           The previous identity is
-///                                           cleared only AFTER the new
-///                                           session validates (see the
-///                                           invariant below).
-///   - `signOut(completion:)`              — wipe FIRST, fire-and-forget
-///                                           revoke. User is logged out
-///                                           on device even if the
-///                                           network call hangs.
+/// 5.4.0 (ADR-033 "One Slot, Two Verbs") — the surface is an INTERPRETER of the
+/// shared transition table `packages/shared/src/auth-machine/transitions.ts`:
 ///
-/// **Invariant: a failed auth attempt leaves the caller exactly as it found
-/// them.** Every credentialed sign-in captures the anon refresh token into a
-/// local, performs the call, validates the response, and only then wipes +
-/// persists. For an anonymous user the stored refresh token is the ONLY
-/// durable handle on the account, so a wipe that runs before a fallible call
-/// and is not followed by a successful persist orphans that account for good —
-/// offline that is not a race but a guarantee. `signInWithMfaSupport` /
-/// `challengeMfa` have used this ordering since the s58.203 audit fix; 4.13.0
-/// propagated it to their siblings.
+///   - **Sign-in never carries the guest.** A credentialed sign-in from a guest
+///     device HOLDS the guest on-device (`heldGuests()`, K = 5 fixed Keychain
+///     slots) and switches; the server row survives. No body ever carries
+///     `prevAnonRefreshToken` / `linkAnonymous` / `onCredentialInUse` (INV-3).
+///   - **Link is the only upgrade.** `signUp()`, `signInWith*(link: true)`,
+///     `loginSocial(link: true)` and `link*()` go to `/me/link/*` on the current
+///     Bearer session from `anonymous` AND `identified`; over an identified
+///     session a link attaches or returns a typed refusal — it never switches.
+///   - **One slot, one writer.** `commit*` (SendoraCloudAuth+Commit.swift) is the
+///     only code that assigns the session, writes the Keychain, arms the refresh
+///     cron and calls the parent hooks. Every public method is sugar for a row.
+///   - **Proposal, then CAS.** A network call changes nothing until it succeeds,
+///     and its result is applied only if the session it was derived from is still
+///     current — `sid` for identity commits, the sent refresh token for rotations.
+///   - **Boot is observable.** `status()` is `.unknown | .signedOut | .anonymous |
+///     .identified | .withheld`; `authStateReady()` resolves after the Keychain
+///     hydrate, never waiting on the network.
 ///
-/// All public ops are serialized through a private dispatch queue so a
-/// double-tap can't race two anonymous mints or interleave signIn +
-/// signOut. Response payloads are validated non-empty before persisting
-/// — a malformed/MitM'd response can't install an `id = ""` user.
+/// **Invariant (kept from 4.13.0): a failed auth attempt leaves the caller
+/// exactly as it found them.** For an anonymous user the stored refresh token is
+/// the ONLY durable handle on the account.
+///
+/// All public identity ops are serialized through `opsQueue`, so a double-tap
+/// can't race two mints or interleave signIn + signOut. Response payloads are
+/// validated non-empty before persisting.
 ///
 /// Tokens persist in Keychain with `kSecAttrAccessibleAfterFirstUnlock-
 /// ThisDeviceOnly` (no iCloud sync, sandboxed to this app's bundle id).
@@ -56,7 +52,16 @@ public struct SendoraCloudAuthUser: Codable {
     /// a pre-4.9.0 build stays safe.
     public let signupMethod: String?
     public let lastLoginMethod: String?
+    /// The account's project pool (ADR-033 B17, 5.4.0) — the same value as the
+    /// JWT `project` claim. `nil` against a pre-B17 backend AND for the org-wide
+    /// pool (Swift cannot carry the wire's absent-vs-null distinction here; the
+    /// project guard reads the JWT claim, not this field).
+    public let project: String?
 }
+
+/// 5.4.0: field-wise equality, used by the machine to decide whether a refresh
+/// changed the user object (`userUpdated(cause: .refresh)`).
+extension SendoraCloudAuthUser: Equatable {}
 
 public struct SendoraCloudAuthTokens: Codable {
     public let accessToken: String
@@ -103,7 +108,10 @@ public enum SendoraCloudAuthErrorKind: String {
     case alreadyIdentified = "already_identified"
     /// The user dismissed a native / browser sheet. Not an error condition.
     case cancelled
-    /// The method is disabled or plan-gated for this project.
+    /// The method is disabled or plan-gated for this project — and, since 5.4.0,
+    /// the client-side refusals of the ADR-033 machine (`SESSION_WITHHELD`,
+    /// `PROJECT_MISMATCH`, `HELD_GUEST_LIMIT`, `HELD_GUEST_PROJECT_MISMATCH`,
+    /// `AMBIGUOUS_HELD_GUEST`): non-retryable, the app must change what it asks.
     case config
     /// Unmapped — treat as non-retryable.
     case unknown
@@ -128,6 +136,37 @@ public enum SendoraCloudAuthError: Error {
     /// pre-4.13.0 cases are still produced for the exact same codes, so
     /// existing matches keep working. Prefer branching on `kind`.
     case rejected(code: String, message: String, status: Int, retryAfterSeconds: Int?)
+
+    // ── 5.4.0 (ADR-033) — client-side refusals of the auth machine. Additive:
+    // an exhaustive `switch` needs a `default:` (same class as 4.13.0's `.rejected`).
+
+    /// `status() == .withheld`: the stored session's `project` claim disagrees
+    /// with `expectedProjectId`. Every identity verb refuses with this — no
+    /// network, no write. Exit via `discardWithheld()`. Code `SESSION_WITHHELD`.
+    case sessionWithheld(SendoraCloudWithheldInfo)
+    /// A session minted by THIS process under THIS key carries the wrong
+    /// `project` claim (wrong-key build): nothing installed, the minted refresh
+    /// token revoked. Code `PROJECT_MISMATCH`.
+    case projectMismatch(expectedProjectId: String, actualProjectId: String?)
+    /// All 5 held-guest slots are in use (`forceNew` at the cap, or every slot
+    /// ineligible for auto-restore). Restore or discard one. Code `HELD_GUEST_LIMIT`.
+    case heldGuestLimit(held: Int, limit: Int)
+    /// The held slot's `project` claim mismatches `expectedProjectId ?? projectId`
+    /// (client-side, no network; slot kept). Code `HELD_GUEST_PROJECT_MISMATCH`.
+    case heldGuestProjectMismatch(userId: String, slotProject: String?, expectedProjectId: String)
+    /// `id` omitted while more than one guest is held. Code `AMBIGUOUS_HELD_GUEST`.
+    case ambiguousHeldGuest(held: Int)
+    /// The held guest's token was presented and the server reported it gone
+    /// (`endReason` ∈ deleted|revoked|expired) or no such guest is held. The
+    /// slot is released. Code `HELD_GUEST_GONE`. Say "unavailable", never "lost".
+    case heldGuestGone(userId: String, endReason: SendoraCloudRefreshEndReason?)
+    /// The held token was refused with `reuse` or no `endReason` — that does not
+    /// prove the guest is gone, so the slot is KEPT; retry later. Code
+    /// `RESTORE_FAILED` (retryable).
+    case restoreFailed(userId: String, endReason: SendoraCloudRefreshEndReason?)
+    /// `switchAccount()` re-read the device identity and it differs from the
+    /// credential the player confirmed (INV-14). Nothing mutated. Code `CREDENTIAL_CHANGED`.
+    case credentialChanged(String)
 }
 
 /// Keeps `error.localizedDescription` useful wherever a typed auth error
@@ -143,10 +182,42 @@ public extension SendoraCloudAuthError {
     var message: String {
         switch self {
         case .emailAlreadyTaken(let m), .alreadyIdentified(let m), .credentialInUse(let m),
-             .unauthorized(let m), .network(let m), .unknown(let m):
+             .unauthorized(let m), .network(let m), .unknown(let m), .credentialChanged(let m):
             return m
         case .rejected(_, let m, _, _):
             return m
+        case .sessionWithheld(let info):
+            return "Session withheld: its project claim (\(info.actualProjectId ?? "null")) does not match expectedProjectId \(info.expectedProjectId). Call discardWithheld() or relaunch with the matching key."
+        case .projectMismatch(let expected, let actual):
+            return "The server minted a session for project \(actual ?? "null"), not the expected \(expected). Nothing was installed; check the API key / expectedProjectId pairing."
+        case .heldGuestLimit(let held, let limit):
+            return "All \(limit) held-guest slots are in use (\(held) held). Restore or discard a held guest first."
+        case .heldGuestProjectMismatch(let userId, let slotProject, let expected):
+            return "Held guest \(userId) belongs to project \(slotProject ?? "null"), not \(expected); it was not restored."
+        case .ambiguousHeldGuest(let held):
+            return "\(held) guests are held — pass the id of the one to act on."
+        case .heldGuestGone(let userId, let endReason):
+            return "Held guest \(userId.isEmpty ? "" : userId + " ")is no longer available (\(endReason?.rawValue ?? "not held"))."
+        case .restoreFailed(let userId, let endReason):
+            return "Held guest \(userId) could not be restored right now (\(endReason?.rawValue ?? "no end reason")); the slot was kept — retry."
+        }
+    }
+
+    /// The machine-readable code, when there is one: the backend `code` of a
+    /// `.rejected`, or the ADR-033 client code of a 5.4.0 refusal. `nil` for
+    /// the pre-4.13.0 cases, which carry only a message.
+    var code: String? {
+        switch self {
+        case .rejected(let code, _, _, _): return code
+        case .sessionWithheld: return "SESSION_WITHHELD"
+        case .projectMismatch: return "PROJECT_MISMATCH"
+        case .heldGuestLimit: return "HELD_GUEST_LIMIT"
+        case .heldGuestProjectMismatch: return "HELD_GUEST_PROJECT_MISMATCH"
+        case .ambiguousHeldGuest: return "AMBIGUOUS_HELD_GUEST"
+        case .heldGuestGone: return "HELD_GUEST_GONE"
+        case .restoreFailed: return "RESTORE_FAILED"
+        case .credentialChanged: return "CREDENTIAL_CHANGED"
+        default: return nil
         }
     }
 
@@ -164,6 +235,12 @@ public extension SendoraCloudAuthError {
         case .unknown: return .unknown
         case .rejected(let code, _, let status, _):
             return SendoraCloudAuthError.classifyKind(code: code, status: status)
+        case .sessionWithheld, .projectMismatch, .heldGuestLimit, .heldGuestProjectMismatch, .ambiguousHeldGuest:
+            return .config
+        case .heldGuestGone, .credentialChanged:
+            return .invalidCredential
+        case .restoreFailed:
+            return .server
         }
     }
 
@@ -222,6 +299,14 @@ public extension SendoraCloudAuthError {
             return .cancelled
         case "GAME_CENTER_UNAVAILABLE", "PLAY_GAMES_UNAVAILABLE", "ENTITLEMENT_ERROR", "tier_required":
             return .config
+        // ADR-033 §3.5 [2c]: the two project-guard refusals REUSE kind `config`;
+        // the closed `AuthErrorKind` is NOT widened.
+        case "SESSION_WITHHELD", "PROJECT_MISMATCH", "HELD_GUEST_LIMIT", "HELD_GUEST_PROJECT_MISMATCH", "AMBIGUOUS_HELD_GUEST":
+            return .config
+        case "HELD_GUEST_GONE", "CREDENTIAL_CHANGED":
+            return .invalidCredential
+        case "RESTORE_FAILED":
+            return .server
         case "UNAUTHORIZED", "INVALID_CREDENTIALS", "INVALID_REFRESH_TOKEN",
              "EMAIL_OTP_INVALID", "MAGIC_LINK_INVALID", "PASSKEY_RP_MISMATCH", "NOT_SIGNED_IN":
             return .invalidCredential
@@ -241,6 +326,11 @@ public extension SendoraCloudAuthError {
 /// background emitted NOTHING — an app could not tell a deliberate sign-out
 /// apart from an expired refresh token, and only discovered the difference when
 /// `getAccessToken` started returning nil.
+///
+/// 5.4.0 (ADR-033 B11, additive): the server's own `endReason` on an
+/// `INVALID_REFRESH_TOKEN` rejection maps onto `revoked` / `evicted` / `deleted`;
+/// `expired`, `reuse`, `unknown` or an absent reason stay `sessionExpired`,
+/// exactly as before. Consumers default-branch.
 public enum SendoraCloudAuthSignedOutReason: String {
     /// The app called `signOut`.
     case user
@@ -249,16 +339,63 @@ public enum SendoraCloudAuthSignedOutReason: String {
     case sessionExpired = "session_expired"
     /// `deleteAccount` succeeded.
     case accountDeleted = "account_deleted"
+    /// The server revoked the session (sign-out elsewhere, admin action).
+    case revoked
+    /// Reserved: a session-cap eviction. Not emitted by the backend yet.
+    case evicted
+    /// The account behind the session no longer exists.
+    case deleted
 }
 
 /// A single auth-state transition (4.13.0). Subscribe with `onAuthStateChanged`
 /// — one stream covering everything that used to need separate listeners (or
 /// had no signal at all).
+///
+/// 5.4.0 (ADR-033, additive — an exhaustive `switch` needs a `default:`):
+/// `initial`, `userUpdated`, `guestHeld`, `guestReleased`, `sessionWithheld`.
+/// The `cause` of a `signedIn` is read from `SendoraCloudAuth.lastSignedInCause()`
+/// inside the listener (the case's payload is frozen for source compatibility).
 public enum SendoraCloudAuthStateChange {
     case signedIn(user: SendoraCloudAuthUser)
     case signedOut(reason: SendoraCloudAuthSignedOutReason)
+    /// LEGACY after ADR-033: fires only when the SERVER reports a retirement,
+    /// which a 5.4.0 sign-in never requests (it holds the guest instead).
     case deviceTakeover(user: SendoraCloudAuthUser?, retiredAnonUserId: String)
     case deletionCancelled(user: SendoraCloudAuthUser?)
+    /// The settled boot state, exactly once per subscriber — INCLUDING
+    /// `.signedOut`, `.unknown` and `.withheld` (the pre-5.4.0 replay carried
+    /// only `.signedIn`, so a subscriber could not tell "no session" from "not
+    /// hydrated yet"). `withheld` is non-nil iff `status == .withheld`.
+    case initial(status: SendoraCloudAuthStatus, user: SendoraCloudAuthUser?, withheld: SendoraCloudWithheldInfo?)
+    /// Same `sub`, different user object: a `link*()` attach, an unlink, email
+    /// verification, a refresh that changed the user, or a claim (`merge`).
+    case userUpdated(user: SendoraCloudAuthUser, cause: SendoraCloudAuthUserUpdatedCause)
+    /// A guest was moved into a held slot (sign-in from a guest, `forceNew`
+    /// mint, restore over a guest). `count` = guests held afterwards.
+    case guestHeld(userId: String, count: Int)
+    /// A held slot was emptied. `dead` = the server said "unavailable" when the
+    /// token was presented — NOT an erasure signal.
+    case guestReleased(userId: String, reason: SendoraCloudGuestReleasedReason, endReason: SendoraCloudRefreshEndReason?)
+    /// An in-process transition INTO `withheld` (a refresh answered with a
+    /// mismatching `project` claim). Never replayed — a hydrate that lands in
+    /// `withheld` emits `.initial(status: .withheld, …)` instead.
+    case sessionWithheld(expectedProjectId: String, actualProjectId: String?, userId: String)
+
+    /// The shared snake_case wire name of this event (`AuthStateEvent`), the same
+    /// token on all four SDKs.
+    public var eventName: String {
+        switch self {
+        case .signedIn: return "signed_in"
+        case .signedOut: return "signed_out"
+        case .deviceTakeover: return "device_takeover"
+        case .deletionCancelled: return "deletion_cancelled"
+        case .initial: return "initial"
+        case .userUpdated: return "user_updated"
+        case .guestHeld: return "guest_held"
+        case .guestReleased: return "guest_released"
+        case .sessionWithheld: return "session_withheld"
+        }
+    }
 }
 
 /// Detail handed to onDeviceTakeover subscribers. Fires once per
@@ -273,9 +410,6 @@ public struct DeviceTakeoverEvent {
     public let at: Date
 }
 
-/// Detail handed to `onDeletionCancelled` subscribers (s58.269). Fires once
-/// per sign-in that cancelled a pending self-service account deletion within
-/// its grace window — the account is restored with the SAME user_id.
 /// What happened to the guest ("anonymous") account this device presented, on a
 /// sign-in that produced an identified session (s58.278).
 ///
@@ -284,6 +418,9 @@ public struct DeviceTakeoverEvent {
 /// `Optional.none` at every comparison site, so `outcome == .none` would be
 /// ambiguous between "no guest was presented" and "no value at all" — exactly
 /// the conflation this whole field exists to remove.
+///
+/// LEGACY after ADR-033: a 5.4.0 sign-in never presents a guest token, so the
+/// server answers `"none"` for every one of this SDK's sign-ins.
 public enum AnonRetirementOutcome: String {
     /// The guest row was deleted. Its id arrives via `onDeviceTakeover`.
     case retired = "retired"
@@ -294,6 +431,9 @@ public enum AnonRetirementOutcome: String {
     case nothingToRetire = "none"
 }
 
+/// Detail handed to `onDeletionCancelled` subscribers (s58.269). Fires once
+/// per sign-in that cancelled a pending self-service account deletion within
+/// its grace window — the account is restored with the SAME user_id.
 public struct DeletionCancelledEvent {
     public let userId: String
     public let at: Date
@@ -303,70 +443,84 @@ public final class SendoraCloudAuth {
     /// What a credentialed sign-in should do when the credential you present
     /// already belongs to an account (4.15.0).
     ///
-    /// **You usually want the default — pass nothing.** Since 4.17.0 the default
-    /// is safe by construction: it adopts the other account silently when
-    /// nothing would be destroyed, and refuses when something would be.
-    ///
-    /// - **Fresh install / no guest session** → nothing to lose, so it adopts.
-    ///   This is the reinstall-recovery path — a Game Center identity survives a
-    ///   reinstall server-side, so the collision is usually the SAME person's
-    ///   earlier account, and they get it back. Never refused.
-    /// - **Live guest session** → adopting would retire it (**its row is
-    ///   deleted** and `onDeviceTakeover` fires). Refused with
-    ///   `.credentialInUse` so you can ask the player.
-    ///
-    /// Override in either direction:
-    ///
-    /// - `.adopt` — always adopt, even when it deletes the guest account. What
-    ///   every release before 4.15.0 did unconditionally.
-    /// - `.reject` — always fail on a collision, even a harmless one.
-    ///
-    /// ⚠ A refusal blocks the switch; it does not merge the two accounts. To offer
-    /// "use my other account", catch the error and re-call with `.adopt`, then
-    /// migrate your own data from `onDeviceTakeover`'s `retiredAnonUserId`.
+    /// 5.4.0 (ADR-033): this option is consulted ONLY on a `link: true` call
+    /// that is refused with 409 `CREDENTIAL_IN_USE`. `.adopt` then falls through
+    /// to a plain sign-in bound to the same credential (`switchAccount()`): the
+    /// device's guest is HELD on-device, never deleted. `.reject` / nil surfaces
+    /// `.credentialInUse` so you can ask the player. On a plain sign-in (no
+    /// `link`) it is accepted and IGNORED — a 5.4.0 body never carries a guest
+    /// hint, so there is no destructive collision left to refuse.
     public enum CredentialCollisionPolicy: String {
         case adopt
         case reject
     }
 
-    private let client: APIClient
-    private let storage: SendoraStorage
-    private let onIdentityChange: (String?) -> Void
-    // Bool = rotateDeviceId: true only at a person-boundary (explicit signOut /
-    // account deletion), so the anonymous id survives a sign-in/upgrade
-    // (SudokuHurdle r6; parity with RN 1.38.0 / web 3.22.0 / Android 4.22.0).
-    private let onAnonymousWipe: (Bool) -> Void
-    private var cachedUser: SendoraCloudAuthUser?
-    private var cachedExpiresAt: Int64 = 0
+    /// ADR-033 wave 1 — the machine's configuration, fixed at `configure()`.
+    internal struct MachineConfig {
+        var expectedProjectId: String?
+        var configProjectId: String?
+        var autoRestoreHeldGuest: Bool = true
+        /// Test seam: when `false` the proactive cron is ARMED (observable via
+        /// `cronArmed`) but no `Timer` / lifecycle observer is created.
+        var schedulesTimers: Bool = true
+        /// Test seam: a fixed clock (epoch ms). `nil` = the wall clock.
+        var clock: (() -> Int64)? = nil
+    }
+
+    /// What the parent SDK does when the current identity is cleared (the
+    /// `commit()` "anon-id/queue hook with the reason", INV-1).
+    internal struct ClearEffects {
+        /// Rotate the analytics device id — ONLY at a person-boundary (explicit
+        /// signOut, account deletion). A switch or an involuntary session death
+        /// is the same person, so the id survives (SudokuHurdle r6).
+        let rotateDeviceId: Bool
+        /// Drop the queued events — only on `accountDeleted` (the s58.353 rule
+        /// as a table column) and `reset()`.
+        let clearQueue: Bool
+    }
+
+    /// The held-guest capacity K (ADR-033 §3.2, confirmed §8-Q19).
+    public static let heldGuestSlots = 5
+    /// The ONLY server codes that mean "this refresh token is dead" (INV-6).
+    internal static let deadCodes: [String] = ["INVALID_REFRESH_TOKEN"]
+    /// A held slot is released on a dead verdict ONLY for these end reasons
+    /// (rev 2 2b); `reuse` / absent keeps the slot (`restoreFailed`, retryable).
+    internal static let releaseHeldOnEndReasons: [SendoraCloudRefreshEndReason] = [.deleted, .revoked, .expired]
+    /// The events `withheld` rejects by name (§3.2); mirrored from the fixture.
+    internal static let rejectedInWithheld: [String] = ["MINT", "SIGN_IN", "LINK", "CLAIM", "RESTORE", "DISCARD", "DELETE", "SESSION_VERB"]
+
+    internal let client: APIClient
+    internal let storage: SendoraStorage
+    internal let machineConfig: MachineConfig
+    internal let onIdentityChange: (String?) -> Void
+    internal let onIdentityCleared: (ClearEffects) -> Void
+    internal let onIdentityWithheld: () -> Void
+
+    // ── Machine state. Every field below is written ONLY by the commit funnel
+    // (SendoraCloudAuth+Commit.swift) under `lock`.
+
+    /// The installed session (`anonymous` / `identified`).
+    internal var current: AuthSessionRecord?
+    /// A refresh token on disk with no readable user — LIMBO_A = `unknown`.
+    internal var limbo: LimboRecord?
+    /// `withheld`: the refused record, held in memory only (nothing persisted).
+    internal var withheldState: WithheldState?
+    /// K held slots; `nil` = empty. `unreadableSlots` are occupied by JSON this
+    /// build cannot decode — kept, ignored, never cleared (INV-9).
+    internal var slots: [HeldSlotRecord?] = Array(repeating: nil, count: SendoraCloudAuth.heldGuestSlots)
+    internal var unreadableSlots: Set<Int> = []
     /// Set once we have PROOF the device clock runs fast: a token the server
-    /// minted SECONDS AGO already reads past its own `exp`. A fresh token is
-    /// never genuinely expired, so the clock we measured it with is the liar.
-    /// Releases the `exp` guard for this process.
-    ///
-    /// - Warning: Never persist this. It is re-learned for the cost of one
-    ///   refresh, and a stored "clock is fast" belief would outlive the
-    ///   correction that made it false — the same stale-frame bug this guard
-    ///   closes, one level up.
-    /// - Warning: Without it the `exp` guard alone is a REFRESH LOOP on any
-    ///   clock fast by more than the token TTL: every freshly-minted token
-    ///   reads as already expired, so every call refreshes. Measured on the
-    ///   React Native reference implementation at 10 reads -> 10 refreshes.
-    private var clockSkewConfirmed = false
-    /// Anon refresh token captured at `signInWithMfaSupport` time, stashed
-    /// keyed to the issued `mfaChallengeToken` so the later `challengeMfa`
-    /// can forward it for device-takeover (s58.111). Without this, the MFA
-    /// branch wiped the anon identity before the challenge resolved → the
-    /// takeover hint was lost → one device ended with two user_ids +
-    /// duplicate pushes (audit s58.203 fix).
-    private var pendingAnonTakeover: (challengeToken: String, prevAnonRefreshToken: String)?
-    private let lock = NSLock()
-    /// Serial queue for public auth ops. All signIn/signUp/signOut/anonymous
-    /// calls funnel through here so concurrent invocations execute one at
-    /// a time. Refresh runs on a separate single-flight Promise.
-    private let opsQueue = DispatchQueue(label: "com.sendora.sdk.auth.ops")
-    private var refreshInFlight: [(String?) -> Void] = []
-    private var isRefreshing = false
-    private let refreshSafetyMs: Int64 = 30_000
+    /// minted SECONDS AGO already reads past its own `exp`. Releases the `exp`
+    /// guard for this process. Never persisted (re-learned per process).
+    internal var clockSkewConfirmed = false
+    internal let lock = NSLock()
+    /// Serial queue for public auth ops. All identity verbs funnel through here
+    /// so concurrent invocations execute one at a time. Refresh runs as a
+    /// single-flight that identity attempts AWAIT at start (§3.3 scheduling rule).
+    internal let opsQueue = DispatchQueue(label: "com.sendora.sdk.auth.ops")
+    internal var refreshInFlight: [(String?) -> Void] = []
+    internal var isRefreshing = false
+    internal let refreshSafetyMs: Int64 = 30_000
     /// Inline device-takeover listeners. UUID-keyed so callers can
     /// unsubscribe via the returned closure. Lock-protected.
     private var takeoverListeners: [UUID: (DeviceTakeoverEvent) -> Void] = [:]
@@ -378,73 +532,205 @@ public final class SendoraCloudAuth {
     /// Inline auth-state listeners (4.13.0). UUID-keyed; lock-protected.
     private var authStateListeners: [UUID: (SendoraCloudAuthStateChange) -> Void] = [:]
     /// True once the Keychain re-hydrate in `init` has run. Distinguishes "no
-    /// session restored YET" from "genuinely signed out" for
-    /// `onAuthStateChanged`'s replay-on-subscribe.
-    private var hydrated = false
+    /// session restored YET" from "genuinely signed out".
+    internal var hydrated = false
+    /// Observable cron state (the `Timer` itself is created only when
+    /// `machineConfig.schedulesTimers`).
+    internal private(set) var cronArmed = false
+    private var proactiveTimer: Timer?
+    private var proactiveAppActiveObserver: NSObjectProtocol?
+    internal var lastSignedInCauseValue: SendoraCloudAuthSignedInCause?
 
-    /// Why the local session is being dropped. `.replaced` is the internal clear
-    /// that immediately precedes a successful `persist()` — NOT a sign-out, and
-    /// it emits nothing, else every sign-in would look like a logout/login pair
-    /// to `onAuthStateChanged` subscribers.
-    private enum WipeReason {
-        case replaced
-        case signedOut(SendoraCloudAuthSignedOutReason)
+    internal struct LimboRecord {
+        var refreshToken: String
+        var accessToken: String?
+        var accessExpiresAt: Int64
+    }
+
+    internal struct WithheldState {
+        var info: SendoraCloudWithheldInfo
+        var refreshToken: String
+        var accessToken: String
+        var accessExpiresAt: Int64
+        var user: SendoraCloudAuthUser?
     }
 
     init(
         client: APIClient,
         storage: SendoraStorage,
+        config: MachineConfig = MachineConfig(),
         onIdentityChange: @escaping (String?) -> Void,
-        onAnonymousWipe: @escaping (Bool) -> Void
+        onIdentityCleared: @escaping (ClearEffects) -> Void,
+        onIdentityWithheld: @escaping () -> Void
     ) {
         self.client = client
         self.storage = storage
+        self.machineConfig = config
         self.onIdentityChange = onIdentityChange
-        self.onAnonymousWipe = onAnonymousWipe
+        self.onIdentityCleared = onIdentityCleared
+        self.onIdentityWithheld = onIdentityWithheld
+        hydrate()
+    }
 
-        // Re-hydrate session from Keychain.
-        if let json = storage.authUserJson,
-           let data = json.data(using: .utf8),
-           let user = try? JSONDecoder().decode(SendoraCloudAuthUser.self, from: data),
-           !user.id.isEmpty {
-            self.cachedUser = user
-            self.cachedExpiresAt = storage.authAccessExpiresAt
-            self.onIdentityChange(user.id)
-        } else if storage.authUserJson != nil {
-            // The cached USER blob is unreadable (torn Keychain write, app killed
-            // mid-persist, a shape this build can't decode). Drop the unusable
-            // user + access token — but KEEP the refresh token: it is
-            // independently valid and is the only thing that can recover this
-            // account, so the next getAccessToken refreshes off it. (Pre-4.13.0
-            // this cleared the refresh token too, turning a recoverable cache
-            // glitch into a permanently orphaned account for an anonymous user.)
-            storage.authUserJson = nil
-            storage.authAccessToken = nil
-            storage.authAccessExpiresAt = 0
-        }
-        self.hydrated = true
+    // MARK: - Status
+
+    /// The machine state (ADR-033 §3.2). Sync, lock-protected. `unknown` ≠
+    /// `signedOut`, `withheld` ≠ `signedOut` — and this is the ONLY call that
+    /// tells them apart (`currentUser` is nil in all three). Default-branch.
+    public func status() -> SendoraCloudAuthStatus {
+        lock.lock(); defer { lock.unlock() }
+        return statusLocked()
+    }
+
+    internal func statusLocked() -> SendoraCloudAuthStatus {
+        if !hydrated { return .unknown }
+        if withheldState != nil { return .withheld }
+        if let c = current { return c.user.isAnonymous ? .anonymous : .identified }
+        if limbo != nil { return .unknown }
+        return .signedOut
+    }
+
+    /// Resolves after the Keychain hydrate with the settled boot status — which
+    /// may be `.unknown` (a refresh token with no readable user, re-judged by the
+    /// single gap-fill refresh) or `.withheld`. NEVER waits on the network; on
+    /// iOS the hydrate is synchronous inside `configure()`, so this completes
+    /// immediately.
+    public func authStateReady(completion: @escaping (SendoraCloudAuthStatus) -> Void) {
+        completion(status())
     }
 
     public var currentUser: SendoraCloudAuthUser? {
         lock.lock(); defer { lock.unlock() }
-        return cachedUser
+        return current?.user
     }
 
-    /// Synchronous read — returns whatever's cached, even if expired.
-    /// Prefer `getAccessToken(completion:)` for transparent refresh.
+    /// Synchronous read — returns whatever's cached, even if expired. `nil` in
+    /// `withheld` (§3.2). Prefer `getAccessToken(completion:)` for transparent refresh.
     public var accessToken: String? {
-        return storage.authAccessToken
+        lock.lock(); defer { lock.unlock() }
+        if withheldState != nil { return nil }
+        return current?.accessToken ?? limbo?.accessToken
     }
 
-    /// Returns a non-expired access token. Triggers a single-flight
-    /// refresh if the cached token is past expiry.
-    ///
-    /// s58.47 — when the cached ACCESS token is missing but a refresh
-    /// token is still in the Keychain (cold start after the access
-    /// token's 15-min TTL elapsed, or partial persist), drive a
-    /// refresh instead of returning nil. Pre-s58.47 we bailed
-    /// immediately, which left the host app reading nil and
-    /// triggering a fresh anonymous mint on every cold launch.
+    /// The stored refresh token, or `nil` when signed out or `withheld`. Kept
+    /// for integrators that journal it; prefer the held-guest verbs.
+    public func getRefreshToken() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        if withheldState != nil { return nil }
+        return current?.refreshToken ?? limbo?.refreshToken
+    }
+
+    /// Why the most recent `.signedIn` fired (`mint` / `signIn` / `restore` /
+    /// `link`). Set BEFORE the event is delivered, so a listener may read it
+    /// inside its `.signedIn(user:)` arm. `.restore` ⇒ re-register push.
+    public func lastSignedInCause() -> SendoraCloudAuthSignedInCause? {
+        lock.lock(); defer { lock.unlock() }
+        return lastSignedInCauseValue
+    }
+
+    // MARK: - Hydrate (the HYDRATE rows, boot entry from `unknown`)
+
+    /// Read-first the 5.4.0 `sendora_auth_session` record, with the four frozen
+    /// keys as the authority on WHETHER a session exists (they are written by
+    /// every version on every install, so after a downgrade→upgrade cycle they are
+    /// at least as fresh as the record): legacy refresh absent → signed out;
+    /// present and equal to the record's → the record; present and different →
+    /// rebuild from the four keys and write-forward. Then the ProjectGuard.
+    private func hydrate() {
+        let legacyRefresh = storage.authRefreshToken
+        let legacyAccess = storage.authAccessToken
+        let legacyExp = storage.authAccessExpiresAt
+        let legacyUserJson = storage.authUserJson
+        let legacyUser = legacyUserJson.flatMap { Self.decodeUser($0) }
+        var record = storage.authSessionJson.flatMap { Self.decodeSessionRecord($0) }
+        var pending = record?.heldReportPending ?? []
+
+        // Slots first (they never depend on the current session).
+        var readSlots: [HeldSlotRecord?] = Array(repeating: nil, count: Self.heldGuestSlots)
+        var unreadable: Set<Int> = []
+        for i in 0..<Self.heldGuestSlots {
+            guard let json = storage.heldSlotJson(i) else { continue }
+            if let slot = HeldSlotRecord.decode(json) { readSlots[i] = slot } else { unreadable.insert(i) }
+        }
+
+        var outcome: HydrateOutcome = .signedOut
+        if let refresh = legacyRefresh {
+            if let r = record, r.refreshToken == refresh {
+                outcome = .record(r, writeForward: false)
+            } else if let user = legacyUser, !user.id.isEmpty, let access = legacyAccess, !access.isEmpty {
+                let rebuilt = AuthSessionRecord(
+                    user: user, accessToken: access, refreshToken: refresh, accessExpiresAt: legacyExp,
+                    sid: jwtStringClaim(access, "sid"), heldReportPending: pending
+                )
+                record = rebuilt
+                outcome = .record(rebuilt, writeForward: true)
+            } else {
+                // LIMBO_A: a refresh token (independently valid, the only thing
+                // that can recover this account) with no readable user. `unknown`,
+                // never signed out, never a mint (INV-9).
+                // A record whose refresh token is not the frozen one is a
+                // LEFTOVER of another session (a 5.4→5.3→sign-out/switch→5.4
+                // cycle: a 5.3.0 clears only the four frozen keys) — cleared
+                // silently by the commit, never trusted.
+                outcome = .limbo(LimboRecord(refreshToken: refresh, accessToken: legacyAccess, accessExpiresAt: legacyExp),
+                                 clearLeftoverRecord: record != nil)
+            }
+        } else if legacyUserJson != nil || record != nil {
+            // LIMBO_B: a user blob with no refresh token — a stale blob, or a
+            // 5.4.0 record with NO frozen counterpart (a downgraded 5.3.0's
+            // signOut()/deleteAccount() clears only the four frozen keys, so the
+            // record of the signed-out / deleted account survives the cycle).
+            // Trust the record ONLY when its refresh token equals the frozen
+            // one: here there is none, so it is a leftover — cleared silently
+            // (no event beyond the boot `initial`, no network) and the state
+            // is signed out (§3.3 row 4). NEVER reinstalled.
+            outcome = .staleBlob
+        }
+
+        switch outcome {
+        case .record(let r, let writeForward):
+            commitHydrate(record: r, writeForward: writeForward, slots: readSlots, unreadable: unreadable)
+        case .limbo(let l, let clearLeftover):
+            commitHydrateLimbo(l, clearLeftoverRecord: clearLeftover, slots: readSlots, unreadable: unreadable)
+        case .staleBlob:
+            commitHydrateStaleBlob(slots: readSlots, unreadable: unreadable)
+        case .signedOut:
+            commitHydrateSignedOut(slots: readSlots, unreadable: unreadable)
+        }
+        pending = pending.filter { id in readSlots.contains { $0?.userId == id } }
+        // `withheld` makes NO network call of any kind (§3.2) — the report
+        // waits for a hydrate that is not withheld.
+        if status() != .withheld { retryPendingHeldReports(pending) }
+    }
+
+    private enum HydrateOutcome {
+        case record(AuthSessionRecord, writeForward: Bool)
+        case limbo(LimboRecord, clearLeftoverRecord: Bool)
+        case staleBlob
+        case signedOut
+    }
+
+    /// B15: a `POST /guest/held` report the previous process never got an
+    /// acknowledgement for. Fire-and-forget, idempotent server-side.
+    private func retryPendingHeldReports(_ userIds: [String]) {
+        guard !userIds.isEmpty else { return }
+        lock.lock()
+        let targets: [(String, String)] = userIds.compactMap { id in
+            slots.compactMap { $0 }.first { $0.userId == id }.map { (id, $0.refreshToken) }
+        }
+        lock.unlock()
+        for (id, token) in targets { reportGuestHeld(userId: id, refreshToken: token) }
+    }
+
+    internal func reportGuestHeld(userId: String, refreshToken: String) {
+        client.post(path: "/auth-service/guest/held", body: ["refreshToken": refreshToken]) { [weak self] response in
+            guard let self = self, (response?["success"] as? Bool) == true else { return }
+            self.commitHeldReportAcknowledged(userId: userId)
+        }
+    }
+
+    // MARK: - Access token (token liveness — never decides identity, INV-6)
+
     /// The cached-token guard, and the only place the two deadlines are
     /// combined. Both must agree before a cached token is served:
     ///
@@ -454,16 +740,8 @@ public final class SendoraCloudAuth {
     ///    full offset on a constantly-wrong clock.
     ///
     /// Guard 2 is released once `clockSkewConfirmed` proves which failure mode
-    /// we are in.
-    ///
-    /// The gap this closes: `authAccessExpiresAt` is written in the device's
-    /// clock frame at mint and persisted to the Keychain. Step the clock
-    /// backwards between mint and read — automatic time landing after a long
-    /// power-off, a restore, a manual set — and the deadline is stale by the
-    /// size of the correction, surviving relaunches. The SDK then serves a
-    /// provably dead token, every request 401s, and the app still looks signed
-    /// in. Reported by Word Hurdle with a token 1929s past its `exp`.
-    private func canServeToken(_ token: String?, expiresAt: Int64, nowMs: Int64) -> Bool {
+    /// we are in. Reported by Word Hurdle with a token 1929s past its `exp`.
+    internal func canServeToken(_ token: String?, expiresAt: Int64, nowMs: Int64) -> Bool {
         guard let token = token, !token.isEmpty, expiresAt > 0 else { return false }
         if nowMs >= expiresAt - refreshSafetyMs { return false }
         lock.lock()
@@ -475,16 +753,17 @@ public final class SendoraCloudAuth {
 
     /// Guard 1 alone: does the locally-tracked deadline still claim life?
     private func trackedDeadlineAlive(nowMs: Int64) -> Bool {
-        guard let token = storage.authAccessToken, !token.isEmpty else { return false }
-        let exp = cachedExpiresAt
-        return exp > 0 && nowMs < exp - refreshSafetyMs
+        lock.lock(); defer { lock.unlock() }
+        guard let c = current, !c.accessToken.isEmpty else { return false }
+        return c.accessExpiresAt > 0 && nowMs < c.accessExpiresAt - refreshSafetyMs
     }
 
     /// True when a cached token is unusable ONLY because `exp` contradicts a
     /// tracked deadline that still claims life.
     private func deadlinesDisagree(nowMs: Int64) -> Bool {
+        let snapshot = currentTokenSnapshot()
         return trackedDeadlineAlive(nowMs: nowMs)
-            && !canServeToken(storage.authAccessToken, expiresAt: cachedExpiresAt, nowMs: nowMs)
+            && !canServeToken(snapshot.token, expiresAt: snapshot.expiresAt, nowMs: nowMs)
     }
 
     private func learnClockSkewFrom(_ freshToken: String, nowMs: Int64) {
@@ -494,19 +773,20 @@ public final class SendoraCloudAuth {
         lock.unlock()
     }
 
+    internal func currentTokenSnapshot() -> (token: String?, expiresAt: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        if withheldState != nil { return (nil, 0) }
+        if let c = current { return (c.accessToken, c.accessExpiresAt) }
+        if let l = limbo { return (l.accessToken, l.accessExpiresAt) }
+        return (nil, 0)
+    }
+
     /// Refresh — and when the two deadlines disagree, let the token that comes
-    /// back say which one was lying.
-    ///
-    /// - Warning: THE TIMING IS THE MECHANISM, and the obvious placement is
-    ///   wrong. Probing at every mint site looks equivalent and is not: in the
-    ///   reported failure the token was MINTED while the clock was fast and
-    ///   only read after the correction, so a mint-time probe records "clock is
-    ///   fast" and then waves through the very token the guard exists to
-    ///   refuse. Probing only on a refresh performed BECAUSE `exp` contradicted
-    ///   a live tracked deadline separates the cases.
-    private func refreshAndReconcile(nowMs: Int64, completion: @escaping (String?) -> Void) {
+    /// back say which one was lying. Probing ONLY on a refresh performed BECAUSE
+    /// `exp` contradicted a live tracked deadline separates the cases (s58.281).
+    private func refreshAndReconcile(nowMs: Int64, force: Bool = false, completion: @escaping (String?) -> Void) {
         let reconciling = deadlinesDisagree(nowMs: nowMs)
-        refreshAccessToken { [weak self] token in
+        refreshAccessToken(force: force) { [weak self] token in
             if reconciling, let self = self, let token = token, !token.isEmpty {
                 self.learnClockSkewFrom(token, nowMs: Int64(Date().timeIntervalSince1970 * 1000))
             }
@@ -514,238 +794,252 @@ public final class SendoraCloudAuth {
         }
     }
 
+    /// Returns a non-expired access token, refreshing (single-flight) when the
+    /// cached one is past expiry. `nil` when signed out, offline with nothing
+    /// servable, or `withheld` (no refresh, no network — §3.2).
+    ///
     /// Pass `forceRefresh: true` when the caller has out-of-band evidence that
     /// the tracked deadline is wrong (it decoded `exp` itself, or ate a 401).
-    /// It skips the cache but NOT the single-flight or the backoff cooldown, so
-    /// an app that force-refreshes on every 401 cannot turn a server outage
-    /// into a hot loop against `/token/refresh`.
+    /// It skips the cache but NOT the single-flight or the backoff cooldown.
     public func getAccessToken(forceRefresh: Bool = false, completion: @escaping (String?) -> Void) {
+        let state = status()
+        if state == .withheld { completion(nil); return }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        if !forceRefresh, let token = storage.authAccessToken,
-           canServeToken(token, expiresAt: cachedExpiresAt, nowMs: nowMs) {
+        let snapshot = currentTokenSnapshot()
+        if state == .unknown {
+            // LIMBO_A: drive the single gap-fill refresh so the state settles
+            // (§3.2); offline, the stashed access token is the fallback.
+            refreshAndReconcile(nowMs: nowMs, force: true) { token in
+                if let token = token { completion(token); return }
+                if let stashed = snapshot.token, self.status() == .unknown,
+                   self.canServeToken(stashed, expiresAt: snapshot.expiresAt, nowMs: nowMs) {
+                    completion(stashed)
+                } else {
+                    completion(nil)
+                }
+            }
+            return
+        }
+        if !forceRefresh, let token = snapshot.token,
+           canServeToken(token, expiresAt: snapshot.expiresAt, nowMs: nowMs) {
             completion(token)
             return
         }
-        // Either no usable access token, or the two deadlines disagree.
-        // refreshAccessToken handles both, and short-circuits to nil when there
-        // is no refresh token in storage either.
-        refreshAndReconcile(nowMs: nowMs, completion: completion)
+        refreshAndReconcile(nowMs: nowMs, force: forceRefresh, completion: completion)
     }
 
-    /// Return this device's anonymous session, minting one only if it has none.
-    ///
-    /// Reusing the existing anonymous user is the same short-circuit Firebase's
-    /// `signInAnonymously` performs, and it is load-bearing: without it, an app
-    /// that calls this defensively on every cold launch (the most natural thing
-    /// to write) mints a fresh `user_id` each time, and `persist` overwrites the
-    /// stored refresh token — the previous anonymous account's ONLY durable
-    /// handle — with no takeover, no webhook and no state event. Same permanent
-    /// account loss as a pre-call wipe on a failed sign-in, except it happens on
-    /// a *healthy* network.
-    ///
-    /// ⚠ Returns the CURRENT session when one exists — anonymous OR identified
-    /// (5.3.0). The guard used to be `user.isAnonymous`, so a plain
-    /// `signInAnonymously()` over a live account session fell through, minted
-    /// a guest and overwrote the account's tokens locally with no state event
-    /// (this path never wipes; it persists over the top). The account survives
-    /// server-side, recoverable by its credential, but the device became a
-    /// stranger to it. Returning the identified session is a no-op for a
-    /// defensive caller and the honest answer to "make sure I have a session";
-    /// read `isAnonymous` to know which kind you got. Reported by RopoLabs on
-    /// the RN SDK; same code here.
-    ///
-    /// Pass `forceNew: true` to deliberately abandon the current session —
-    /// whichever kind — and mint a separate anonymous one. That is the only
-    /// way this replaces an identified session, and it does so silently.
-    public func signInAnonymously(
-        name: String? = nil,
-        metadata: [String: Any]? = nil,
-        forceNew: Bool = false,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            let existing: SendoraCloudAuthUser? = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser
-            }()
-            // Both halves are load-bearing: the cached user says WHO this device
-            // is, the stored refresh token is what still makes that account
-            // reachable. A cached user without a token is not a session worth
-            // handing back. Reading it here — inside the serial queue, which
-            // `callAuthSync` holds until a mint has persisted — is also what
-            // makes a burst of cold-launch calls collapse onto ONE mint instead
-            // of one account each.
-            if !forceNew,
-               let user = existing,
-               self.storage.authRefreshToken != nil {
-                completion(.success(user))
+    /// Public since 5.4.0 (the README documented it for years while it was
+    /// private). Forces one refresh of the current session's tokens; `nil` when
+    /// nothing could be refreshed. Prefer `getAccessToken`.
+    public func refreshAccessToken(completion: @escaping (String?) -> Void) {
+        refreshAccessToken(force: true, completion: completion)
+    }
+
+    /// `force` skips the stashed-token short-circuit (a caller with out-of-band
+    /// evidence the tracked deadline is wrong); the cron and the sibling-join
+    /// path leave it off.
+    internal func refreshAccessToken(force: Bool, completion: @escaping (String?) -> Void) {
+        opsQueue.async { self.performRefresh(force: force, completion) }
+    }
+
+    /// The refresh body. Runs ON `opsQueue` (an identity attempt calls it
+    /// directly while it holds the queue). Single-flight: a second caller joins
+    /// the in-flight request. Re-reads the stored refresh token at firing time.
+    internal func performRefresh(force: Bool = false, _ completion: @escaping (String?) -> Void) {
+        lock.lock()
+        refreshInFlight.append(completion)
+        if isRefreshing {
+            lock.unlock()
+            return
+        }
+        isRefreshing = true
+        // `withheld` never refreshes (no cron, no gap-fill — §3.2).
+        let sent: String? = withheldState == nil ? (current?.refreshToken ?? limbo?.refreshToken) : nil
+        let stashedAccess = current?.accessToken ?? limbo?.accessToken
+        let stashedExp = current?.accessExpiresAt ?? limbo?.accessExpiresAt ?? 0
+        lock.unlock()
+
+        guard let refresh = sent else {
+            completeRefresh(token: nil)
+            return
+        }
+
+        // Short-circuit: a sibling rotated and stashed a fresh token before we
+        // acquired `isRefreshing`. Same guard as the fast path — no clock-skew
+        // learning here, nothing proves this token just arrived from the server.
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if !force, let stashedAccess = stashedAccess, !stashedAccess.isEmpty,
+           canServeToken(stashedAccess, expiresAt: stashedExp, nowMs: nowMs) {
+            completeRefresh(token: stashedAccess)
+            return
+        }
+
+        client.requestWithDetails(method: "POST", path: "/auth-service/token/refresh",
+                                  body: ["refreshToken": refresh]) { [weak self] rich in
+            guard let self = self else { return }
+            // The rotated trio lives under `data.tokens` (alongside `data.user`),
+            // matching every other auth response. It was FLAT before s58.76, and
+            // reading the wrong level does not fail loudly — it just never
+            // refreshes, so the session dies at access-token expiry and the app
+            // mints a fresh anonymous user, silently fragmenting the account.
+            // Accept both levels.
+            let data = (rich.body?["data"] as? [String: Any]) ?? [:]
+            let tokenFields = (data["tokens"] as? [String: Any]) ?? data
+            let token = self.routeRefreshResult(sent: refresh, rich: rich, tokenFields: tokenFields)
+            self.completeRefresh(token: token)
+        }
+    }
+
+    /// Route a `/token/refresh` answer for the CURRENT session or the limbo
+    /// record by the token that was SENT (INV-2 token CAS): a rotation installs
+    /// only while `sent` is still the stored token; a dead verdict clears only the
+    /// session it was about; anything else (429, 5xx, generic 401, network) is
+    /// transient and changes no identity (INV-6). Returns the access token to hand
+    /// to the waiting callers, or `nil`.
+    private func routeRefreshResult(sent: String, rich: APIClient.RichResponse, tokenFields: [String: Any]?) -> String? {
+        let errorEnvelope = rich.body?["error"] as? [String: Any]
+        if rich.statusCode == 0 { return nil } // transport failure — backoff, no identity change
+        if !(200..<300).contains(rich.statusCode) {
+            let code = rich.errorCode ?? (errorEnvelope?["code"] as? String) ?? ""
+            if Self.isDeadRefreshError(code) {
+                let endReason = Self.readEndReason(errorEnvelope)
+                _ = commitRefreshDead(sent: sent, endReason: endReason)
+            }
+            return nil
+        }
+        guard let fields = tokenFields,
+              let accessToken = fields["accessToken"] as? String, !accessToken.isEmpty,
+              let refreshToken = fields["refreshToken"] as? String, !refreshToken.isEmpty,
+              let expiresIn = fields["expiresIn"] as? Int else {
+            return nil
+        }
+        let tokens = SendoraCloudAuthTokens(
+            accessToken: accessToken, refreshToken: refreshToken, expiresIn: expiresIn,
+            tokenType: fields["tokenType"] as? String ?? "Bearer"
+        )
+        let user = parseSuccess(rich.body)
+        return commitRefreshOk(sent: sent, tokens: tokens, user: user)
+    }
+
+    internal static func readEndReason(_ error: [String: Any]?) -> SendoraCloudRefreshEndReason? {
+        guard let details = error?["details"] as? [String: Any],
+              let raw = details["endReason"] as? String else { return nil }
+        return SendoraCloudRefreshEndReason(rawValue: raw)
+    }
+
+    /// `signed_out.reason` off a dead verdict (B11): `revoked` / `evicted` /
+    /// `deleted` pass through; `expired`, `reuse`, `unknown` and an absent reason
+    /// are `sessionExpired` — exactly what every build before 5.4.0 emitted.
+    internal static func signedOutReason(for endReason: SendoraCloudRefreshEndReason?) -> SendoraCloudAuthSignedOutReason {
+        switch endReason {
+        case .revoked?: return .revoked
+        case .evicted?: return .evicted
+        case .deleted?: return .deleted
+        default: return .sessionExpired
+        }
+    }
+
+    /// Block the current op (on `opsQueue`) until any in-flight refresh lands —
+    /// the §3.3 scheduling rule that makes the sid-CAS a backstop: an identity
+    /// attempt never snapshots a token a rotation is about to replace (the "GC
+    /// sheet open during refresh" interleaving).
+    internal func awaitRefreshInflight() {
+        lock.lock()
+        guard isRefreshing else { lock.unlock(); return }
+        let sem = DispatchSemaphore(value: 0)
+        refreshInFlight.append { _ in sem.signal() }
+        lock.unlock()
+        sem.wait()
+    }
+
+    /// Refresh synchronously from within an op that holds `opsQueue`.
+    internal func performRefreshSync() -> String? {
+        let sem = DispatchSemaphore(value: 0)
+        var out: String?
+        performRefresh { token in out = token; sem.signal() }
+        sem.wait()
+        return out
+    }
+
+    /// A Bearer for the Bearer verbs, from within an op on `opsQueue`: the
+    /// cached token when servable, else one refresh.
+    internal func bearerTokenOnQueue() -> String? {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let snapshot = currentTokenSnapshot()
+        if let token = snapshot.token, canServeToken(token, expiresAt: snapshot.expiresAt, nowMs: nowMs) { return token }
+        return performRefreshSync()
+    }
+
+    // MARK: - Proactive refresh (s58.73)
+
+    /// Background timer + UIApplication.didBecomeActive observer that
+    /// triggers a refresh when the access token enters the last 20%
+    /// of its TTL ± 30s jitter. Armed ONLY by an install commit; stopped by a
+    /// clear / withhold commit (ADR-033 INV-1). Never refreshes a held guest.
+    internal func startProactiveRefreshCron() {
+        lock.lock()
+        let alreadyArmed = cronArmed
+        cronArmed = true
+        lock.unlock()
+        guard !alreadyArmed, machineConfig.schedulesTimers else { return }
+        let tick: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            let snapshot = self.currentTokenSnapshot()
+            guard let token = snapshot.token else { return }
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let expMs = snapshot.expiresAt
+            // Repair, not just anticipate: the combined guard is the only thing
+            // here that can see a deadline left stale by a backwards clock step.
+            if !self.canServeToken(token, expiresAt: expMs, nowMs: nowMs) {
+                self.refreshAndReconcile(nowMs: nowMs) { _ in }
                 return
             }
-            var body: [String: Any] = [:]
-            if let name = name { body["name"] = name }
-            if let metadata = metadata { body["metadata"] = metadata }
-            self.callAuthSync(path: "/auth-service/anonymous", body: body, completion: completion)
-        }
-    }
-
-    public func signUp(
-        email: String,
-        password: String,
-        name: String? = nil,
-        metadata: [String: Any]? = nil,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // Snapshot anonymity inside the serial queue so a concurrent
-            // signOut/signIn can't race the read.
-            let isAnonymous: Bool = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser?.isAnonymous == true
-            }()
-            let refresh = self.storage.authRefreshToken
-
-            if isAnonymous, let refresh = refresh {
-                var body: [String: Any] = [
-                    "refreshToken": refresh,
-                    "email": email,
-                    "password": password,
-                ]
-                if let name = name { body["name"] = name }
-                self.callAuthSync(path: "/auth-service/upgrade", body: body, completion: completion)
-                return
+            let remainingMs = expMs - nowMs
+            if remainingMs <= 0 { return }
+            let guessOriginalMs: Int64 = max(remainingMs, 5 * 60 * 1000)
+            let jitter = Int64.random(in: -30_000...30_000)
+            let fireWhenRemainingMs = Int64(Double(guessOriginalMs) * 0.2) + jitter
+            if remainingMs <= fireWhenRemainingMs {
+                self.refreshAccessToken(force: false) { _ in }
             }
+        }
+        tick()
+        let t = Timer(timeInterval: 60.0, repeats: true) { _ in tick() }
+        RunLoop.main.add(t, forMode: .common)
+        self.proactiveTimer = t
+        #if canImport(UIKit)
+        self.proactiveAppActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in tick() }
+        #endif
+    }
 
-            // ADR-030 §4: already signed in with an identity. signUp() would
-            // orphan the current account by minting a second one — refuse and
-            // point at link*() (was: silently wiped + fresh-signup = duplicate
-            // account). A genuinely signed-out caller (no cachedUser) still
-            // falls through to a fresh signup below.
-            let wasIdentified: Bool = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                return self.cachedUser != nil && self.cachedUser?.isAnonymous == false
-            }()
-            if wasIdentified {
-                completion(.failure(.alreadyIdentified("Already signed in. Use linkEmailPassword() to add a password to this account, or sign out first.")))
-                return
-            }
-
-            var body: [String: Any] = ["email": email, "password": password]
-            if let name = name { body["name"] = name }
-            if let metadata = metadata { body["metadata"] = metadata }
-            self.callAuthSync(path: "/auth-service/signup", body: body, completion: completion)
+    internal func stopProactiveRefreshCron() {
+        lock.lock()
+        cronArmed = false
+        lock.unlock()
+        proactiveTimer?.invalidate()
+        proactiveTimer = nil
+        if let obs = proactiveAppActiveObserver {
+            NotificationCenter.default.removeObserver(obs)
+            proactiveAppActiveObserver = nil
         }
     }
 
-    public func signIn(
-        email: String,
-        password: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // Device-takeover (backend s58.111): if this device holds
-            // an anonymous session, forward its refresh token to
-            // /login so the backend revokes the anon session,
-            // reassigns this device's push tokens to the identified
-            // user, and deletes the anon user row. One device → one
-            // user_id on the platform side.
-            //
-            // Captured WITHOUT wiping: a wrong password, a dead radio or a 5xx
-            // must leave the anonymous session — and the account behind it —
-            // exactly as it was. `callAuthSync` clears the old identity only
-            // once the response has validated as a real session.
-            let prevAnonRefreshToken = self.takeoverHint()
-
-            var body: [String: Any] = ["email": email, "password": password]
-            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
-            self.callAuthSync(path: "/auth-service/login", body: body, replacesIdentity: true, completion: completion)
-        }
+    internal func completeRefresh(token: String?) {
+        let callbacks: [(String?) -> Void] = {
+            lock.lock(); defer { lock.unlock() }
+            let cs = refreshInFlight
+            refreshInFlight.removeAll()
+            isRefreshing = false
+            return cs
+        }()
+        for cb in callbacks { cb(token) }
     }
 
-    /// Login MFA challenge — when an account has MFA enabled, signIn returns
-    /// a `mfaChallenge` outcome instead of an authenticated user. Caller
-    /// follows up with `challengeMfa(challengeToken:code:)`.
-    public enum SignInOutcome {
-        case authenticated(SendoraCloudAuthUser)
-        case mfaRequired(challengeToken: String, userId: String)
-    }
-
-    /// Like signIn(), but discriminates the MFA-required path. Use this
-    /// when you support MFA on your end-users.
-    public func signInWithMfaSupport(
-        email: String,
-        password: String,
-        completion: @escaping (Result<SignInOutcome, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // Capture the device-takeover hint BEFORE any wipe, exactly like
-            // signIn(). Do NOT wipe the anon identity here — the MFA challenge
-            // may not resolve (or may fail), so the anon session must survive
-            // until challengeMfa() actually mints a real session. On the
-            // no-MFA direct-success path we wipe-then-persist inside the
-            // success branch below (audit s58.203 device-takeover fix).
-            let prevAnonRefreshToken = self.takeoverHint()
-
-            var body: [String: Any] = ["email": email, "password": password]
-            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
-            let semaphore = DispatchSemaphore(value: 0)
-            self.client.requestWithDetails(method: "POST", path: "/auth-service/login", body: body) { rich in
-                let response = rich.body
-                if let err = self.parseError(rich) {
-                    completion(.failure(err))
-                    semaphore.signal()
-                    return
-                }
-                guard let data = response?["data"] as? [String: Any] else {
-                    completion(.failure(.unknown("Malformed response")))
-                    semaphore.signal()
-                    return
-                }
-                if let mfaRequired = data["mfaRequired"] as? Bool,
-                   mfaRequired,
-                   let challengeToken = data["mfaChallengeToken"] as? String {
-                    // Stash the anon takeover token keyed to this challenge so
-                    // challengeMfa() can forward it. Anon identity stays intact.
-                    if let prev = prevAnonRefreshToken {
-                        self.lock.lock()
-                        self.pendingAnonTakeover = (challengeToken: challengeToken, prevAnonRefreshToken: prev)
-                        self.lock.unlock()
-                    }
-                    let userDict = data["user"] as? [String: Any]
-                    let userId = (userDict?["id"] as? String) ?? ""
-                    completion(.success(.mfaRequired(challengeToken: challengeToken, userId: userId)))
-                    semaphore.signal()
-                    return
-                }
-                guard let user = self.parseSuccess(response),
-                      let tokens = self.parseTokens(response) else {
-                    completion(.failure(.unknown("Malformed response")))
-                    semaphore.signal()
-                    return
-                }
-                // Direct success (account has no MFA): clear the old anon
-                // identity now, after the new session is confirmed, then persist.
-                self.wipeReplacedIdentityIfPresent()
-                self.persist(user: user, tokens: tokens)
-                self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
-                completion(.success(.authenticated(user)))
-                semaphore.signal()
-            }
-            semaphore.wait()
-        }
-    }
-
-    /// Returns the stored anon refresh token iff the local subject is
-    /// currently anonymous. Used by every identified-session-mint path
-    /// so the backend can run device-takeover (s58.111 + s58.112).
-    /// Exposed as `internal` so cross-file helpers (e.g. passkey
-    /// assertion) can read it without copying the gating logic.
-    internal func takeoverHint() -> String? {
-        self.lock.lock(); defer { self.lock.unlock() }
-        guard cachedUser?.isAnonymous == true else { return nil }
-        return self.storage.authRefreshToken
-    }
-
-    // MARK: - Device-takeover listener (s58.116 parity with RN 1.0.5)
+    // MARK: - Listeners
 
     /// Register a callback fired when the backend retires an anon
     /// `user_id` during a signin on this device. Use it to delete
@@ -753,23 +1047,15 @@ public final class SendoraCloudAuth {
     /// `auth_service_users` + `push_tokens` are already cleaned up
     /// server-side. Returns an unsubscribe closure.
     ///
-    /// Listeners fire on EVERY identified-signin path:
-    /// signIn / loginSocial / **signInWithGameCenter** / challengeMfa /
-    /// verifyMagicLink / verifyEmailOtp / passkey authenticate / OIDC SSO
-    /// callback — fired centrally from `fireLifecycleSignals` whenever the
-    /// response carries `retiredAnonUserId`.
-    ///
-    /// ⚠ `signInWithGameCenter` is the one that matters most here, and was
-    /// missing from this list before 4.16.0. When the presented player
-    /// identity already belongs to another account, the sign-in ADOPTS that
-    /// account and the anonymous account on this device is retired — its row
-    /// is DELETED server-side — while the call itself still SUCCEEDS. This
-    /// listener is the only client-side signal. Pass
-    /// `onCredentialInUse: .reject` if you would rather it not happen.
-    ///
-    /// Local-only — survives webhook receiver downtime. For
-    /// server-pipeline cleanup also subscribe `auth.device_takeover`
-    /// webhook.
+    /// ⚠ LEGACY after ADR-033 (5.4.0): a 5.4.0 sign-in — signIn / loginSocial /
+    /// **signInWithGameCenter** / challengeMfa / verifyMagicLink / verifyEmailOtp
+    /// / passkey / SSO — never presents the guest's token, so the server never
+    /// retires the guest and this listener never fires for this SDK's sign-ins.
+    /// The guest is HELD on-device instead: subscribe to `.guestHeld` on
+    /// `onAuthStateChanged` and read `heldGuests()`. Kept callable so installed
+    /// handlers compile; it still fires if an OLDER SDK on the same account
+    /// triggers a server-side retirement that this device later observes in a
+    /// response (`retiredAnonUserId`).
     @discardableResult
     public func onDeviceTakeover(_ listener: @escaping (DeviceTakeoverEvent) -> Void) -> () -> Void {
         let key = UUID()
@@ -784,24 +1070,15 @@ public final class SendoraCloudAuth {
     }
 
     /// Returns the most recent takeover the SDK observed in this
-    /// session, or nil if none. Lets late subscribers pick up the
-    /// takeover their handler missed.
+    /// session, or nil if none.
     public func getLastDeviceTakeover() -> DeviceTakeoverEvent? {
         lock.lock(); defer { lock.unlock() }
         return lastTakeover
     }
 
-    /// Internal — called from every identified-signin path with the
-    /// `retiredAnonUserId` parsed off the backend response (or off
-    /// the SSO redirect fragment). Snapshot + dispatch outside the
-    /// lock so a listener can't deadlock by re-entering the auth
-    /// surface.
-    ///
-    /// Validates UUID shape before firing. The value comes from a
-    /// URL fragment / response body that a MitM could tamper; a
-    /// non-UUID value handed to a listener that interpolates it
-    /// into a path (the documented pattern) becomes a
-    /// path-injection sink in the host app.
+    /// Internal — called with the `retiredAnonUserId` parsed off a backend
+    /// response. Validates UUID shape before firing (a tampered value handed to a
+    /// listener that interpolates it into a path is a path-injection sink).
     func fireDeviceTakeover(retiredAnonUserId: String, identifiedUserId: String) {
         guard Self.isCanonicalUuid(retiredAnonUserId) else { return }
         let evt = DeviceTakeoverEvent(
@@ -820,8 +1097,7 @@ public final class SendoraCloudAuth {
 
     /// Subscribe to deletion-cancelled events (s58.269): fires when a sign-in
     /// cancelled a pending self-service account deletion within its grace
-    /// window (the account is restored, same user_id). Surface "your deletion
-    /// was cancelled" + reconcile local state. Returns an unsubscribe closure.
+    /// window (the account is restored, same user_id). Returns an unsubscribe closure.
     @discardableResult
     public func onDeletionCancelled(_ listener: @escaping (DeletionCancelledEvent) -> Void) -> () -> Void {
         let key = UUID()
@@ -842,11 +1118,9 @@ public final class SendoraCloudAuth {
     }
 
     /// What the last sign-in did with this device's guest account, or nil if no
-    /// sign-in has happened this session (s58.278).
-    ///
-    /// The one worth acting on is `.preserved`: a guest account was presented,
-    /// was NOT retired, and is therefore still alive server-side — so "recover
-    /// your other account" is a real offer rather than a guess.
+    /// sign-in has happened this session (s58.278). LEGACY after ADR-033: a 5.4.0
+    /// sign-in never presents the guest, so the server states `nothingToRetire`
+    /// for every one of this SDK's sign-ins — read `heldGuests()` instead.
     public func getLastAnonRetirement() -> AnonRetirementOutcome? {
         lock.lock(); defer { lock.unlock() }
         return lastAnonRetirement
@@ -864,40 +1138,30 @@ public final class SendoraCloudAuth {
         emitAuthState(.deletionCancelled(user: currentUser))
     }
 
-    // MARK: - Auth-state stream (4.13.0)
-
     /// Subscribe to every auth-state transition — the single stream that answers
     /// "what happened to my session?". Firebase `addStateDidChangeListener` /
     /// Supabase `onAuthStateChange` parity.
     ///
-    /// The reason it exists: a session that died in the BACKGROUND (the server
-    /// rejected the stored refresh token) used to emit no signal whatsoever, so
-    /// an app could not distinguish it from a deliberate sign-out and only
-    /// noticed when `getAccessToken` began returning nil. That transition is now
-    /// `.signedOut(reason: .sessionExpired)`.
-    ///
-    /// Replays the CURRENT state on subscribe once the Keychain re-hydrate has
-    /// run (a `.signedIn` when a session was restored from disk — including
-    /// offline, since hydration is disk-only), so a subscriber never misses the
-    /// state it started in. Nothing is emitted for a signed-out cold start.
-    ///
-    /// A failed sign-in emits NOTHING: the session is unchanged, so there is no
-    /// transition to report — the `.failure` result is the whole story.
-    ///
-    /// `onDeviceTakeover` / `onDeletionCancelled` keep working unchanged; the
-    /// matching cases here are the same events on the one stream. Listeners are
-    /// best-effort. Returns an unsubscribe closure.
+    /// Replay on subscribe (once the Keychain hydrate has run — always, on iOS):
+    /// `.initial(status:user:withheld:)` exactly once, INCLUDING `.signedOut`,
+    /// `.unknown` and `.withheld`; then, when a session is installed, the
+    /// pre-5.4.0 `.signedIn(user:)` replay as well (kept verbatim for installed
+    /// listeners). A failed sign-in emits NOTHING: the session is unchanged.
+    /// Replace emits `.guestHeld` then ONE `.signedIn` — no `.signedOut`.
+    /// Listeners are best-effort. Returns an unsubscribe closure.
     @discardableResult
     public func onAuthStateChanged(_ listener: @escaping (SendoraCloudAuthStateChange) -> Void) -> () -> Void {
         let key = UUID()
-        let replay: SendoraCloudAuthUser? = {
+        let replay: (status: SendoraCloudAuthStatus, user: SendoraCloudAuthUser?, withheld: SendoraCloudWithheldInfo?)? = {
             lock.lock(); defer { lock.unlock() }
             authStateListeners[key] = listener
-            // Gated on hydration: before it runs, `cachedUser == nil` means "not
-            // restored yet", NOT "signed out" — emitting there would be a lie.
-            return hydrated ? cachedUser : nil
+            guard hydrated else { return nil }
+            return (statusLocked(), current?.user, withheldState?.info)
         }()
-        if let user = replay { listener(.signedIn(user: user)) }
+        if let r = replay {
+            listener(.initial(status: r.status, user: r.user, withheld: r.withheld))
+            if let user = r.user { listener(.signedIn(user: user)) }
+        }
         return { [weak self] in
             guard let self = self else { return }
             self.lock.lock(); defer { self.lock.unlock() }
@@ -907,7 +1171,7 @@ public final class SendoraCloudAuth {
 
     /// Internal — fan a state change out to subscribers. Snapshot-then-dispatch
     /// outside the lock so a listener can re-enter the auth surface safely.
-    private func emitAuthState(_ change: SendoraCloudAuthStateChange) {
+    internal func emitAuthState(_ change: SendoraCloudAuthStateChange) {
         let snapshot: [(SendoraCloudAuthStateChange) -> Void] = {
             lock.lock(); defer { lock.unlock() }
             return Array(authStateListeners.values)
@@ -935,351 +1199,230 @@ public final class SendoraCloudAuth {
         }
     }
 
-    /// Exchange the `mfaChallengeToken` from `signInWithMfaSupport` + a
-    /// 6-digit TOTP code (or a 17-char recovery code) for a real session.
-    public func challengeMfa(
-        challengeToken: String,
-        code: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // Forward the device-takeover hint: prefer the token stashed at
-            // signInWithMfaSupport() time (keyed to this challenge), falling
-            // back to the live anon refresh (covers callers who reached an
-            // MFA challenge through a path that didn't stash). Captured BEFORE
-            // any wipe. The anon identity is wiped ONLY on a successful mint
-            // below — a wrong/expired code preserves the anon session so the
-            // user can retry (audit s58.203 device-takeover fix).
-            let stashed: String? = {
-                self.lock.lock(); defer { self.lock.unlock() }
-                if let p = self.pendingAnonTakeover, p.challengeToken == challengeToken {
-                    return p.prevAnonRefreshToken
-                }
-                return nil
-            }()
-            let prevAnonRefreshToken = stashed ?? self.takeoverHint()
+    // MARK: - Parsing + error coercion
 
-            var body: [String: Any] = ["challengeToken": challengeToken, "code": code]
-            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
-
-            let semaphore = DispatchSemaphore(value: 0)
-            self.client.requestWithDetails(method: "POST", path: "/auth-service/mfa/challenge", body: body) { rich in
-                let response = rich.body
-                if let err = self.parseError(rich) {
-                    completion(.failure(err)) // anon identity preserved on failure
-                    semaphore.signal()
-                    return
-                }
-                guard let user = self.parseSuccess(response),
-                      let tokens = self.parseTokens(response) else {
-                    completion(.failure(.unknown("Malformed response")))
-                    semaphore.signal()
-                    return
-                }
-                // Success: clear the stash + old anon identity, then persist.
-                self.lock.lock()
-                if self.pendingAnonTakeover?.challengeToken == challengeToken {
-                    self.pendingAnonTakeover = nil
-                }
-                self.lock.unlock()
-                self.wipeReplacedIdentityIfPresent()
-                self.persist(user: user, tokens: tokens)
-                self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
-                completion(.success(user))
-                semaphore.signal()
-            }
-            semaphore.wait()
+    // `internal`, not `private`: `SendoraCloudPasskeys` is a separate file and
+    // needs this to surface a step-up refusal on `deletePasskey`.
+    internal func parseError(_ response: [String: Any]?) -> SendoraCloudAuthError? {
+        guard let response = response else {
+            // No body at all — the request never produced one: offline, TLS
+            // failure, request timed out, breaker open. Message kept verbatim,
+            // apps match on it.
+            return .network("Network request failed")
         }
-    }
-
-    // MARK: - Magic link
-
-    /// Send a magic-link email. Always resolves successfully regardless
-    /// of whether the email matches a known user.
-    public func sendMagicLink(
-        email: String,
-        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
-    ) {
-        client.post(path: "/auth-service/magic-link/request", body: ["email": email]) { response in
-            if let err = self.parseError(response) {
-                completion(.failure(err))
-            } else {
-                completion(.success(()))
-            }
-        }
-    }
-
-    // MARK: - Social sign-in (8 providers)
-
-    /// Verify an IdP-issued credential and mint a Sendora session.
-    /// Customer's app handles the IdP dance — typically via
-    /// ASAuthorization (Apple), ASWebAuthenticationSession (web-based
-    /// providers), or a 3rd-party SDK — then hands the result here.
-    ///
-    /// `provider` is one of: google, github, apple, microsoft,
-    /// linkedin, facebook, twitter, discord. Twitter is rejected
-    /// server-side per OAuth 2.0 verified-email gap.
-    ///
-    /// Pass either `code` + `redirectUri` (authorization-code flow)
-    /// OR `idToken` (Apple-native flow). Apple's first-time prompt
-    /// also yields name fields — pass via `appleFirstName` /
-    /// `appleLastName`. Apple only sends them once.
-    public func loginSocial(
-        provider: String,
-        code: String? = nil,
-        idToken: String? = nil,
-        redirectUri: String? = nil,
-        codeVerifier: String? = nil,
-        appleFirstName: String? = nil,
-        appleLastName: String? = nil,
-        // ADR-025 link-in-place opt-in. When anonymous + `link: true`, an
-        // anon→social upgrade KEEPS the same user id (sub) — promoted in place
-        // (like Firebase linkWithCredential) instead of a device-takeover that
-        // mints a new id. No effect off-anon or on a collision.
-        link: Bool = false,
-        /// What to do if this social identity (or its verified email) already
-        /// belongs to an account. **Leave it nil** — the default refuses only
-        /// when a live guest session would be deleted.
-        onCredentialInUse: CredentialCollisionPolicy? = nil,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // Device-takeover hint — same posture as signIn(). Captured WITHOUT
-            // wiping: `code` and `idToken` are both optional and the IdP round
-            // trip fails routinely (user cancelled at the provider, a code
-            // already redeemed, no connectivity), so nothing local may be
-            // dropped until the exchange has actually produced a session.
-            let prevAnonRefreshToken = self.takeoverHint()
-
-            var body: [String: Any] = ["provider": provider]
-            if let code = code { body["code"] = code }
-            if let idToken = idToken { body["idToken"] = idToken }
-            if let redirectUri = redirectUri { body["redirectUri"] = redirectUri }
-            if let codeVerifier = codeVerifier { body["codeVerifier"] = codeVerifier }
-            if appleFirstName != nil || appleLastName != nil {
-                var name: [String: String] = [:]
-                if let f = appleFirstName { name["firstName"] = f }
-                if let l = appleLastName { name["lastName"] = l }
-                body["appleName"] = name
-            }
-            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
-            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
-            if link { body["linkAnonymous"] = true }
-            // See signInWithGameCenter — omitted means the server's "adopt".
-            if let policy = onCredentialInUse { body["onCredentialInUse"] = policy.rawValue }
-            self.callAuthSync(path: "/auth-service/login/social", body: body, replacesIdentity: true, completion: completion)
-        }
-    }
-
-    /// Convenience: Google authorization-code login.
-    public func signInWithGoogle(
-        code: String,
-        redirectUri: String,
-        link: Bool = false,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "google", code: code, redirectUri: redirectUri, link: link, completion: completion) }
-
-    /// Convenience: GitHub authorization-code login.
-    public func signInWithGitHub(
-        code: String,
-        redirectUri: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "github", code: code, redirectUri: redirectUri, completion: completion) }
-
-    /// Apple Sign In via native ASAuthorization. Pass the
-    /// `identityToken` from `ASAuthorizationAppleIDCredential`. On
-    /// first sign-in, also pass the user's first + last name from
-    /// `fullName` — Apple won't send them again.
-    public func signInWithApple(
-        idToken: String,
-        firstName: String? = nil,
-        lastName: String? = nil,
-        // ADR-025: keep the same user id on an anon→Apple upgrade. See `loginSocial`.
-        link: Bool = false,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        loginSocial(
-            provider: "apple",
-            idToken: idToken,
-            appleFirstName: firstName,
-            appleLastName: lastName,
-            link: link,
-            completion: completion
+        if let success = response["success"] as? Bool, success { return nil }
+        let error = response["error"] as? [String: Any]
+        let code = error?["code"] as? String ?? ""
+        let message = error?["message"] as? String ?? "Auth request failed"
+        let status = (error?["status"] as? Int) ?? 0
+        return Self.asAuthError(
+            code: code,
+            message: message,
+            status: status,
+            retryAfterSeconds: Self.readRetryAfterSeconds(error)
         )
     }
 
-    /// Apple Game Center sign-in (email-less, player-keyed). Pass the payload
-    /// from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)`
-    /// plus your app's bundle id — obtain them via GameKit (or the Sendora
-    /// helper). `link: true` KEEPS the same user id when upgrading an anonymous
-    /// device (ADR-025 link-in-place); no effect off-anon or on a collision.
-    /// `signature`/`salt` are base64; `timestamp` is GameKit's millisecond value.
-    public func signInWithGameCenter(
-        publicKeyURL: String,
-        signature: String,
-        salt: String,
-        timestamp: UInt64,
-        teamPlayerID: String,
-        bundleID: String,
-        link: Bool = false,
-        /// What to do if this Game Center player identity already belongs to
-        /// an account. **Leave it nil** — the default refuses only when a live
-        /// guest session would be deleted. See `CredentialCollisionPolicy`.
-        onCredentialInUse: CredentialCollisionPolicy? = nil,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // Device-takeover hint — same posture as loginSocial(), and the
-            // ordering matters most here: games sign in at launch over whatever
-            // network the device happens to have, and for an anonymous player
-            // the refresh token captured below is the ONLY handle on their
-            // progress and purchases. Nothing local is dropped until the
-            // response validates.
-            let prevAnonRefreshToken = self.takeoverHint()
-
-            var body: [String: Any] = [
-                "publicKeyUrl": publicKeyURL,
-                "signature": signature,
-                "salt": salt,
-                "timestamp": timestamp,
-                "teamPlayerId": teamPlayerID,
-                "bundleId": bundleID,
-            ]
-            if let prev = prevAnonRefreshToken { body["prevAnonRefreshToken"] = prev }
-            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
-            if link { body["linkAnonymous"] = true }
-            // Only sent when explicitly chosen — omitted is the backend's
-            // "adopt" default, i.e. exactly what every prior release did.
-            if let policy = onCredentialInUse { body["onCredentialInUse"] = policy.rawValue }
-            self.callAuthSync(path: "/auth-service/login/game-center", body: body, replacesIdentity: true, completion: completion)
-        }
-    }
-
-    /// Convenience: Microsoft Azure AD authorization-code login.
-    public func signInWithMicrosoft(
-        code: String,
-        redirectUri: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "microsoft", code: code, redirectUri: redirectUri, completion: completion) }
-
-    /// Convenience: LinkedIn (Sign In with LinkedIn using OpenID Connect).
-    public func signInWithLinkedIn(
-        code: String,
-        redirectUri: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "linkedin", code: code, redirectUri: redirectUri, completion: completion) }
-
-    /// Convenience: Facebook Graph login. Refuses if email permission not granted.
-    public func signInWithFacebook(
-        code: String,
-        redirectUri: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "facebook", code: code, redirectUri: redirectUri, completion: completion) }
-
-    /// Convenience: Discord OAuth2. Refuses if account email not verified.
-    public func signInWithDiscord(
-        code: String,
-        redirectUri: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) { loginSocial(provider: "discord", code: code, redirectUri: redirectUri, completion: completion) }
-
-    /// Consume a magic-link token (extracted from the deep-link the user
-    /// tapped) and mint a session.
-    public func verifyMagicLink(
-        token: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // No pre-call wipe: the token comes from a tapped email link and is
-            // routinely expired or already consumed (mail scanners pre-fetch
-            // links; users tap twice). Those rejections must not cost the session.
-            let prev = self.takeoverHint()
-            var body: [String: Any] = ["token": token]
-            if let prev = prev { body["prevAnonRefreshToken"] = prev }
-            self.callAuthSync(path: "/auth-service/magic-link/verify", body: body, replacesIdentity: true, completion: completion)
-        }
-    }
-
-    // MARK: - Email OTP (6-digit cross-device code)
-
-    /// Send a 6-digit email OTP. Always resolves successfully
-    /// regardless of whether the email matches a known user.
-    public func sendEmailOtp(
-        email: String,
-        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
-    ) {
-        client.post(path: "/auth-service/email-otp/request", body: ["email": email]) { response in
-            if let err = self.parseError(response) {
-                completion(.failure(err))
-            } else {
-                completion(.success(()))
+    /// Error mapping for the paths that carry the HTTP status + the typed
+    /// envelope. Unmapped codes become `.rejected` so the caller keeps the
+    /// backend code, the status and the server's retry hint.
+    internal func parseError(_ rich: APIClient.RichResponse) -> SendoraCloudAuthError? {
+        if rich.statusCode == 0 { return .network("Network request failed") }
+        if (200..<300).contains(rich.statusCode) {
+            if let success = rich.body?["success"] as? Bool, success { return nil }
+            if rich.body == nil {
+                return .rejected(
+                    code: "PARSE_ERROR",
+                    message: "Unreadable response (HTTP \(rich.statusCode))",
+                    status: rich.statusCode,
+                    retryAfterSeconds: nil
+                )
             }
         }
+        let error = rich.body?["error"] as? [String: Any]
+        let code = rich.errorCode ?? (error?["code"] as? String) ?? "HTTP_\(rich.statusCode)"
+        let message = rich.errorMessage ?? (error?["message"] as? String) ?? "Auth request failed"
+        return Self.asAuthError(
+            code: code,
+            message: message,
+            status: rich.statusCode,
+            retryAfterSeconds: Self.readRetryAfterSeconds(error)
+        )
     }
 
-    /// Verify a typed 6-digit code + the email it was sent to.
-    public func verifyEmailOtp(
-        email: String,
+    /// The single coercion point for a failure the SDK did not construct itself:
+    /// a raw `code` + `message` (+ HTTP status, + the server's retry hint) in,
+    /// a typed error whose `kind` is ALWAYS defined out.
+    ///
+    /// ⚠ The default MUST stay non-fatal. That is what makes the one-code
+    /// `isDeadRefreshError` allow-list safe rather than merely lucky.
+    static func asAuthError(
         code: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        opsQueue.async {
-            // No pre-call wipe: mistyping a 6-digit code is the single most
-            // common outcome of this flow. The user must be able to retry — with
-            // their session still there.
-            let prev = self.takeoverHint()
-            var body: [String: Any] = ["email": email, "code": code]
-            if let prev = prev { body["prevAnonRefreshToken"] = prev }
-            self.callAuthSync(path: "/auth-service/email-otp/verify", body: body, replacesIdentity: true, completion: completion)
-        }
+        message: String,
+        status: Int,
+        retryAfterSeconds: Int? = nil
+    ) -> SendoraCloudAuthError {
+        if let mapped = mapKnownErrorCode(code, message: message) { return mapped }
+        return .rejected(code: code, message: message, status: status, retryAfterSeconds: retryAfterSeconds)
     }
 
-    // MARK: - Password reset + email verification
-
-    /// Trigger a password-reset email. Backend always resolves
-    /// successfully even when the address is unknown — prevents
-    /// account enumeration.
-    public func requestPasswordReset(
-        email: String,
-        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
-    ) {
-        client.post(path: "/auth-service/password/forgot", body: ["email": email]) { response in
-            if let err = self.parseError(response) {
-                completion(.failure(err))
-            } else {
-                completion(.success(()))
-            }
+    /// Codes with a dedicated case since before 4.13.0. Kept in one place so the
+    /// two `parseError` entry points can never drift.
+    private static func mapKnownErrorCode(_ code: String, message: String) -> SendoraCloudAuthError? {
+        if code == "NOT_ANONYMOUS" {
+            return .alreadyIdentified(message)
         }
+        if code == "CREDENTIAL_IN_USE" {
+            return .credentialInUse(message)
+        }
+        if code == "CONFLICT" || code == "EMAIL_ALREADY_TAKEN" {
+            return .emailAlreadyTaken(message)
+        }
+        if code == "UNAUTHORIZED" || code.hasPrefix("HTTP_401") {
+            return .unauthorized(message)
+        }
+        return nil
     }
 
-    /// Pair the reset-email token with the user's new password.
-    public func resetPassword(
-        token: String,
-        newPassword: String,
-        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
-    ) {
-        client.post(path: "/auth-service/password/reset", body: ["token": token, "newPassword": newPassword]) { response in
-            if let err = self.parseError(response) {
-                completion(.failure(err))
-            } else {
-                completion(.success(()))
-            }
-        }
+    /// Pull the server's backoff hint out of an error envelope.
+    internal static func readRetryAfterSeconds(_ error: [String: Any]?) -> Int? {
+        guard let details = error?["details"] as? [String: Any] else { return nil }
+        guard let seconds = details["retryAfterSeconds"] as? NSNumber else { return nil }
+        let value = seconds.intValue
+        return value > 0 ? value : nil
     }
 
-    /// Verify the email-address token from the link Sendora sent on
-    /// signup. Flips `emailVerified=true` on the user row.
-    public func verifyEmail(
-        token: String,
-        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
-    ) {
-        client.post(path: "/auth-service/email/verify", body: ["token": token]) { response in
-            if let err = self.parseError(response) {
-                completion(.failure(err))
-            } else {
-                completion(.success(()))
-            }
+    internal func parseSuccess(_ response: [String: Any]?) -> SendoraCloudAuthUser? {
+        guard let data = response?["data"] as? [String: Any],
+              let userDict = data["user"] as? [String: Any],
+              let id = userDict["id"] as? String,
+              !id.isEmpty else { return nil }
+        return SendoraCloudAuthUser(
+            id: id,
+            email: userDict["email"] as? String,
+            emailVerified: userDict["emailVerified"] as? Bool ?? false,
+            name: userDict["name"] as? String,
+            isAnonymous: userDict["isAnonymous"] as? Bool ?? false,
+            signupMethod: userDict["signupMethod"] as? String,   // s58.266
+            lastLoginMethod: userDict["lastLoginMethod"] as? String,
+            project: userDict["project"] as? String                // B17
+        )
+    }
+
+    internal func parseTokens(_ response: [String: Any]?) -> SendoraCloudAuthTokens? {
+        guard let data = response?["data"] as? [String: Any],
+              let tokensDict = data["tokens"] as? [String: Any],
+              let accessToken = tokensDict["accessToken"] as? String,
+              !accessToken.isEmpty,
+              let refreshToken = tokensDict["refreshToken"] as? String,
+              !refreshToken.isEmpty,
+              let expiresIn = tokensDict["expiresIn"] as? Int,
+              expiresIn > 0 else { return nil }
+        return SendoraCloudAuthTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            expiresIn: expiresIn,
+            tokenType: tokensDict["tokenType"] as? String ?? "Bearer"
+        )
+    }
+
+    internal static func decodeUser(_ json: String) -> SendoraCloudAuthUser? {
+        guard let data = json.data(using: .utf8),
+              let user = try? JSONDecoder().decode(SendoraCloudAuthUser.self, from: data),
+              !user.id.isEmpty else { return nil }
+        return user
+    }
+
+    internal static func encodeUser(_ user: SendoraCloudAuthUser) -> String? {
+        guard let json = try? JSONEncoder().encode(user) else { return nil }
+        return String(data: json, encoding: .utf8)
+    }
+
+    internal static func decodeSessionRecord(_ json: String) -> AuthSessionRecord? {
+        guard let data = json.data(using: .utf8),
+              let record = try? JSONDecoder().decode(AuthSessionRecord.self, from: data),
+              !record.user.id.isEmpty, !record.refreshToken.isEmpty else { return nil }
+        return record
+    }
+
+    internal static func encodeSessionRecord(_ record: AuthSessionRecord) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let json = try? encoder.encode(record) else { return nil }
+        return String(data: json, encoding: .utf8)
+    }
+
+    /// Canonical UUID validator. Defends against tampered
+    /// `sendora_retired_anon` fragment / response values reaching
+    /// host-app listeners as a path-injection sink.
+    internal static func isCanonicalUuid(_ s: String) -> Bool {
+        return UUID(uuidString: s) != nil
+    }
+
+    /// Backend error codes on /token/refresh that mean the stored refresh token
+    /// is permanently dead (`DEAD_CODES` in `packages/shared`). ONLY the specific
+    /// code: a generic 401 on this route is NOT proof the refresh token is dead
+    /// (the API-key middleware returns the same 401 for a rotated `pk_` key), and
+    /// a RATE_LIMIT says nothing about token validity. Failing to recognise a
+    /// genuinely dead token only costs a retry loop the backoff bounds; wiping a
+    /// live one is irreversible.
+    internal static func isDeadRefreshError(_ code: String) -> Bool {
+        return deadCodes.contains(code)
+    }
+
+    /// Fire-and-forget server-side revoke of a refresh token (signOut, the
+    /// identified→identified switch hygiene, a CAS-dropped result, a fresh-mint
+    /// project mismatch). Never awaited; the local state is already decided.
+    internal func fireAndForgetRevoke(_ refreshToken: String) {
+        client.post(path: "/auth-service/token/revoke", body: ["refreshToken": refreshToken]) { _ in }
+    }
+
+    /// Synchronous request from within an op that holds `opsQueue`.
+    internal func requestSync(method: String, path: String, body: [String: Any]?, headers: [String: String]? = nil) -> APIClient.RichResponse {
+        let sem = DispatchSemaphore(value: 0)
+        var out = APIClient.RichResponse(statusCode: 0, body: nil, errorCode: "NETWORK", errorMessage: "No response")
+        client.requestWithDetails(method: method, path: path, body: body, headers: headers) { rich in
+            out = rich
+            sem.signal()
         }
+        sem.wait()
+        return out
+    }
+}
+
+// MARK: - Bearer verbs that are NOT identity transitions (SESSION_VERB row)
+//
+// They run on the current Bearer, outside the commit funnel, and a refusal
+// surfaces through the typed `Result` (s58.335: no SDK transport throws on a
+// non-2xx, so a discarded return would report every failure as success). In
+// `withheld` every one of them rejects `SESSION_WITHHELD` with no network.
+
+extension SendoraCloudAuth {
+    /// The withheld refusal, when `status() == .withheld` (§3.2: every verb
+    /// except `discardWithheld()` / `signOut()` rejects with no network, no write).
+    internal func withheldRefusal() -> SendoraCloudAuthError? {
+        lock.lock(); defer { lock.unlock() }
+        guard let w = withheldState else { return nil }
+        return .sessionWithheld(w.info)
+    }
+
+    /// Build the Authorization header for end-user-authenticated routes.
+    /// Returns nil when no current session (or `withheld`) — callers bail.
+    func bearerHeaders() -> [String: String]? {
+        guard let token = accessToken else { return nil }
+        return ["Authorization": "Bearer \(token)"]
+    }
+
+    private func bearerCall(
+        path: String,
+        body: [String: Any],
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
+        guard let headers = bearerHeaders() else {
+            completion(nil)
+            return
+        }
+        client.post(path: path, body: body, headers: headers, completion: completion)
     }
 
     /// Re-send the email-verification email for the currently-
@@ -1287,6 +1430,7 @@ public final class SendoraCloudAuth {
     public func sendVerificationEmail(
         completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
     ) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         bearerCall(path: "/auth-service/email/verify/resend", body: [:]) { response in
             if let err = self.parseError(response) {
                 completion(.failure(err))
@@ -1296,7 +1440,7 @@ public final class SendoraCloudAuth {
         }
     }
 
-    // MARK: - MFA enrollment management (Bearer-authenticated)
+    // MARK: MFA enrollment management (Bearer-authenticated)
 
     public struct MfaEnrollment {
         public let secret: String
@@ -1307,6 +1451,7 @@ public final class SendoraCloudAuth {
     /// Begin MFA enrollment. Returns the otpauth:// URL + 8 recovery
     /// codes — shown ONCE.
     public func enrollMfa(completion: @escaping (Result<MfaEnrollment, SendoraCloudAuthError>) -> Void) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         bearerCall(path: "/auth-service/mfa/enroll/start", body: [:]) { response in
             guard let data = response?["data"] as? [String: Any],
                   let secret = data["secret"] as? String,
@@ -1314,8 +1459,7 @@ public final class SendoraCloudAuth {
                   let codes = data["recoveryCodes"] as? [String] else {
                 // Classify WHY there is no payload before reporting one. A nil
                 // response is a dead radio or a timed-out request — `.network`,
-                // retryable — not the malformed body this used to call it, which
-                // classified as `.unknown` and told the app not to retry.
+                // retryable — not a malformed body.
                 completion(.failure(self.parseError(response) ?? .unknown("Malformed enrollment response")))
                 return
             }
@@ -1324,11 +1468,10 @@ public final class SendoraCloudAuth {
     }
 
     public func confirmMfa(code: String, completion: @escaping (Result<Bool, SendoraCloudAuthError>) -> Void) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         bearerCall(path: "/auth-service/mfa/enroll/confirm", body: ["code": code]) { response in
-            // A wrong code still answers `confirmed: false` — that is a verdict,
-            // and it is reported as one. A request that never got an answer is
-            // NOT a verdict: reporting `.success(false)` for a timeout told the
-            // app the user's code was wrong and cost them the attempt.
+            // A wrong code still answers `confirmed: false` — that is a verdict.
+            // A request that never got an answer is NOT a verdict.
             if let confirmed = (response?["data"] as? [String: Any])?["confirmed"] as? Bool {
                 completion(.success(confirmed))
                 return
@@ -1338,6 +1481,7 @@ public final class SendoraCloudAuth {
     }
 
     public func disableMfa(completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         bearerCall(path: "/auth-service/mfa/disable", body: [:]) { response in
             // Was unconditional success — a timed-out request reported MFA as
             // disabled while the second factor was still armed server-side.
@@ -1349,7 +1493,7 @@ public final class SendoraCloudAuth {
         }
     }
 
-    // MARK: - Device sessions self-service
+    // MARK: Device sessions self-service
 
     public struct DeviceSession {
         public let id: String
@@ -1378,15 +1522,14 @@ public final class SendoraCloudAuth {
     /// Revoke one of the caller's own sessions ("sign out that device").
     ///
     /// ⚠ BREAKING in 5.0.0: the completion was `() -> Void` — no failure
-    /// channel at all. `APIClient.request`'s completion is non-throwing and
-    /// deliberately delivers the body on a non-2xx, so a failure was
-    /// indistinguishable from success. A "sign out this device" button that
-    /// reports success on a failure is the one place a user acts on the claim
-    /// and then stops worrying about a device they no longer control.
+    /// channel at all. A "sign out this device" button that reports success on
+    /// a failure is the one place a user acts on the claim and then stops
+    /// worrying about a device they no longer control.
     public func revokeSession(
         sessionId: String,
         completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
     ) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         guard let headers = bearerHeaders() else {
             completion(.failure(.unauthorized("Sign in before revoking a session")))
             return
@@ -1402,6 +1545,7 @@ public final class SendoraCloudAuth {
     /// Revoke every session for the caller. Same 5.0.0 signature change and the
     /// same reason as `revokeSession`.
     public func revokeAllSessions(completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         guard let headers = bearerHeaders() else {
             completion(.failure(.unauthorized("Sign in before signing out other devices")))
             return
@@ -1413,200 +1557,7 @@ public final class SendoraCloudAuth {
         }
     }
 
-    /// Outcome of `deleteAccount`. `status` is `"purged"` (hard-deleted now,
-    /// grace = 0) or `"pending"` (deactivated + sessions revoked now, hard
-    /// delete scheduled at `scheduledPurgeAt`; cancellable by signing back in).
-    public struct AccountDeletionResult {
-        public let status: String
-        public let scheduledPurgeAt: String?
-        public let graceDays: Int
-    }
-
-    /// Delete the signed-in user's account (Apple App Store Guideline 5.1.1(v)).
-    /// Honors the project's configured grace period. Wipes local identity on
-    /// success (the server has revoked the session). Fails when no user is
-    /// signed in or the request errors.
-    ///
-    /// Resolves a FRESH access token via `getAccessToken` first (refreshing a
-    /// past-expiry cached token) — this is a one-shot destructive action, so a
-    /// 401 from a stale token would silently strand the user with an undeleted
-    /// account (the cause of the prod 401s when "delete" was tapped after the
-    /// app sat idle).
-    public func deleteAccount(completion: @escaping (Result<AccountDeletionResult, Error>) -> Void) {
-        getAccessToken { [weak self] token in
-            guard let self = self else { return }
-            guard let token = token else {
-                completion(.failure(SendoraCloudAuthError.unauthorized("deleteAccount requires a signed-in user")))
-                return
-            }
-            let headers = ["Authorization": "Bearer \(token)"]
-            self.client.delete(path: "/auth-service/me", headers: headers) { [weak self] response in
-                guard let response = response else {
-                    // The completion type is still `Error`, but what travels in
-                    // it is now typed: an NSError carried no `kind`, so on the
-                    // one call that cannot be re-attempted blind, an app could
-                    // not tell a stalled radio (retry) from a server refusal
-                    // (don't). Messages are unchanged — apps match on them, and
-                    // `LocalizedError` keeps them on `localizedDescription`.
-                    completion(.failure(SendoraCloudAuthError.network("deleteAccount failed (network error)")))
-                    return
-                }
-                if let error = response["error"] as? [String: Any] {
-                    let msg = (error["message"] as? String) ?? "deleteAccount failed"
-                    completion(.failure(SendoraCloudAuth.asAuthError(
-                        code: (error["code"] as? String) ?? "",
-                        message: msg,
-                        status: (error["status"] as? Int) ?? 500,
-                        retryAfterSeconds: SendoraCloudAuth.readRetryAfterSeconds(error)
-                    )))
-                    return
-                }
-                // Account is gone / deactivated server-side — drop local identity.
-                self?.wipeLocalIdentity(reason: .signedOut(.accountDeleted))
-                let data = response["data"] as? [String: Any]
-                completion(.success(AccountDeletionResult(
-                    status: (data?["status"] as? String) ?? "pending",
-                    scheduledPurgeAt: data?["scheduledPurgeAt"] as? String,
-                    graceDays: (data?["graceDays"] as? Int) ?? 0
-                )))
-            }
-        }
-    }
-
-    // MARK: - Identity linking (ADR-030)
-    //
-    // Attach a SECOND credential to the CURRENT signed-in account, preserving
-    // the same user id (sub). Unlike signUp()/loginSocial(link:) — which
-    // preserve the sub only from an ANONYMOUS session — these operate on an
-    // already-identified account. Bearer-authenticated; NO token rotation (the
-    // cached user is refreshed in place). Collision → `.credentialInUse` (never
-    // merges). Primary use: one account across platforms — a Game Center player
-    // links email/Google, then signs in on Android to the SAME sub.
-
-    /// Link email + password to the current account (sub preserved).
-    public func linkEmailPassword(
-        email: String,
-        password: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        linkCredential(path: "/auth-service/me/link/email", body: ["email": email, "password": password], completion: completion)
-    }
-
-    /// Link an OAuth social identity to the current account. Pass a native
-    /// `idToken` OR a web `code` + `redirectURI`.
-    public func linkSocial(
-        provider: String,
-        idToken: String? = nil,
-        code: String? = nil,
-        redirectURI: String? = nil,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        var body: [String: Any] = ["provider": provider]
-        if let idToken = idToken { body["idToken"] = idToken }
-        if let code = code { body["code"] = code }
-        if let redirectURI = redirectURI { body["redirectUri"] = redirectURI }
-        linkCredential(path: "/auth-service/me/link/social", body: body, completion: completion)
-    }
-
-    /// Convenience: link a Google identity (native `idToken`, or web `code`+`redirectURI`).
-    public func linkGoogle(
-        idToken: String? = nil,
-        code: String? = nil,
-        redirectURI: String? = nil,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        linkSocial(provider: "google", idToken: idToken, code: code, redirectURI: redirectURI, completion: completion)
-    }
-
-    /// Convenience: link an Apple identity (native ASAuthorization `idToken`).
-    public func linkApple(
-        idToken: String? = nil,
-        code: String? = nil,
-        redirectURI: String? = nil,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        linkSocial(provider: "apple", idToken: idToken, code: code, redirectURI: redirectURI, completion: completion)
-    }
-
-    /// Link an Apple Game Center identity to the current account. Pass the
-    /// payload from `GKLocalPlayer.local.fetchItems(forIdentityVerificationSignature:)`
-    /// + the app's bundle id (same inputs as `signInWithGameCenter`).
-    public func linkGameCenter(
-        publicKeyURL: String,
-        signature: String,
-        salt: String,
-        timestamp: Int,
-        teamPlayerID: String,
-        bundleID: String,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        let body: [String: Any] = [
-            "publicKeyUrl": publicKeyURL,
-            "signature": signature,
-            "salt": salt,
-            "timestamp": timestamp,
-            "teamPlayerId": teamPlayerID,
-            "bundleId": bundleID,
-        ]
-        linkCredential(path: "/auth-service/me/link/game-center", body: body, completion: completion)
-    }
-
-    /// Shared link executor. Resolves a fresh access token, POSTs the credential
-    /// with the Bearer header, then refreshes the cached user IN PLACE (no token
-    /// rotation — the sub is unchanged). Mirrors `deleteAccount`'s Bearer flow.
-    private func linkCredential(
-        path: String,
-        body: [String: Any],
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
-    ) {
-        getAccessToken { [weak self] token in
-            guard let self = self else { return }
-            guard let token = token else {
-                completion(.failure(.unauthorized("Sign in before linking a credential")))
-                return
-            }
-            let headers = ["Authorization": "Bearer \(token)"]
-            self.client.post(path: path, body: body, headers: headers) { [weak self] response in
-                guard let self = self else { return }
-                if let err = self.parseError(response) {
-                    completion(.failure(err))
-                    return
-                }
-                guard let user = self.parseSuccess(response) else {
-                    completion(.failure(.unknown("Malformed link response")))
-                    return
-                }
-                // 4.15.0 — linking a provider identity from an ANONYMOUS session
-                // promotes this account in place (sub preserved) and the server
-                // rotates the session, because the `is_anonymous` JWT claim just
-                // changed. The old refresh token is revoked server-side, so
-                // installing the returned pair is NOT optional: skip it and this
-                // device is signed out at the next refresh. An identified link
-                // returns no tokens and keeps the ADR-030 in-place behaviour.
-                let data = (response?["data"] as? [String: Any]) ?? [:]
-                if data["upgraded"] as? Bool == true, let tokens = self.parseTokens(response) {
-                    self.persist(user: user, tokens: tokens)
-                    self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
-                    completion(.success(user))
-                    return
-                }
-                self.updateLocalUser(user)
-                completion(.success(user))
-            }
-        }
-    }
-
-    /// Refresh the cached user after a link — the sub is unchanged, so only the
-    /// user object + its stored copy change (no token/identity rotation).
-    private func updateLocalUser(_ user: SendoraCloudAuthUser) {
-        lock.lock()
-        cachedUser = user
-        lock.unlock()
-        if let json = try? JSONEncoder().encode(user),
-           let str = String(data: json, encoding: .utf8) {
-            storage.authUserJson = str
-        }
-    }
+    // MARK: Linked identities (ADR-030 read side + unlink)
 
     /// One credential linked to an account (ADR-030 read side, s58.270).
     public struct LinkedIdentity {
@@ -1624,13 +1575,12 @@ public final class SendoraCloudAuth {
     /// List the auth methods/identities linked to the current account (ADR-030
     /// read side, s58.270): every social/gaming identity plus a `hasPassword`
     /// flag — the cross-device / reinstall-durable source of truth for a
-    /// "Connected: Game Center · Google" UI (an on-device tracker misses a link
-    /// made on another device). Bearer-authenticated network read that resolves
-    /// a fresh access token first (mirrors `deleteAccount`). Firebase
-    /// `user.providerData` / Supabase `user.identities` parity.
+    /// "Connected: Game Center · Google" UI. Bearer-authenticated network read
+    /// that resolves a fresh access token first.
     public func listLinkedIdentities(
         completion: @escaping (Result<LinkedIdentitiesResult, SendoraCloudAuthError>) -> Void
     ) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         getAccessToken { [weak self] token in
             guard let self = self else { return }
             guard let token = token else {
@@ -1660,11 +1610,8 @@ public final class SendoraCloudAuth {
         }
     }
 
-    /// Result of `unlink(provider:)`.
-    ///
-    /// `removed` can exceed 1: an account may hold more than one row for a
-    /// provider (distinct provider user ids across projects), and unlinking
-    /// takes all of them.
+    /// Result of `unlink(provider:)`. `removed` can exceed 1: an account may hold
+    /// more than one row for a provider, and unlinking takes all of them.
     public struct UnlinkResult {
         public let provider: String
         public let removed: Int
@@ -1676,25 +1623,18 @@ public final class SendoraCloudAuth {
     /// calls. The write half of `listLinkedIdentities`.
     ///
     /// - Warning: The server REFUSES to remove the last way into the account,
-    ///   with code `LAST_CREDENTIAL` / kind `.lastCredential`. An account with
-    ///   no credentials still exists and still holds the user's data, but
-    ///   nothing can ever authenticate into it again — permanent lockout, not
-    ///   an inconvenience. A password counts as a credential.
-    ///
-    /// Prefer preventing the tap to explaining the refusal: read
-    /// `listLinkedIdentities` and disable Disconnect when
-    /// `identities.count + (hasPassword ? 1 : 0) <= 1`. The error is the
-    /// backstop, not the UX.
+    ///   with code `LAST_CREDENTIAL` / kind `.lastCredential` — permanent lockout,
+    ///   not an inconvenience. Prefer preventing the tap: disable Disconnect when
+    ///   `identities.count + (hasPassword ? 1 : 0) <= 1`. The error is the backstop.
     ///
     /// Fails with `.unauthorized` when signed out, and with the server's
-    /// `NOT_FOUND` when the provider is not linked — an absent provider is NOT
-    /// reported as a successful removal, because a screen saying "disconnected"
-    /// about a credential that is still attached tells the user something
-    /// untrue about their account.
+    /// `NOT_FOUND` when the provider is not linked. On success the cached user
+    /// is left as the server returned it (`userUpdated(cause: .unlink)` when it changed).
     public func unlink(
         provider: String,
         completion: @escaping (Result<UnlinkResult, SendoraCloudAuthError>) -> Void
     ) {
+        if let refusal = withheldRefusal() { completion(.failure(refusal)); return }
         getAccessToken { [weak self] token in
             guard let self = self else { return }
             guard let token = token else {
@@ -1722,580 +1662,64 @@ public final class SendoraCloudAuth {
         }
     }
 
-    // MARK: - Internals (Bearer)
+    // MARK: Email / password utilities (no session involved)
 
-    /// Internal helper used by passkey + SSO flows. Parses the
-    /// standard `{ data: { user, tokens } }` envelope and persists.
-    /// Returns the user on success, nil on malformed payload. Fires
-    /// the device-takeover listener when `data.retiredAnonUserId`
-    /// is present.
-    func persistFromAuthResponse(_ response: [String: Any]?) -> SendoraCloudAuthUser? {
-        guard let user = parseSuccess(response),
-              let tokens = parseTokens(response) else {
-            return nil
-        }
-        persist(user: user, tokens: tokens)
-        fireLifecycleSignals(from: response, identifiedUserId: user.id)
-        return user
-    }
-
-    /// Build the Authorization header for end-user-authenticated routes.
-    /// Returns nil when no current session — callers bail.
-    func bearerHeaders() -> [String: String]? {
-        guard let token = storage.authAccessToken else { return nil }
-        return ["Authorization": "Bearer \(token)"]
-    }
-
-    private func bearerCall(
-        path: String,
-        body: [String: Any],
-        completion: @escaping ([String: Any]?) -> Void
+    /// Send a magic-link email. Always resolves successfully regardless
+    /// of whether the email matches a known user.
+    public func sendMagicLink(
+        email: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
     ) {
-        guard let headers = bearerHeaders() else {
-            completion(nil)
-            return
-        }
-        client.post(path: path, body: body, headers: headers, completion: completion)
-    }
-
-    public func signOut(completion: @escaping () -> Void) {
-        opsQueue.async {
-            // Wipe FIRST so the user is logged out on device even if
-            // the revoke request hangs (airplane mode, 5xx, circuit
-            // open). Refresh token still expires server-side.
-            let refresh = self.storage.authRefreshToken
-            self.wipeLocalIdentity(reason: .signedOut(.user))
-            if let refresh = refresh {
-                self.client.post(path: "/auth-service/token/revoke",
-                                 body: ["refreshToken": refresh]) { _ in
-                    completion()
-                }
-            } else {
-                completion()
-            }
+        client.post(path: "/auth-service/magic-link/request", body: ["email": email]) { response in
+            if let err = self.parseError(response) { completion(.failure(err)) } else { completion(.success(())) }
         }
     }
 
-    // MARK: - Internals
-
-    /// Synchronous wrapper that blocks the opsQueue until the network
-    /// call completes — keeps one auth op at a time per SDK instance.
-    ///
-    /// `replacesIdentity` marks the paths that sign a DIFFERENT subject in
-    /// (login / social / Game Center / magic link / email OTP): they clear the
-    /// previous identity — but only from the success branch, after the response
-    /// has validated as a real session. Every `.failure` above that point
-    /// returns with local state untouched. The anonymous-mint and in-place
-    /// `/upgrade` paths pass false: `persist` overwrites and the subject is
-    /// preserved, so there is nothing to wipe.
-    ///
-    /// Uses the details-carrying request so the backend's `error.code`, HTTP
-    /// status and `retryAfterSeconds` survive to the caller — `client.post`
-    /// collapses every non-2xx to nil, which made a wrong password, a 429 and a
-    /// dead radio indistinguishable at the call site.
-    private func callAuthSync(
-        path: String,
-        body: [String: Any],
-        replacesIdentity: Bool = false,
-        completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void
+    /// Send a 6-digit email OTP. Always resolves successfully
+    /// regardless of whether the email matches a known user.
+    public func sendEmailOtp(
+        email: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
     ) {
-        let semaphore = DispatchSemaphore(value: 0)
-        client.requestWithDetails(method: "POST", path: path, body: body) { [weak self] rich in
-            guard let self = self else { semaphore.signal(); return }
-            let response = rich.body
-            if let err = self.parseError(rich) {
-                completion(.failure(err))
-                semaphore.signal()
-                return
-            }
-            guard let user = self.parseSuccess(response),
-                  let tokens = self.parseTokens(response) else {
-                completion(.failure(.unknown("Malformed response")))
-                semaphore.signal()
-                return
-            }
-            // Session confirmed — ONLY NOW may the previous identity go.
-            if replacesIdentity { self.wipeReplacedIdentityIfPresent() }
-            self.persist(user: user, tokens: tokens)
-            self.fireLifecycleSignals(from: response, identifiedUserId: user.id)
-            completion(.success(user))
-            semaphore.signal()
-        }
-        semaphore.wait()
-    }
-
-    private func refreshAccessToken(completion: @escaping (String?) -> Void) {
-        opsQueue.async {
-            self.lock.lock()
-            self.refreshInFlight.append(completion)
-            if self.isRefreshing {
-                self.lock.unlock()
-                return
-            }
-            self.isRefreshing = true
-            self.lock.unlock()
-
-            // s58.73: re-read the stored refresh token at firing time
-            // (NOT at completion enqueue). If a sibling task (background
-            // push handler, deferred deep-link cold-start) rotated the
-            // token while this call was queued, we get the fresh value
-            // and dodge the backend's reuse-detection grace race.
-            guard let refresh = self.storage.authRefreshToken else {
-                self.completeRefresh(token: nil)
-                return
-            }
-
-            // Short-circuit: if we have a fresh access token in storage
-            // already (sibling rotated successfully + populated it
-            // before we acquired isRefreshing), return it directly.
-            // Saves a redundant /refresh round-trip.
-            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-            // Same guard as the fast path, same reason — this token is "fresh"
-            // only in that a sibling task stashed it; we have no idea how long
-            // ago, so it is a cached token like any other. It shipped with a
-            // bare `> nowMs`: no safety margin AND no `exp` check, on the very
-            // path meant to REPAIR an expired token. Do not learn clock skew
-            // here — nothing proves this token just arrived from the server.
-            if let stashedAccess = self.storage.authAccessToken,
-               !stashedAccess.isEmpty,
-               self.canServeToken(stashedAccess, expiresAt: self.storage.authAccessExpiresAt, nowMs: nowMs) {
-                self.lock.lock()
-                self.cachedExpiresAt = self.storage.authAccessExpiresAt
-                self.lock.unlock()
-                self.completeRefresh(token: stashedAccess)
-                return
-            }
-
-            let sent = refresh
-            self.client.post(path: "/auth-service/token/refresh",
-                             body: ["refreshToken": sent]) { [weak self] response in
-                guard let self = self else { return }
-                // s58.46 — stored token is dead. Wipe local identity
-                // so the next op doesn't loop on the same refresh
-                // value. Pre-s58.46 we silently returned nil and the
-                // host app re-tried indefinitely (Pulse News iOS hit
-                // /refresh ~1×/s for hours).
-                // Only wipe if the token the server rejected is STILL the
-                // stored one. A sign-in or signOut that landed while this
-                // request was in flight already replaced it, and that newer
-                // session is not the one the server declared dead.
-                if let error = response?["error"] as? [String: Any],
-                   let code = error["code"] as? String,
-                   Self.isDeadRefreshError(code),
-                   self.tokenStillCurrent(sent) {
-                    // The ONE background wipe: the server has told us this
-                    // refresh token is permanently dead. Emits
-                    // `.signedOut(.sessionExpired)` so the app learns the
-                    // session died instead of discovering it later via a nil
-                    // access token.
-                    self.wipeLocalIdentity(reason: .signedOut(.sessionExpired))
-                    self.completeRefresh(token: nil)
-                    return
-                }
-                // The rotated trio lives under `data.tokens` (alongside
-                // `data.user`), matching every other auth response. It was FLAT
-                // before s58.76, and reading the wrong level does not fail
-                // loudly — it just never refreshes, so the session dies at
-                // access-token expiry and the app mints a fresh anonymous user,
-                // silently fragmenting the account. Accept both levels.
-                guard let data = response?["data"] as? [String: Any] else {
-                    self.completeRefresh(token: nil)
-                    return
-                }
-                let tokenFields = (data["tokens"] as? [String: Any]) ?? data
-                guard let accessToken = tokenFields["accessToken"] as? String,
-                      !accessToken.isEmpty,
-                      let refreshToken = tokenFields["refreshToken"] as? String,
-                      !refreshToken.isEmpty,
-                      let expiresIn = tokenFields["expiresIn"] as? Int else {
-                    self.completeRefresh(token: nil)
-                    return
-                }
-                // Installing this would resurrect a session the user just
-                // signed out of, or clobber a newer one. The revoke signOut
-                // fires cannot save us: it hashes the PRE-rotation token,
-                // while a successful refresh has already minted a new
-                // server-side session row.
-                guard self.tokenStillCurrent(sent) else {
-                    self.completeRefresh(token: nil)
-                    return
-                }
-                let expMs = Int64(Date().timeIntervalSince1970 * 1000) + Int64(expiresIn) * 1000
-                self.storage.authAccessToken = accessToken
-                self.storage.authRefreshToken = refreshToken
-                self.storage.authAccessExpiresAt = expMs
-                self.lock.lock()
-                self.cachedExpiresAt = expMs
-                self.lock.unlock()
-
-                // Adopt the user the backend returns alongside the rotated trio
-                // when we don't have one. Without this the corrupt-cache path is
-                // a dead end: `init` deliberately KEEPS the refresh token when
-                // the cached user blob is unreadable (it is the only thing that
-                // can recover that account), but nothing could ever turn that
-                // token back into an identity — the session stayed live with a
-                // permanently nil `cachedUser` and the next sign-in orphaned it
-                // anyway. Fills a GAP only: a refresh rotates tokens, it is not
-                // an identity change, so a rotation with a user already present
-                // must still emit nothing. `parseSuccess` is the gate on shape —
-                // the route tolerates a missing user row, so `data.user` may be
-                // absent or null.
-                let hasUser: Bool = {
-                    self.lock.lock(); defer { self.lock.unlock() }
-                    return self.cachedUser != nil
-                }()
-                if !hasUser, let recovered = self.parseSuccess(response) {
-                    // Same path a sign-in takes, so `.signedIn` reaches
-                    // `onAuthStateChanged` — recovering an identity IS a
-                    // transition. Re-writes the tokens just installed above with
-                    // identical values.
-                    self.persist(user: recovered, tokens: SendoraCloudAuthTokens(
-                        accessToken: accessToken,
-                        refreshToken: refreshToken,
-                        expiresIn: expiresIn,
-                        tokenType: tokenFields["tokenType"] as? String ?? "Bearer"
-                    ))
-                }
-                self.completeRefresh(token: accessToken)
-            }
+        client.post(path: "/auth-service/email-otp/request", body: ["email": email]) { response in
+            if let err = self.parseError(response) { completion(.failure(err)) } else { completion(.success(())) }
         }
     }
 
-    // MARK: - Proactive refresh (s58.73)
-
-    /// Background timer + UIApplication.didBecomeActive observer that
-    /// triggers a refresh when the access token enters the last 20%
-    /// of its TTL ± 30s jitter. Refresh becomes a scheduled event,
-    /// never a 401-driven race. Started on persist(), stopped on
-    /// wipeLocalIdentity().
-    private var proactiveTimer: Timer?
-    private var proactiveAppActiveObserver: NSObjectProtocol?
-
-    fileprivate func startProactiveRefreshCron() {
-        guard proactiveTimer == nil else { return }
-        let tick: () -> Void = { [weak self] in
-            guard let self = self else { return }
-            guard let _ = self.storage.authAccessToken else { return }
-            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-            let expMs = self.storage.authAccessExpiresAt
-            // Repair, not just anticipate. Everything below reasons from the
-            // tracked deadline, so one left stale by a backwards clock step
-            // reads as "an hour of life left" and this never fires — the SDK
-            // sits on a dead token for a full TTL while the timer ticks past
-            // it. The combined guard is the only thing here that can see that.
-            if !self.canServeToken(self.storage.authAccessToken, expiresAt: expMs, nowMs: nowMs) {
-                self.refreshAndReconcile(nowMs: nowMs) { _ in }
-                return
-            }
-            let remainingMs = expMs - nowMs
-            if remainingMs <= 0 { return }
-            // Assume 15-min default access-TTL when we can't observe the
-            // originally-issued lifetime; pad with jitter so multiple
-            // app instances on the same network don't synchronize the
-            // refresh herd.
-            let guessOriginalMs: Int64 = max(remainingMs, 5 * 60 * 1000)
-            let jitter = Int64.random(in: -30_000...30_000)
-            let fireWhenRemainingMs = Int64(Double(guessOriginalMs) * 0.2) + jitter
-            if remainingMs <= fireWhenRemainingMs {
-                self.refreshAccessToken { _ in }
-            }
-        }
-        // Fire immediately on start in case the app launched with a
-        // near-expired token.
-        tick()
-        // Then every 60s.
-        let t = Timer(timeInterval: 60.0, repeats: true) { _ in tick() }
-        RunLoop.main.add(t, forMode: .common)
-        self.proactiveTimer = t
-
-        // Also tick when the app comes back to foreground.
-        #if canImport(UIKit)
-        self.proactiveAppActiveObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in tick() }
-        #endif
-    }
-
-    fileprivate func stopProactiveRefreshCron() {
-        proactiveTimer?.invalidate()
-        proactiveTimer = nil
-        if let obs = proactiveAppActiveObserver {
-            NotificationCenter.default.removeObserver(obs)
-            proactiveAppActiveObserver = nil
+    /// Trigger a password-reset email. Backend always resolves
+    /// successfully even when the address is unknown — prevents
+    /// account enumeration.
+    public func requestPasswordReset(
+        email: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/password/forgot", body: ["email": email]) { response in
+            if let err = self.parseError(response) { completion(.failure(err)) } else { completion(.success(())) }
         }
     }
 
-    private func completeRefresh(token: String?) {
-        let callbacks: [(String?) -> Void] = {
-            lock.lock(); defer { lock.unlock() }
-            let cs = refreshInFlight
-            refreshInFlight.removeAll()
-            isRefreshing = false
-            return cs
-        }()
-        for cb in callbacks { cb(token) }
-    }
-
-    // `internal`, not `private`: `SendoraCloudPasskeys` is a separate file and
-    // needs this to surface a step-up refusal on `deletePasskey`.
-    internal func parseError(_ response: [String: Any]?) -> SendoraCloudAuthError? {
-        guard let response = response else {
-            // No body at all — the request never produced one: offline, TLS
-            // failure, request timed out, breaker open. Message kept verbatim,
-            // apps match on it.
-            return .network("Network request failed")
-        }
-        if let success = response["success"] as? Bool, success { return nil }
-        let error = response["error"] as? [String: Any]
-        let code = error?["code"] as? String ?? ""
-        let message = error?["message"] as? String ?? "Auth request failed"
-        // `APIClient` stamps the HTTP status onto the envelope. Reading it is
-        // what lets an unmapped code classify at all — this path used to
-        // collapse every one of them into `.unknown`, so a 429 and a 503
-        // reported as "not retryable" on the routes that reach the transport
-        // through the plain `post`/`get` helpers.
-        let status = (error?["status"] as? Int) ?? 0
-        return Self.asAuthError(
-            code: code,
-            message: message,
-            status: status,
-            retryAfterSeconds: Self.readRetryAfterSeconds(error)
-        )
-    }
-
-    /// Error mapping for the sign-in paths, which carry the HTTP status + the
-    /// typed envelope. Unmapped codes become `.rejected` so the caller keeps the
-    /// backend code, the status and the server's retry hint (`.unknown` above
-    /// has nowhere to put them); the codes that already had a dedicated case
-    /// still produce that case, unchanged.
-    private func parseError(_ rich: APIClient.RichResponse) -> SendoraCloudAuthError? {
-        // Status 0 = the request never reached the server (offline, TLS failure,
-        // timeout, circuit breaker open). Message kept verbatim — apps match it.
-        if rich.statusCode == 0 { return .network("Network request failed") }
-        if (200..<300).contains(rich.statusCode) {
-            if let success = rich.body?["success"] as? Bool, success { return nil }
-            if rich.body == nil {
-                // A 2xx whose body the SDK could not read — the server (or
-                // something on the path) is misbehaving, so this is retryable.
-                return .rejected(
-                    code: "PARSE_ERROR",
-                    message: "Unreadable response (HTTP \(rich.statusCode))",
-                    status: rich.statusCode,
-                    retryAfterSeconds: nil
-                )
-            }
-        }
-        let error = rich.body?["error"] as? [String: Any]
-        let code = rich.errorCode ?? (error?["code"] as? String) ?? "HTTP_\(rich.statusCode)"
-        let message = rich.errorMessage ?? (error?["message"] as? String) ?? "Auth request failed"
-        return Self.asAuthError(
-            code: code,
-            message: message,
-            status: rich.statusCode,
-            retryAfterSeconds: Self.readRetryAfterSeconds(error)
-        )
-    }
-
-    /// The single coercion point for a failure the SDK did not construct itself:
-    /// a raw `code` + `message` (+ HTTP status, + the server's retry hint) in,
-    /// a typed error whose `kind` is ALWAYS defined out. Both `parseError`
-    /// overloads and the Bearer routes go through it, so no path can hand a
-    /// caller a rejection it has nothing to branch on.
-    ///
-    /// ⚠ The default MUST stay non-fatal. That is what makes the one-code
-    /// `isDeadRefreshError` allow-list safe rather than merely lucky: a code
-    /// this build has never seen classifies from the status, and `.unknown`
-    /// when there is none — never "your refresh token is dead" — so a new
-    /// failure mode can only become session-fatal through a deliberate edit.
-    /// Firebase enforces the same rule at its HTTP boundary.
-    static func asAuthError(
-        code: String,
-        message: String,
-        status: Int,
-        retryAfterSeconds: Int? = nil
-    ) -> SendoraCloudAuthError {
-        if let mapped = mapKnownErrorCode(code, message: message) { return mapped }
-        return .rejected(code: code, message: message, status: status, retryAfterSeconds: retryAfterSeconds)
-    }
-
-    /// Codes with a dedicated case since before 4.13.0. Kept in one place so the
-    /// two `parseError` entry points can never drift — an app matching
-    /// `.emailAlreadyTaken` must keep matching it whichever path produced it.
-    private static func mapKnownErrorCode(_ code: String, message: String) -> SendoraCloudAuthError? {
-        if code == "NOT_ANONYMOUS" {
-            return .alreadyIdentified(message)
-        }
-        if code == "CREDENTIAL_IN_USE" {
-            return .credentialInUse(message)
-        }
-        if code == "CONFLICT" || code == "EMAIL_ALREADY_TAKEN" {
-            return .emailAlreadyTaken(message)
-        }
-        if code == "UNAUTHORIZED" || code.hasPrefix("HTTP_401") {
-            return .unauthorized(message)
-        }
-        return nil
-    }
-
-    /// Pull the server's backoff hint out of an error envelope. The backend puts
-    /// it in `error.details.retryAfterSeconds` (429 throttling, and the
-    /// ACCOUNT_LOCKED cool-off — where its ABSENCE means the lock does not
-    /// expire on its own).
-    private static func readRetryAfterSeconds(_ error: [String: Any]?) -> Int? {
-        guard let details = error?["details"] as? [String: Any] else { return nil }
-        guard let seconds = details["retryAfterSeconds"] as? NSNumber else { return nil }
-        let value = seconds.intValue
-        return value > 0 ? value : nil
-    }
-
-    private func parseSuccess(_ response: [String: Any]?) -> SendoraCloudAuthUser? {
-        guard let data = response?["data"] as? [String: Any],
-              let userDict = data["user"] as? [String: Any],
-              let id = userDict["id"] as? String,
-              !id.isEmpty else { return nil }
-        return SendoraCloudAuthUser(
-            id: id,
-            email: userDict["email"] as? String,
-            emailVerified: userDict["emailVerified"] as? Bool ?? false,
-            name: userDict["name"] as? String,
-            isAnonymous: userDict["isAnonymous"] as? Bool ?? false,
-            signupMethod: userDict["signupMethod"] as? String,   // s58.266
-            lastLoginMethod: userDict["lastLoginMethod"] as? String
-        )
-    }
-
-    private func parseTokens(_ response: [String: Any]?) -> SendoraCloudAuthTokens? {
-        guard let data = response?["data"] as? [String: Any],
-              let tokensDict = data["tokens"] as? [String: Any],
-              let accessToken = tokensDict["accessToken"] as? String,
-              !accessToken.isEmpty,
-              let refreshToken = tokensDict["refreshToken"] as? String,
-              !refreshToken.isEmpty,
-              let expiresIn = tokensDict["expiresIn"] as? Int,
-              expiresIn > 0 else { return nil }
-        return SendoraCloudAuthTokens(
-            accessToken: accessToken,
-            refreshToken: refreshToken,
-            expiresIn: expiresIn,
-            tokenType: tokensDict["tokenType"] as? String ?? "Bearer"
-        )
-    }
-
-    private func persist(user: SendoraCloudAuthUser, tokens: SendoraCloudAuthTokens) {
-        let expMs = Int64(Date().timeIntervalSince1970 * 1000) + Int64(tokens.expiresIn) * 1000
-        lock.lock()
-        cachedUser = user
-        cachedExpiresAt = expMs
-        lock.unlock()
-
-        storage.authAccessToken = tokens.accessToken
-        storage.authRefreshToken = tokens.refreshToken
-        storage.authAccessExpiresAt = expMs
-        if let json = try? JSONEncoder().encode(user),
-           let str = String(data: json, encoding: .utf8) {
-            storage.authUserJson = str
-        }
-        onIdentityChange(user.id)
-        startProactiveRefreshCron()
-        emitAuthState(.signedIn(user: user))
-    }
-
-    /// Clear a PREVIOUS identity immediately before installing a new one. Only
-    /// ever called from a success branch — see the ordering note on
-    /// `wipeLocalIdentity`.
-    private func wipeReplacedIdentityIfPresent() {
-        let hadUser: Bool = {
-            lock.lock(); defer { lock.unlock() }
-            return cachedUser != nil
-        }()
-        if hadUser { wipeLocalIdentity(reason: .replaced) }
-    }
-
-    /// Drop the local session.
-    ///
-    /// `reason` drives the `onAuthStateChanged` emission: a real sign-out reason
-    /// emits `.signedOut`, while `.replaced` (the internal clear that precedes a
-    /// SUCCESSFUL sign-in's `persist`) emits nothing — subscribers see one
-    /// `.signedIn`, not a spurious logout/login pair.
-    ///
-    /// ⚠ Never call this before a fallible network request. A failed sign-in
-    /// must leave the caller exactly as it found them; for an anonymous session
-    /// the refresh token dropped here is the ONLY durable handle on the account,
-    /// so a pre-call wipe that is not followed by a successful `persist` orphans
-    /// that account permanently (offline: deterministically). The blast radius is
-    /// wider than tokens, too — `onAnonymousWipe` rotates the device/session ids
-    /// and drops the queued events. Capture the anon refresh into a local, make
-    /// the call, and wipe only after the response validates.
-    private func wipeLocalIdentity(reason: WipeReason = .replaced) {
-        lock.lock()
-        cachedUser = nil
-        cachedExpiresAt = 0
-        // Drop the clock-skew finding with everything else: one refresh to
-        // re-learn, and a wipe is exactly when to inherit no beliefs.
-        clockSkewConfirmed = false
-        pendingAnonTakeover = nil
-        lock.unlock()
-        storage.clearAuthTokens()
-        stopProactiveRefreshCron()
-        // Rotate the device (anonymous analytics) id ONLY at a person-boundary —
-        // an explicit signOut or account deletion. A sign-in/upgrade (.replaced) or
-        // an involuntary session death (.sessionExpired) is the SAME person, so the
-        // id survives and pre-auth analytics link to them (SudokuHurdle r6; the
-        // industry norm). Rotating on logout keeps two people on a shared device
-        // from merging.
-        var rotateDeviceId = false
-        if case .signedOut(let r) = reason {
-            rotateDeviceId = (r == .user || r == .accountDeleted)
-        }
-        onAnonymousWipe(rotateDeviceId)
-        if case .signedOut(let signedOutReason) = reason {
-            emitAuthState(.signedOut(reason: signedOutReason))
+    /// Pair the reset-email token with the user's new password.
+    public func resetPassword(
+        token: String,
+        newPassword: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/password/reset", body: ["token": token, "newPassword": newPassword]) { response in
+            if let err = self.parseError(response) { completion(.failure(err)) } else { completion(.success(())) }
         }
     }
 
-    /// Canonical UUID validator. Defends against tampered
-    /// `sendora_retired_anon` fragment / response values reaching
-    /// host-app listeners as a path-injection sink.
-    private static func isCanonicalUuid(_ s: String) -> Bool {
-        return UUID(uuidString: s) != nil
-    }
-
-    /// Backend error codes on /token/refresh that mean the stored
-    /// refresh token is permanently dead — SDK must wipe local
-    /// identity + stop retrying. INVALID_REFRESH_TOKEN is the s58.46
-    /// canonical code; UNAUTHORIZED / HTTP_401 cover older backend
-    /// builds.
-    ///
-    /// ⚠ 4.13.0 REMOVED `RATE_LIMIT` / `RATE_LIMIT_EXCEEDED` from this list. A
-    /// 429 is TRANSIENT throttling (a shared NAT/CGN egress ip, a burst of
-    /// refreshes) and says nothing about the token's validity — treating it as
-    /// permanent meant a passing rate limit silently destroyed a live session,
-    /// including an anonymous one whose refresh token is its only durable
-    /// handle. A rate limit now falls through to the normal failure path: the
-    /// refresh returns nil, the token stays put, the next call retries.
-    /// ONLY the specific code. `UNAUTHORIZED` / `HTTP_401` used to be accepted
-    /// here as a catch-all for older backends, but a 401 on this route is NOT
-    /// proof the refresh token is dead: the API-key middleware returns the same
-    /// generic 401 for a rotated or expired publishable key. Rotating a `pk_`
-    /// key would therefore have wiped the stored refresh token of every install
-    /// at once. Failing to recognise a genuinely dead token only costs a retry
-    /// loop the backoff already bounds; wiping a live one is irreversible.
-    /// True when `sent` is still the refresh token in storage — i.e. nothing
-    /// replaced or cleared the session while a request carrying it was in
-    /// flight. Guards both directions of the refresh race: installing a rotated
-    /// token over a session that has since been signed out or replaced, and
-    /// wiping a fresh session because an OLD token was rejected.
-    private func tokenStillCurrent(_ sent: String) -> Bool {
-        return storage.authRefreshToken == sent
-    }
-
-    private static func isDeadRefreshError(_ code: String) -> Bool {
-        return code == "INVALID_REFRESH_TOKEN"
+    /// Verify the email-address token from the link Sendora sent on
+    /// signup. Flips `emailVerified=true` on the user row.
+    public func verifyEmail(
+        token: String,
+        completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
+    ) {
+        client.post(path: "/auth-service/email/verify", body: ["token": token]) { response in
+            if let err = self.parseError(response) { completion(.failure(err)) } else { completion(.success(())) }
+        }
     }
 }
-
 
 // MARK: - Access-token expiry
 
@@ -2303,16 +1727,9 @@ public final class SendoraCloudAuth {
 /// clock — or when the token carries no readable `exp` at all.
 ///
 /// - Warning: Unreadable → `true` is deliberate, and it is what makes this safe
-///   to layer UNDER the tracked-deadline check rather than in place of it. An
-///   opaque or non-JWT access token keeps exactly the behaviour it had before
-///   this guard existed; the pair can only ever refresh earlier, never later.
+///   to layer UNDER the tracked-deadline check rather than in place of it.
 /// - Warning: Never derive the tracked deadline FROM `exp`. The two guards fail
-///   in opposite directions and that is the point — `now + expiresIn` is
-///   skew-INVARIANT (a permanently wrong clock cancels on both sides) and blind
-///   to a clock that MOVES, while `exp` is written in the server's frame and
-///   survives a clock step but is wrong by the full offset on a permanently
-///   wrong clock. Collapsing them leaves one failure mode instead of two that
-///   cover each other.
+///   in opposite directions and that is the point (s58.281).
 internal func accessTokenExpIsFuture(_ token: String, nowMs: Int64) -> Bool {
     guard let expSeconds = decodeJwtExp(token) else { return true }
     return Double(nowMs) < expSeconds * 1000.0
@@ -2321,15 +1738,8 @@ internal func accessTokenExpIsFuture(_ token: String, nowMs: Int64) -> Bool {
 /// Read `exp` out of a JWT payload. Signature is never verified client-side —
 /// the server is the only authority on validity; this is a freshness hint.
 internal func decodeJwtExp(_ token: String) -> Double? {
-    let parts = token.split(separator: ".", omittingEmptySubsequences: false)
-    guard parts.count == 3 else { return nil }
-    var b64 = String(parts[1])
-        .replacingOccurrences(of: "-", with: "+")
-        .replacingOccurrences(of: "_", with: "/")
-    while b64.count % 4 != 0 { b64 += "=" }
-    guard let data = Data(base64Encoded: b64),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let exp = obj["exp"] as? Double,
+    guard let obj = decodeJwtPayload(token),
+          let exp = (obj["exp"] as? NSNumber)?.doubleValue,
           exp.isFinite else { return nil }
     return exp
 }

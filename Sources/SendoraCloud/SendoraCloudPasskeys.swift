@@ -33,6 +33,10 @@ public enum SendoraCloudPasskeyError: Error {
     case userCancelled
     case verificationFailed(String)
     case missingPresenter
+    /// 5.4.0 (ADR-033): a typed refusal from the auth machine — `SESSION_WITHHELD`
+    /// (the stored session's project claim disagrees with `expectedProjectId`),
+    /// `PROJECT_MISMATCH`, or a dropped result. Branch on `.kind` / `.code`.
+    case authError(SendoraCloudAuthError)
 }
 
 @available(iOS 16.0, *)
@@ -42,6 +46,8 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
     private weak var presentingWindow: UIWindow?
     private var registerCompletion: ((Result<RegisteredPasskey, SendoraCloudPasskeyError>) -> Void)?
     private var assertCompletion: ((Result<SendoraCloudAuthUser, SendoraCloudPasskeyError>) -> Void)?
+    /// ADR-033: the identity CAS taken when the assertion ceremony started.
+    private var assertStartedFrom: SendoraCloudAuth.IdentityCAS?
     private var pendingChallenge: PasskeyContext?
 
     /// The hostname configured as the WebAuthn RP ID in the dashboard.
@@ -114,6 +120,14 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
         presentingWindow: UIWindow,
         completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudPasskeyError>) -> Void
     ) {
+        // ADR-033 §3.2: in `withheld` every sign-in verb rejects before any network.
+        if let refusal = auth.withheldRefusal() {
+            completion(.failure(.authError(refusal)))
+            return
+        }
+        // The attempt's identity CAS is taken NOW, before the sheet: a result
+        // that lands after a signOut()/switch made meanwhile is dropped.
+        self.assertStartedFrom = auth.externalAttemptStart()
         self.presentingWindow = presentingWindow
         self.assertCompletion = completion
 
@@ -187,6 +201,7 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
         _ passkeyId: String,
         completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
     ) {
+        if let refusal = auth.withheldRefusal() { completion(.failure(refusal)); return }
         guard let headers = auth.bearerHeaders() else {
             completion(.failure(.unauthorized("Sign in before deleting a passkey")))
             return
@@ -241,16 +256,20 @@ public final class SendoraCloudPasskeys: NSObject, ASAuthorizationControllerDele
                     ],
                 ],
             ]
-            // Device-takeover (s58.112): if the device is currently
-            // signed in anonymously, forward the anon refresh so the
-            // backend retires the anon row + reassigns push tokens.
-            if let prev = auth.takeoverHint() { body["prevAnonRefreshToken"] = prev }
+            // ADR-033 INV-3: the body carries NO guest hint. A guest on this
+            // device is HELD by the SIGN_IN commit below, never retired.
             client.post(path: "/auth-service/passkeys/authenticate/finish", body: body) { [weak self] response in
                 guard let self = self else { return }
-                if let user = self.auth.persistFromAuthResponse(response) {
-                    self.finishAssert(.success(user))
-                } else {
+                guard response != nil, (response?["success"] as? Bool) == true else {
                     self.finishAssert(.failure(.verificationFailed("server rejected assertion")))
+                    return
+                }
+                self.auth.completeExternalSignIn(response: response, startedFrom: self.assertStartedFrom) { [weak self] result in
+                    guard let self = self else { return }
+                    switch result {
+                    case .success(let user): self.finishAssert(.success(user))
+                    case .failure(let error): self.finishAssert(.failure(.authError(error)))
+                    }
                 }
             }
         } else {

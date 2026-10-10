@@ -1,6 +1,15 @@
 import Foundation
 import CommonCrypto
 
+/// The one seam between `APIClient` and the network (ADR-033 wave 1, 5.4.0).
+/// Production is `URLSessionTransport` (the pinned `URLSession` below); the auth
+/// conformance suite installs a scripted stub so every row of the shared
+/// transition table can be replayed without a server. Completions arrive on an
+/// arbitrary thread, exactly as `URLSession`'s do.
+protocol SendoraHTTPTransport: AnyObject {
+    func perform(_ request: URLRequest, completion: @escaping (Data?, HTTPURLResponse?, Error?) -> Void)
+}
+
 /// HTTPS-only client with exponential backoff + circuit breaker.
 /// Optionally enforces SPKI certificate pinning when `pinnedSPKIHashes`
 /// is non-empty — useful against user-installed enterprise / MitM CAs
@@ -9,24 +18,30 @@ final class APIClient: NSObject, URLSessionDelegate {
     private let baseUrl: String
     private let apiKey: String
     private let pinnedSPKIHashes: Set<String>
-    private var session: URLSession!
+    private var transport: SendoraHTTPTransport!
     private let lock = NSLock()
     private var consecutiveFailures = 0
     private var nextAllowedAfter: Date = .distantPast
 
     private let maxBackoff: TimeInterval = 60
 
-    init(baseUrl: String, apiKey: String, pinnedSPKIHashes: [String] = []) {
+    /// `transport` is a test seam; `nil` builds the production `URLSession`
+    /// (ephemeral, 10 s request / 15 s resource timeouts, pinning delegate).
+    init(baseUrl: String, apiKey: String, pinnedSPKIHashes: [String] = [], transport: SendoraHTTPTransport? = nil) {
         self.baseUrl = baseUrl.hasSuffix("/") ? String(baseUrl.dropLast()) : baseUrl
         self.apiKey = apiKey
         self.pinnedSPKIHashes = Set(pinnedSPKIHashes)
         super.init()
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 15
-        config.waitsForConnectivity = false
-        config.urlCache = nil
-        self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        if let transport = transport {
+            self.transport = transport
+        } else {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = 10
+            config.timeoutIntervalForResource = 15
+            config.waitsForConnectivity = false
+            config.urlCache = nil
+            self.transport = URLSessionTransport(session: URLSession(configuration: config, delegate: self, delegateQueue: nil))
+        }
     }
 
     /// Circuit breaker: returns true if the caller should skip this call entirely.
@@ -96,25 +111,12 @@ final class APIClient: NSObject, URLSessionDelegate {
         return out
     }
 
-    private func request(
-        method: String,
-        path: String,
-        body: [String: Any]?,
-        headers: [String: String]?,
-        completion: @escaping ([String: Any]?) -> Void
-    ) {
-        if shouldSkip() {
-            completion(nil)
-            return
-        }
-
+    private func buildRequest(method: String, path: String, body: [String: Any]?, headers: [String: String]?) -> URLRequest? {
         guard let url = URL(string: "\(baseUrl)/api/v1\(path)"),
               url.scheme == "https" || url.host == "localhost" || url.host == "127.0.0.1" else {
             SendoraCloudLogger.shared.error("APIClient refusing non-HTTPS URL")
-            completion(nil)
-            return
+            return nil
         }
-
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -127,20 +129,36 @@ final class APIClient: NSObject, URLSessionDelegate {
         if let headers = headers {
             for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
         }
-
         if let body = body {
             do {
                 req.httpBody = try JSONSerialization.data(withJSONObject: body)
             } catch {
                 SendoraCloudLogger.shared.error("JSON serialization failed")
-                completion(nil)
-                return
+                return nil
             }
         }
+        return req
+    }
 
-        let task = session.dataTask(with: req) { [weak self] data, response, _ in
+    private func request(
+        method: String,
+        path: String,
+        body: [String: Any]?,
+        headers: [String: String]?,
+        completion: @escaping ([String: Any]?) -> Void
+    ) {
+        if shouldSkip() {
+            completion(nil)
+            return
+        }
+        guard let req = buildRequest(method: method, path: path, body: body, headers: headers) else {
+            completion(nil)
+            return
+        }
+
+        transport.perform(req) { [weak self] data, http, _ in
             guard let self = self else { return }
-            guard let http = response as? HTTPURLResponse else {
+            guard let http = http else {
                 // No response at all — a genuine transport failure.
                 self.recordFailure()
                 completion(nil)
@@ -163,7 +181,6 @@ final class APIClient: NSObject, URLSessionDelegate {
             if http.statusCode >= 500 { self.recordFailure() } else { self.recordSuccess() }
             completion(json.map { Self.stampErrorStatus($0, status: http.statusCode) })
         }
-        task.resume()
     }
 
     /// Rich response for callers that need HTTP status + the typed
@@ -180,44 +197,28 @@ final class APIClient: NSObject, URLSessionDelegate {
         let errorMessage: String?
     }
 
+    /// `headers` (5.4.0): the Bearer-authenticated link / claim paths of the
+    /// auth machine need the typed envelope too (a 409 `CREDENTIAL_IN_USE` carries
+    /// `details.collision`; a 403 `RECENT_AUTH_REQUIRED` must classify by code).
     func requestWithDetails(
         method: String,
         path: String,
         body: [String: Any]?,
+        headers: [String: String]? = nil,
         completion: @escaping (RichResponse) -> Void
     ) {
         if shouldSkip() {
             completion(RichResponse(statusCode: 0, body: nil, errorCode: "NETWORK", errorMessage: "Circuit breaker open — too many recent failures"))
             return
         }
-
-        guard let url = URL(string: "\(baseUrl)/api/v1\(path)"),
-              url.scheme == "https" || url.host == "localhost" || url.host == "127.0.0.1" else {
-            SendoraCloudLogger.shared.error("APIClient refusing non-HTTPS URL")
-            completion(RichResponse(statusCode: 0, body: nil, errorCode: "NETWORK", errorMessage: "Non-HTTPS URL refused"))
+        guard let req = buildRequest(method: method, path: path, body: body, headers: headers) else {
+            completion(RichResponse(statusCode: 0, body: nil, errorCode: body == nil ? "NETWORK" : "INVALID_INPUT", errorMessage: body == nil ? "Non-HTTPS URL refused" : "Body serialization failed or non-HTTPS URL refused"))
             return
         }
 
-        var req = URLRequest(url: url)
-        req.httpMethod = method
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        // ADR-023: SDK-version request headers (see `request(...)`).
-        req.setValue(SendoraCloud.sdkName, forHTTPHeaderField: "X-Sendora-SDK-Name")
-        req.setValue(SendoraCloud.sdkVersion, forHTTPHeaderField: "X-Sendora-SDK-Version")
-
-        if let body = body {
-            do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: body)
-            } catch {
-                completion(RichResponse(statusCode: 0, body: nil, errorCode: "INVALID_INPUT", errorMessage: "Body serialization failed"))
-                return
-            }
-        }
-
-        let task = session.dataTask(with: req) { [weak self] data, response, _ in
+        transport.perform(req) { [weak self] data, http, _ in
             guard let self = self else { return }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let status = http?.statusCode ?? 0
             var parsed: [String: Any]?
             if let data = data {
                 parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -238,7 +239,6 @@ final class APIClient: NSObject, URLSessionDelegate {
                 errorMessage: err?["message"] as? String
             ))
         }
-        task.resume()
     }
 
     func postBatch(path: String, events: [[String: Any]], completion: @escaping (Bool) -> Void) {
@@ -301,5 +301,21 @@ final class APIClient: NSObject, URLSessionDelegate {
             _ = CC_SHA256(buf.baseAddress, CC_LONG(publicKeyData.count), &hash)
         }
         return Data(hash).base64EncodedString()
+    }
+}
+
+/// The production transport: a plain `URLSession.dataTask`.
+final class URLSessionTransport: SendoraHTTPTransport {
+    private let session: URLSession
+
+    init(session: URLSession) {
+        self.session = session
+    }
+
+    func perform(_ request: URLRequest, completion: @escaping (Data?, HTTPURLResponse?, Error?) -> Void) {
+        let task = session.dataTask(with: request) { data, response, error in
+            completion(data, response as? HTTPURLResponse, error)
+        }
+        task.resume()
     }
 }
