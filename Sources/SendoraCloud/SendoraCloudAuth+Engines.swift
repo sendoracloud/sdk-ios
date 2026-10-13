@@ -454,6 +454,18 @@ extension SendoraCloudAuth {
         }
         let tokens = SendoraCloudAuthTokens(accessToken: accessToken, refreshToken: refreshToken, expiresIn: expiresIn,
                                             tokenType: fields?["tokenType"] as? String ?? "Bearer")
+        // ⚠ IDENTITY TRIPWIRE (s58.360, parity RN 1.41.2 / web 3.24.2). The refresh
+        // must come back for the held GUEST. Before the server fix `/token/refresh`
+        // preferred the `sd_rt` cookie over the body, and a URLSession jar (ephemeral
+        // keeps one in memory) held the signed-in ACCOUNT's cookie — so this 200 was
+        // the account's, and committing it overwrote the guest's only token. Refuse
+        // BEFORE the slot write: nothing written, nothing installed, slot kept.
+        let answeredFor = parseSuccess(rich.body)?.id ?? (decodeJwtPayload(tokens.accessToken)?["sub"] as? String)
+        if let who = answeredFor, !who.isEmpty, who != slot.userId {
+            return .transient(.rejected(code: "HELD_GUEST_IDENTITY_MISMATCH",
+                                        message: "The held guest's refresh was answered for a different account; nothing was changed",
+                                        status: rich.statusCode, retryAfterSeconds: nil))
+        }
         guard commitSlotRotation(index: index, expectRefresh: sent, newRefresh: tokens.refreshToken) else {
             return .transient(.unknown("Held slot changed while refreshing"))
         }

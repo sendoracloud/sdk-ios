@@ -35,13 +35,27 @@ final class APIClient: NSObject, URLSessionDelegate {
         if let transport = transport {
             self.transport = transport
         } else {
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 10
-            config.timeoutIntervalForResource = 15
-            config.waitsForConnectivity = false
-            config.urlCache = nil
+            let config = Self.makeSessionConfiguration()
             self.transport = URLSessionTransport(session: URLSession(configuration: config, delegate: self, delegateQueue: nil))
         }
+    }
+
+    /// The default transport's session configuration (a seam so the cookie posture is testable).
+    internal static func makeSessionConfiguration() -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 15
+        config.waitsForConnectivity = false
+        config.urlCache = nil
+        // ⚠ NO COOKIES (s58.360). The SDK authenticates with x-api-key + body
+        // tokens, never a cookie — but an ephemeral session still keeps an
+        // in-memory jar, so every `sd_rt` the server set was replayed on the
+        // next /token/refresh. After a sign-in that cookie is the ACCOUNT's,
+        // and the server preferred it over a HELD GUEST's token in the body.
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        return config
     }
 
     /// Circuit breaker: returns true if the caller should skip this call entirely.

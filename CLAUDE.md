@@ -5,6 +5,12 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+## 5.4.2 — held-slot refresh identity tripwire (parity RN 1.41.2, s58.360)
+
+Full write-up in the RN CLAUDE.md 1.41.2 section. A held guest's refresh must come back for that guest;
+a response for anyone else → `HELD_GUEST_IDENTITY_MISMATCH` before the slot write (claim: no `/merge`;
+restore: nothing installed, slot kept). Also: `APIClient.makeSessionConfiguration()` (a test seam) turns cookies off — an ephemeral session still keeps an in-memory jar. `swift build` + `swift test` 49/49 on this Mac (Swift 6.4); tripwire mutation → 10 failures.
+
 ## 5.4.1 — dead session is `.sessionExpired` again; server detail in `lastSignedOutEndReason()` (set under the lock BEFORE `emitAuthState`, like `lastSignedInCause()`; the enum payload is frozen) (RopoLabs, 2026-10-10)
 
 5.4.0 mapped the B11 `endReason` onto `signed_out.reason` (`revoked` / `deleted`). Those are two

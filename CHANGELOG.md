@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.4.2 — claiming or restoring a held guest works within one launch
+
+Parity with RN 1.41.2. Before the server fix (e09c86dc, already live), `/token/refresh` preferred the `sd_rt` refresh cookie over the token in the request body. A phone keeps a native cookie jar, and after a sign-in that jar holds the ACCOUNT's cookie — so refreshing a HELD guest's token was answered for the account, and the SDK wrote the account's token into the guest's slot. The device lost its only copy of the guest's credential; `claimHeldGuest()` / `merge()` then failed with 401 and `restoreHeldGuest()` released the guest. The guest's account was never touched on the server. An ephemeral `URLSession` still keeps an in-memory cookie jar for the life of the process, so sign-in → claim in one launch was exposed.
+
+- **No cookies.** The SDK's session configuration now sets `httpShouldSetCookies = false`, `httpCookieAcceptPolicy = .never` and no cookie storage.
+- **Identity check on a held refresh** — a response for anyone but the held guest fails with `HELD_GUEST_IDENTITY_MISMATCH` (`.rejected` code) and changes nothing.
+
 ## 5.4.1 — a dead session is `.sessionExpired` again; the server's detail is `lastSignedOutEndReason()`
 
 **Fix to a 5.4.0 behaviour change (ADR-023: a new value is additive only for a NEW situation).**
