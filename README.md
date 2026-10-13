@@ -12,14 +12,22 @@ In Xcode → File → Add Package Dependencies → paste:
 https://github.com/sendoracloud/sdk-ios
 ```
 
-Pin to `4.0.0` or newer for unprefixed alias routes (org is resolved
-server-side from the API key — no `orgId` config required).
+Choose **Up to Next Major Version**, with the current release as the minimum.
 
 Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/sendoracloud/sdk-ios", from: "4.0.0"),
+.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.4.3"),
 ```
+
+### Upgrading from 4.x
+
+SwiftPM's `from:` never crosses a major version, so an app that pinned `from: "4.x.y"` stays on 4.x
+until you raise the minimum to 5. 5.0.0 changed three completion handlers to
+`(Result<Void, SendoraCloudAuthError>) -> Void`, so their failures are no longer silent:
+`SendoraCloudPasskeys.deletePasskey(_:completion:)`, `SendoraCloudAuth.revokeSession(sessionId:completion:)`
+and `SendoraCloudAuth.revokeAllSessions(completion:)`. Update those call sites when you raise the
+minimum; `CHANGELOG.md` 5.0.0 shows the before and after.
 
 ### Upgrading from 3.x
 

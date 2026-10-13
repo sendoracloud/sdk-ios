@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.4.3 — README install pin
+
+No code or behaviour change (only `SDKVersion.sdkVersion`, which the SDK reports in `X-Sendora-SDK-Version`). The README told
+new integrators `from: "4.0.0"`; SwiftPM's `from:` never crosses a major version, so that resolved to the
+latest **4.x**, a whole major behind. It now names the current release, and a new "Upgrading from 4.x"
+section lists the three completion-handler signatures 5.0.0 changed.
+
 ## 5.4.2 — claiming or restoring a held guest works within one launch
 
 Parity with RN 1.41.2. Before the server fix (e09c86dc, already live), `/token/refresh` preferred the `sd_rt` refresh cookie over the token in the request body. A phone keeps a native cookie jar, and after a sign-in that jar holds the ACCOUNT's cookie — so refreshing a HELD guest's token was answered for the account, and the SDK wrote the account's token into the guest's slot. The device lost its only copy of the guest's credential; `claimHeldGuest()` / `merge()` then failed with 401 and `restoreHeldGuest()` released the guest. The guest's account was never touched on the server. An ephemeral `URLSession` still keeps an in-memory cookie jar for the life of the process, so sign-in → claim in one launch was exposed.
