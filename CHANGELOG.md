@@ -1,5 +1,21 @@
 # Changelog
 
+## 5.5.0 — Support: the player's own conversations, verified reporter, ticket context, theming
+
+Parity with RN 1.42.0 (s58.376, asked for by Sudoku Hurdle). Additive; nothing existing changes shape.
+
+- **`SendoraCloud.support?.listMyTickets(widgetId:)` / `getMyTicket(widgetId:ticketId:)` /
+  `replyToMyTicket(widgetId:ticketId:body:)`** (`async throws`) — the player's own tickets for a native support
+  screen. Refusals throw `SendoraSupportError` (`code`, `status`) — never an empty list.
+- **`createTicket(subject:body:…:metadata:)`** (`async throws`) — new on iOS; sends the player's access token when
+  signed in, so the ticket carries their VERIFIED user id. **`deviceContext()`** — app version + build, OS + version,
+  device model (`iPhone15,2`), SDK version. `sanitizeMetadata(_:)` — the backend's rules.
+- **`presentContactWidget`** gains `metadata:`, `includeDeviceContext:` (default true), `attachSession:` (default
+  true — the token rides the URL fragment), `accent:`; **`presentTicketHistory`** gains `accent:`. All defaulted and
+  placed before `completion:`, so existing calls compile unchanged.
+- **Fix:** support calls (incl. `getUnreadCount`) always went to production — they now use the configured
+  `apiBaseUrl`. `SendoraCloud.support` (the API half) now exists on every platform; the hosted screens stay iOS-only.
+
 ## 5.4.3 — README install pin
 
 No code or behaviour change (only `SDKVersion.sdkVersion`, which the SDK reports in `X-Sendora-SDK-Version`). The README told

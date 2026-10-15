@@ -17,7 +17,7 @@ Choose **Up to Next Major Version**, with the current release as the minimum.
 Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.4.3"),
+.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.5.0"),
 ```
 
 ### Upgrading from 4.x
@@ -273,6 +273,30 @@ matching key. A fresh mint under the wrong key rejects `PROJECT_MISMATCH` and re
 
 Passkeys via `SendoraCloud.passkeys?` (iOS 16+ via ASAuthorization).
 OIDC SSO via `SendoraCloud.sso?.signInWithOidc(returnTo:from:completion:)` (ASWebAuthenticationSession).
+
+## Support (5.5.0)
+
+Create a **Contact Widget** for this app's project in the dashboard and use its id. Signed in (guest or account), the
+SDK sends the player's session, so tickets carry their verified user id.
+
+```swift
+// Hosted form + My messages (iOS)
+SendoraCloud.support?.presentContactWidget(
+    widgetId: "your-widget-id",
+    from: viewController,
+    metadata: ["plan": "pro", "level": 40],   // + app version, build, OS, model, SDK — added for you
+    accent: "#22c55e"
+) { result in }
+SendoraCloud.support?.presentTicketHistory(widgetId: "your-widget-id", from: viewController, accent: "#22c55e")
+
+// Your own screens
+let tickets = try await SendoraCloud.support?.listMyTickets(widgetId: "your-widget-id")
+let ticket = try await SendoraCloud.support?.getMyTicket(widgetId: "your-widget-id", ticketId: "ticket-id")
+let reply = try await SendoraCloud.support?.replyToMyTicket(widgetId: "your-widget-id", ticketId: "ticket-id", body: "Still happening")
+let created = try await SendoraCloud.support?.createTicket(subject: "Purchase not restored", body: "Bought the hint pack")
+```
+
+Refusals throw `SendoraSupportError` (`code` — e.g. `PROJECT_MISMATCH`, `NOT_SIGNED_IN` — and `status`).
 
 ## Push
 

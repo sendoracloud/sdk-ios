@@ -77,11 +77,11 @@ public final class SendoraCloud {
     /// OIDC SSO via ASWebAuthenticationSession (iOS only). Use as
     /// `SendoraCloud.sso?.signInWithOidc(returnTo:from:completion:)`.
     public private(set) static var sso: SendoraCloudSso?
-    /// Wave 66 — open the worker-hosted contact widget in a modal
-    /// WKWebView. iOS only (UIKit gate). Use as
-    /// `SendoraCloud.support?.presentContactWidget(widgetId:, from:)`.
-    public private(set) static var support: SendoraCloudSupport?
     #endif
+    /// Support: `createTicket`, the player's own tickets (`listMyTickets` / `getMyTicket` / `replyToMyTicket`),
+    /// `deviceContext()` — every platform (5.5.0); plus, on iOS, the hosted contact form and ticket history
+    /// (`presentContactWidget(widgetId:from:)`, `presentTicketHistory(widgetId:from:)`).
+    public private(set) static var support: SendoraCloudSupport?
 
     /// iOS Live Activities helper (iOS 16.1+, ActivityKit). Wired on
     /// configure(). Use as `SendoraCloud.liveActivities?.track(activity:...)`.
@@ -191,9 +191,11 @@ public final class SendoraCloud {
             queue.startTimer(interval: finalConfig.flushInterval)
             self.eventQueue = queue
 
-            #if canImport(UIKit)
-            self.support = SendoraCloudSupport()
-            #endif
+            // 5.5.0: every platform, and the CONFIGURED API base (support calls always went to production).
+            self.support = SendoraCloudSupport(
+                apiBaseUrl: URL(string: finalConfig.apiBaseUrl) ?? URL(string: "https://api.sendoracloud.com")!,
+                client: client
+            )
 
             #if canImport(ActivityKit)
             if #available(iOS 16.1, *) {

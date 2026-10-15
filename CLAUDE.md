@@ -5,6 +5,22 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+## 5.5.0 — Support parity with RN 1.42.0 (s58.376)
+
+`SendoraCloudSupport.swift` is now split: the API half compiles on EVERY platform (so `swift test` on macOS covers
+it) — `createTicket` / `listMyTickets` / `getMyTicket` / `replyToMyTicket` (`async throws`, through the configured
+`APIClient`; refusals → `SendoraSupportError`), `deviceContext()` (CFBundle version + build, `UIDevice` OS version,
+`utsname` machine id, SDK), `sanitizeMetadata` (sorted keys → deterministic cap), `contactURL` (token + metadata in
+the FRAGMENT, strict `-._~` encoding so `&`, `=`, `+` survive `URLSearchParams`). The hosted screens stay in a
+`#if canImport(UIKit)` `@MainActor` extension; `presentContactWidget` gained `metadata:` / `includeDeviceContext:` /
+`attachSession:` / `accent:` (defaulted, before `completion:`), `presentTicketHistory` `accent:`.
+⚠ `SendoraCloud.support` was built with hardcoded production URLs — a staging config polled the PROD API. Now
+`SendoraCloudSupport(apiBaseUrl: config.apiBaseUrl, client:)`, on every platform. The class is no longer
+`@MainActor` (only the present methods are) — `getUnreadCount` is callable off the main actor.
+Verified: `swift build`, `xcodebuild -scheme SendoraCloud -destination 'generic/platform=iOS Simulator' build`,
+`swift test --filter SupportTests` 8/8 (stub transport via `APIClient(transport:)`); mutations all red (token
+dropped, refusal swallowed, no-session check, key check, accent check, token in the query).
+
 ## 5.4.2 — held-slot refresh identity tripwire (parity RN 1.41.2, s58.360)
 
 Full write-up in the RN CLAUDE.md 1.41.2 section. A held guest's refresh must come back for that guest;
