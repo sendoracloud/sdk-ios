@@ -70,6 +70,11 @@ final class RecordingPlainStore: SendoraPlainStore {
 struct StubResponse {
     let status: Int
     let json: [String: Any]?
+    /// 5.6.0: extra response headers (`Retry-After`, `cf-mitigated`) and a non-JSON body (a Cloudflare page).
+    var headers: [String: String] = [:]
+    var rawBody: Data? = nil
+
+    func with(headers: [String: String]) -> StubResponse { var c = self; c.headers = headers; return c }
 
     static func ok(_ data: [String: Any], status: Int = 200) -> StubResponse {
         return StubResponse(status: status, json: ["success": true, "data": data])
@@ -121,8 +126,9 @@ final class StubTransport: SendoraHTTPTransport {
                 completion(nil, nil, URLError(.notConnectedToInternet))
                 return
             }
-            let data = response.json.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
-            let http = HTTPURLResponse(url: request.url!, statusCode: response.status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])
+            let data = response.rawBody ?? response.json.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+            let headers = ["Content-Type": "application/json"].merging(response.headers) { _, new in new }
+            let http = HTTPURLResponse(url: request.url!, statusCode: response.status, httpVersion: nil, headerFields: headers)
             completion(data, http, nil)
         }
     }

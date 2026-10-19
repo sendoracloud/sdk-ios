@@ -12,7 +12,7 @@ import UIKit
 ///   • `handleUniversalLink(url:completion:)`          — warm-path resolve.
 ///   • `matchDeferred(_:completion:)`                  — cold-launch deferred match.
 ///   • `onLinkOpened(_:)`                              — observer (warm + deferred).
-///   • `revoke(shortcode:completion:)`                 — soft-delete.
+///   • `revoke(shortcode:completion:)`                 — revoke (final with the mint's token, 5.6.0).
 ///   • `getStats(shortcode:completion:)`               — totals + breakdowns.
 ///   • Static `computeDeviceFingerprint()`             — canonical recipe.
 ///   • Static `decodeLinkData<T:Decodable>(_:)`        — typed access to `linkData`.
@@ -185,6 +185,20 @@ public final class SendoraCloudLinks {
         public let androidDeepLinkPath: String?
         public let fallbackUrl: String
         public let linkData: [String: Any]
+        /// 5.6.0 — the mint's revoke capability (`lrt_…`). Only this device holds it; a
+        /// `revoke` that sends it is FINAL (the team cannot reactivate the link). The SDK
+        /// keeps it for you (per shortcode, Keychain) and `revoke(shortcode:)` sends it
+        /// automatically — read it only to revoke from somewhere else (your server).
+        /// `nil` on an older backend.
+        public let revokeToken: String?
+    }
+
+    /// 5.6.0 — the answer to `revoke(shortcode:revokeToken:completion:)`.
+    public struct LinkRevokeResult {
+        public let shortcode: String
+        /// `true` = revoked with its `revokeToken`: permanent, cannot be reactivated.
+        /// `false` = a soft revoke (no token): the link's team can reactivate it.
+        public let final: Bool
     }
 
     public struct LinkOpenedEvent {
@@ -228,6 +242,8 @@ public final class SendoraCloudLinks {
     private let apiClient: APIClient
     private let bundleId: String?
     private let linkHosts: [String]
+    /// 5.6.0: where the mint's `revokeToken` is kept (nil = not persisted, e.g. a test).
+    private let storage: SendoraStorage?
     private let lock = NSLock()
     private var handlers: [(token: UUID, handler: LinkOpenedHandler)] = []
 
@@ -247,14 +263,15 @@ public final class SendoraCloudLinks {
     private var prewarmInflight = 0
     private let prewarmMaxInflight = 5
 
-    internal init(apiClient: APIClient, bundleId: String?, linkHosts: [String]) {
+    internal init(apiClient: APIClient, bundleId: String?, linkHosts: [String], storage: SendoraStorage? = nil) {
         self.apiClient = apiClient
         self.bundleId = bundleId
         self.linkHosts = linkHosts
+        self.storage = storage
     }
 
-    internal convenience init(client: APIClient, bundleId: String?, linkHosts: [String]) {
-        self.init(apiClient: client, bundleId: bundleId, linkHosts: linkHosts)
+    internal convenience init(client: APIClient, bundleId: String?, linkHosts: [String], storage: SendoraStorage? = nil) {
+        self.init(apiClient: client, bundleId: bundleId, linkHosts: linkHosts, storage: storage)
     }
 
     /// Back-compat init — drops linkHosts gating. Prefer the 3-arg init.
@@ -417,7 +434,7 @@ public final class SendoraCloudLinks {
 
     private func doCreate(_ input: LinkCreateInput, completion: @escaping (Result<LinkCreateResult, Error>) -> Void) {
         let body = buildCreateBody(input)
-        apiClient.requestWithDetails(method: "POST", path: "/sdk/links", body: body) { rich in
+        apiClient.requestWithDetails(method: "POST", path: "/sdk/links", body: body) { [storage] rich in
             if !(200..<300).contains(rich.statusCode) {
                 completion(.failure(SendoraCloudLinks.mapError(status: rich.statusCode, code: rich.errorCode, message: rich.errorMessage)))
                 return
@@ -430,6 +447,8 @@ public final class SendoraCloudLinks {
                 completion(.failure(LinkError(code: .server, message: "links.create returned an unexpected payload", statusCode: rich.statusCode)))
                 return
             }
+            let revokeToken = (data["revokeToken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            if let token = revokeToken { storage?.setLinkRevokeToken(token, forShortcode: shortcode) }
             completion(.success(LinkCreateResult(
                 id: id,
                 shortcode: shortcode,
@@ -437,7 +456,8 @@ public final class SendoraCloudLinks {
                 iosDeepLinkPath: data["iosDeepLinkPath"] as? String,
                 androidDeepLinkPath: data["androidDeepLinkPath"] as? String,
                 fallbackUrl: fallback,
-                linkData: (data["linkData"] as? [String: Any]) ?? [:]
+                linkData: (data["linkData"] as? [String: Any]) ?? [:],
+                revokeToken: revokeToken
             )))
         }
     }
@@ -520,13 +540,31 @@ public final class SendoraCloudLinks {
 
     // MARK: - revoke
 
+    /// Revoke a link this app minted. 5.6.0: sends the mint's stored `revokeToken`
+    /// when this device holds one, which makes the revoke FINAL; use
+    /// `revoke(shortcode:revokeToken:completion:)` to see which one you got.
     public func revoke(shortcode: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        revoke(shortcode: shortcode, revokeToken: nil) { result in
+            completion(result.map { _ in () })
+        }
+    }
+
+    /// 5.6.0 — revoke with the mint's `revokeToken` (`nil` = the one this device
+    /// stored at `create`, if any). With a token the revoke is FINAL
+    /// (`result.final == true`); without one it is soft and the team can
+    /// reactivate it. A wrong token is a 403 (`.unauthorized`) and nothing
+    /// changes. On success the stored token is forgotten.
+    public func revoke(shortcode: String, revokeToken: String?, completion: @escaping (Result<LinkRevokeResult, Error>) -> Void) {
         guard shortcode.range(of: #"^[a-z0-9-]{3,20}$"#, options: .regularExpression) != nil else {
             completion(.failure(LinkError(code: .invalidInput, message: "'\(shortcode)' is not a valid shortcode"))); return
         }
-        apiClient.requestWithDetails(method: "POST", path: "/sdk/links/\(shortcode)/revoke", body: [:]) { rich in
+        let token = (revokeToken.flatMap { $0.isEmpty ? nil : $0 }) ?? storage?.linkRevokeToken(forShortcode: shortcode)
+        let body: [String: Any] = token.map { ["revokeToken": $0] } ?? [:]
+        apiClient.requestWithDetails(method: "POST", path: "/sdk/links/\(shortcode)/revoke", body: body) { [storage] rich in
             if (200..<300).contains(rich.statusCode) {
-                completion(.success(()))
+                storage?.forgetLinkRevokeToken(forShortcode: shortcode)
+                let data = rich.body?["data"] as? [String: Any]
+                completion(.success(LinkRevokeResult(shortcode: shortcode, final: (data?["final"] as? Bool) ?? false)))
             } else {
                 completion(.failure(Self.mapError(status: rich.statusCode, code: rich.errorCode, message: rich.errorMessage)))
             }

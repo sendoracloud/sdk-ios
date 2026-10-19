@@ -5,6 +5,157 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+## 5.6.0 — the response contract, client half (audit F67, backend s58.402; + adversarial review)
+
+**What.** (1) `APIClient`: `Retry-After` (delta-seconds or HTTP-date, else `error.details.retryAfterSeconds`) on a
+**503** holds the breaker that long (cap 1 h, `maxServerWait`); on a **429** the WHOLE-client hold is clamped to 60 s
+(`rateLimitMaxHold` — review H2: the events quota 429 asks until the month resets and held `/token/refresh`, `/login`,
+push for an hour, all month; Android clamps the same) while the full wait (≤ 1 h) still reaches the caller in
+`RichResponse.retryAfterSeconds` / the stamped `details`. `cf-mitigated: challenge` holds ≥ 60 s and is delivered as
+the TRANSPORT class (`statusCode == 0`, `cfMitigated`, `challengeStatus`; plain path → nil). Full-jitter backoff
+`random(0, min(60, 2^n))` (seams `jitter`, `clock`, `breakerOpenUntil`). A 429 used to reset the breaker. Other 4xx:
+never trip.
+(2) `EventQueue` (outcome = `APIClient.DeliveryOutcome`): chunks ≤ 100 events AND ≤ 60,000 serialized bytes
+(`maxChunkBytes`; `/events/batch` 413s over 64 KB); a lone event over the byte cap goes alone. 400 / 413 / 422 on a
+multi-event chunk → BISECT (`bisectLimit`, halved, reset per flush); a single refused event drops. Other permanent
+4xx (401 / 403 / 404 …) drop the chunk. `.retryLater(countsAttempt:after:)`: 408 / 5xx / 401 `IDENTITY_UNVERIFIED`
+spend the per-event budget (`maxAttempts` 50, `_sendoraAttempts` in the persisted event, stripped before send);
+offline / breaker / 429 / challenge do not. `after` = the server's wait → `holdUntil` (≤ 1 h): no flush starts
+before it. Sent events are removed by IDENTITY (in-memory `Queued.id`) — positional removal deleted unsent events
+when `add()` trimmed at `maxSize` mid-flight. `flushEvents` sends a single event > 30 KB to `/events/batch` (the
+`/events` cap is 32 KB). `trackScreen` refuses names > 128 chars (eventType was already capped by `eventPattern`).
+A 201 whose `data.rejected[i]` is an identity refusal (`code == "IDENTITY_UNVERIFIED"`, else a code-less row whose
+`reason` contains "identity", case-insensitive — `APIClient.identityRejectedIndices`) → `.acceptedExcept(retry:)`:
+those events stay, spend ONE attempt (answered-transient, like the identity 401) and are skipped for the rest of that
+flush (`deferredThisFlush`, else they'd be resent at once until their budget ran out); every other row is removed, by
+identity. "Unanswered" (never spends) = no response / transport timeout / 429 / challenge / Cloudflare 520–527 and
+530 — the same set as RN / web / Android (408 is answered).
+**Round 3 (second review).** The queue has its OWN full-jitter backoff (`applyBackoff`: `random(0, min(300 s,
+1 s·2^(n-1)))` after EVERY retry-later, a server wait raises the floor, `noteSuccess` resets it); `performFlush` starts
+nothing before `holdUntil`, including the flushes `add()` triggers past `flushAt` — events go through
+`requestWithDetails`, which never trips the breaker on 500 / 502 / 504, so a 5xx outage re-sent the head chunk on every
+`trackEvent`. Bisection is bounded: `bisectLimit` stays halved until a SUCCESS, then doubles back toward 100; one flush
+makes at most `maxPostsPerFlush` (20) POSTs, then backs off. Three answered 5xx in a row on the SAME multi-event chunk
+(by id set) halve it (`serverErrorBisectAfter`); a lone event follows the 50-attempt budget (it blocks the events behind
+it until then — the normal head rule). The identity token is attached at SEND time (`EventQueue.decorator` →
+`SendoraCloud.decorateForSend`: only on an event whose `userId` is the identified user), never stored, and counted in
+the 60 KB cap. ⚠ Pre-existing, NOT changed: `saveEventQueue` strips `userId` and nothing restores it after a relaunch, so
+a persisted event loses its user (and so gets no token).
+(3) A challenge on any auth call is `.network` (retryable): never dead, never a wipe (choke point = `APIClient`).
+(4) `knownDeviceToken`: `sendora_auth_known_devices` (Keychain, in `secureKeys`), `[{k: sha256(normalised email), t,
+at}]`, newest 20, ≤ 2048. **Survives signOut AND the RESET row** (rule on all four SDKs); `deleteAccount` removes THAT
+account's entry (`commitForgetKnownDevice`, email read before the DELETE). Writes only via +Commit (INV-1). Sent/saved
+in `performSwitch` only (every `/login` goes through it); `/mfa/challenge` files under the `/login` address
+(`pendingMfaEmails`, ≤ 8), else the response user's email. Never logged.
+(5) Push: `Authorization: Bearer` when a session exists; the token lookup is bounded (`tokenTimeout` 5 s, `OnceGate`)
+— then it registers without. (6) Links: `LinkCreateResult.revokeToken`; `sendora_link_revoke_tokens` (Keychain, 200);
+`revoke(shortcode:)` sends it; `revoke(shortcode:revokeToken:completion:)` (NOT defaulted — a default makes
+`revoke(shortcode:) { _ in }` ambiguous) → `LinkRevokeResult { shortcode, final }`; forgotten on 2xx, kept on 403.
+(7) `support.getUnreadCount` → `APIClient.get` (was `URLSession.shared`).
+
+**Why.** Backend s58.402 guarantees the wait; Cloudflare challenges reached the auth taxonomy as 403
+`invalidCredential`; a poison event wedged the queue forever; F23 / F53 / F34 need the device to send the proof.
+
+**Guards.** `ResponseContractTests.swift` (24) + `SurfaceHardeningTests.swift` (12); harness `StubResponse` gained
+`headers` / `rawBody`. `swift build` + `swift test` **93 / 93** (Swift 6.4), iOS-Simulator `xcodebuild` green.
+Mutations (`scratchpad/mutate560b.py`: cp backup → edit → `swift test` → restore → byte-compare), all red
+(failures / 93, the whole set re-run after round 3; backups named `sdkios560_<M>_bak_<path>`):
+
+| # | Mutation | Red |
+|---|---|---|
+| M01 | 429 records success (breaker reset) again | 7 |
+| M02 | ignore the Retry-After header | 13 |
+| M03 | ignore details.retryAfterSeconds | 2 |
+| M04 | no 1 h cap on the server wait | 2 |
+| M05 | a challenge does not hold the breaker | 1 |
+| M06 | details path delivers a challenge as its 403 | 9 |
+| M07 | plain path hands the challenge body to the caller | 1 |
+| M08 | fixed doubling instead of full jitter | 8 |
+| M09 | a plain 4xx trips the breaker | 8 |
+| M10 | queue: 429 counted as delivered | 3 |
+| M11 | queue: permanent 4xx retried (old behaviour) | 25 |
+| M12 | queue: rejected chunk kept at the head | 20 |
+| M13 | queue: no per-event attempt cap | 3 |
+| M14 | queue: offline / challenge spend the budget | 3 |
+| M15 | queue: budget field sent on the wire | 1 |
+| M16 | queue: chunks of 1000 | 1 |
+| M17 | knownDeviceToken never sent | 3 |
+| M18 | knownDeviceToken cleared by signOut | 8 |
+| M19 | email not normalised | 3 |
+| M20 | MFA token not filed under the /login address | 1 |
+| M21 | RESET row clears the known-device token | 1 |
+| M22 | email stored in plaintext | 1 |
+| M23 | no 20-account cap | 5 |
+| M24 | push registered without the Bearer | 1 |
+| M25 | links: revokeToken not persisted | 3 |
+| M26 | links: stored token not sent | 1 |
+| M27 | links: token not forgotten on success | 2 |
+| M28 | links: `final` not read from the answer | 1 |
+| M29 | links: no 200 cap | 5 |
+| M30 | support badge back on URLSession.shared | 5 |
+| M31 | a 429 holds the whole client for the full wait | 3 |
+| M32 | no 60 KB chunk cap | 3 |
+| M33 | no bisection of a refused multi-event chunk | 7 |
+| M34 | bisect every 4xx (incl. 401) | 2 |
+| M35 | 401 IDENTITY_UNVERIFIED treated as permanent | 1 |
+| M36 | sent events removed by position | 6 |
+| M37 | queue ignores the server wait | 14 |
+| M38 | deleteAccount keeps that account's token | 1 |
+| M39 | deleteAccount removes every account's token | 1 |
+| M40 | push waits for the token forever | 2 |
+| M41 | 201 identity rows treated as delivered | 6 |
+| M42 | no reason fallback for a code-less row | 5 |
+| M43 | reason fallback case-sensitive | 5 |
+| M44 | kept identity rows spend no attempt | 1 |
+| M45 | kept identity rows resent in the same flush | 5 |
+| M46 | partial 201 keeps the whole chunk | 2 |
+| M47 | row code ignored (reason decides) | 3 |
+| M48 | queue has no backoff of its own | 14 |
+| M49 | backoff not reset by a success | 1 |
+| M50 | no 300 s backoff cap | 2 |
+| M51 | a server wait does not raise the backoff floor | 1 |
+| M52 | decorator never applied (no send-time token) | 1 |
+| M53 | token on any user's event | 1 |
+| M54 | decoration not counted in the byte cap | 1 |
+| M55 | no 5xx bisection | 2 |
+| M56 | 5xx bisection on the first failure | 1 |
+| M57 | halved cap reset every flush | 2 |
+| M58 | halved cap never doubles back | 1 |
+| M59 | halved cap jumps straight back to 100 | 1 |
+| M60 | no per-flush POST cap | 2 |
+| M61 | Cloudflare 52x / 530 counted as answered | 9 |
+| M62 | a nil `projectId` serialised as `null` on events (/ 96) | 2 |
+| M63 | install report builds `projectId` from the optional again (/ 96) | 1 |
+
+**LIVE run against STAGING (`Tests/SendoraCloudTests/LiveStagingTests.swift`).** Skipped unless `SENDORA_LIVE=1`
+(offline `swift test` = 96, 1 skipped). Real `URLSession` (the SDK's own session config), real `APIClient` /
+`EventQueue` / `SendoraCloudAuth` / `SendoraCloudLinks` / `SendoraCloudPush`; in-memory stores (no Keychain). Host
+pinned to `api-dev.sendoracloud.com`; key from `SENDORA_PK`, refused unless `pk_dev_`; the recorder keeps statuses,
+counts, sizes and response-header values only. Run:
+`set -a; . ../../.env.e2e.local; set +a; SENDORA_LIVE=1 swift test --filter LiveStagingTests`.
+10/10 PASS (2026-10-18): 250 events → 3 × 201 (100/100/50, max 36 KB); 12 × 8 KB → 2 posts (57.9 KB, 41.4 KB); one 70 KB
+event → `201/10, 413/1, 201/10`; one 200-char eventType → bisected `422/21 … 422/1` then 201s, 20/20 accepted, 10
+posts; signUp→signIn sends `knownDeviceToken`, SHA-256-keyed, RESET keeps it, `deleteAccount` 200 `purged` removes
+it; push 201 with Bearer; link create → `revokeToken` stored → revoke sent it → 200 `final: true`; a real ingest 429
+(`RateLimit-Policy: "ingest";q=200;w=60`, `Retry-After` 1–2 s) → no POST inside the wait, 0 attempts, refresh out in
+1 s, delivered after 2 s.
+⚠⚠ **Bug the live run found (every earlier test was green): a nil `projectId` went out as JSON `null`.** `projectId`
+is optional since 3.0.0; a nil `String?` in `[String: Any]` bridges to `NSNull`, and the schema is
+`z.string().uuid().optional()` — absent passes, `null` is `422 events.0.projectId: Expected string, received null`.
+So an app configured with the key only NEVER delivered an event (≤ 5.5 retried them forever; 5.6.0's
+permanent-refusal rule would have bisected and DELETED all of them — the first live run did exactly that, 260 POSTs
+for 250 events). Fixed in `buildEvent` (now the one event builder, used by `trackEvent` and the live test),
+`/attribution/install` and `/attribution/deferred`. Guards `test_anEventWithoutAProjectIdOmitsTheField_neverSendsNull`
+(behavioural) + a source pin on the two body literals. ⚠ Lesson: a stub transport accepts any body; only a real
+server's zod schema could see this. ⚠ The 60 s whole-client 429 clamp was NOT exercised live with a long wait
+(staging's ingest Retry-After was 1–2 s); it is unit-tested only.
+⚠ M01–M61 ran before the live test existed (93 tests, no skip); M62/M63 against 96 with the runner's regex fixed to
+read "with 1 test skipped and N failures" (the old regex silently read a per-suite line — "0 failures / 12").
+⚠ M21's first form (forget AFTER `commitClear`) was a no-op mutation and stayed green — `current` is already nil
+there; re-run inserted before the clear → red. ⚠ Not test-covered: the `trackScreen` 128-char guard and the
+> 30 KB single-event routing (both need `configure()`'s static state). ⚠ A one-off extra red on
+`test_everyTransitionRowIsReplayed` under a loaded machine did not reproduce; M18's conformance hit is real.
+
 ## 5.5.0 — Support parity with RN 1.42.0 (s58.376)
 
 `SendoraCloudSupport.swift` is now split: the API half compiles on EVERY platform (so `swift test` on macOS covers

@@ -1,5 +1,51 @@
 # Changelog
 
+## 5.6.0 — the server's wait is honoured, Cloudflare challenges are never refusals, a poison event no longer blocks the queue
+
+Additive; no frozen key, header or route changed. One NEW public overload, one new optional property.
+
+- **`Retry-After` is honoured.** A 503 (overload) keeps every SDK call off the network for the server's wait
+  (`Retry-After`, else `error.details.retryAfterSeconds`; capped at 1 hour). A 429 (one lane's budget) holds the whole
+  client for at most 60 s — a quota 429 that asks until the month resets must not block sign-in or token refresh — and
+  the full wait (≤ 1 h) pauses only the event queue. A 429 used to RESET the breaker. Backoff after a failure is now full jitter (`random(0, min(60 s, 2^n s))`), so devices that
+  failed together no longer retry together. A plain 4xx still never trips the breaker.
+- **Cloudflare challenges** (`cf-mitigated: challenge`, a 403 or 503 from Cloudflare, not the API) are treated as "the
+  request did not arrive": a retryable `.network` error, held ≥ 60 s. A challenge can no longer end a session or be read
+  as a wrong password.
+- **Event queue.** Chunks are ≤ 100 events AND ≤ 60 KB (the batch route refuses bodies over 64 KB). A 400 / 413 / 422
+  on a multi-event chunk is halved and resent, so only the one bad event is dropped; other permanent refusals (401 /
+  403 / 404 …) drop the chunk — it used to be retried forever and every event behind it was never delivered. A 429 is no
+  longer counted as delivered. A transient failure (offline, 408, 429, 5xx, a challenge, 401 `IDENTITY_UNVERIFIED`)
+  keeps the events, and so does an event a 201 batch answer lists as an identity refusal
+  (`data.rejected[i].code == "IDENTITY_UNVERIFIED"`) — the rest of that batch is removed; each event may fail 50 times on a server answer (408 / 5xx / `IDENTITY_UNVERIFIED`) before it is
+  dropped — offline time, 429s and challenges never spend that budget. Sent events are removed by identity (an event
+  trimmed at the queue cap mid-flight can no longer cost an unsent one). A single event over 30 KB goes to
+  `/events/batch` (the `/events` cap is 32 KB). `trackScreen` refuses a name over 128 characters (it 400'd the batch).
+- **The event queue backs off on its own** — full jitter, 1 s doubling to 5 min, after every failed delivery (a
+  server's wait raises the floor), reset by a delivered send; no flush starts before it, including the ones
+  `trackEvent` triggers. During a 5xx outage every tracked event used to re-send the same head chunk. A refused chunk
+  stays halved until a send succeeds (then doubles back), one flush makes at most 20 requests, and three 5xx answers in
+  a row for the same multi-event chunk halve it too, so one event the server always fails on cannot hold 99 others.
+  Cloudflare's 520–527 / 530 (origin unreachable) never spend an event's budget.
+- **Identity token attached when sent, not when tracked.** An event queued before `identify()` handed over a token now
+  carries it; the token is no longer written to the persisted queue. (It counts toward the 60 KB chunk limit.)
+- **Password sign-in remembers this device.** The `knownDeviceToken` `/auth-service/login` and `/mfa/challenge` return
+  is kept per account (Keychain, keyed by a hash of the address, newest 20) and sent on the next sign-in for that address,
+  so an account under a password-guessing attack still admits its owner's phone. Survives `signOut()` and the reset;
+  `deleteAccount()` removes that account's entry.
+- **Push tokens are proven.** `push.registerToken` sends the player's access token (`Authorization: Bearer`) when a
+  session exists, so the backend can bind the device to the player. Without a session — or if the token takes over
+  5 s (a refresh on a bad network) — it registers exactly as before.
+- **Links: final revokes.** `LinkCreateResult.revokeToken` (new, optional). The SDK keeps it per shortcode (Keychain,
+  newest 200) and `revoke(shortcode:)` sends it, which makes the revoke final; it is forgotten on success. New
+  `revoke(shortcode:revokeToken:completion:)` → `LinkRevokeResult { shortcode, final }`.
+- **Fix (found by the live staging run): events from an app configured without `projectId` were all refused.** A
+  missing project id was sent as JSON `null`, which the server rejects (422) — so with the key-only setup documented
+  since 3.0.0 no event was ever delivered. It is now omitted (the key identifies the project); the same fix applies to
+  the install and deferred-link reports.
+- **Fix:** `support.getUnreadCount` went out on `URLSession.shared` — without the API key, the SDK headers, pinning or
+  the no-cookies session. It now uses the SDK's own client.
+
 ## 5.5.0 — Support: the player's own conversations, verified reporter, ticket context, theming
 
 Parity with RN 1.42.0 (s58.376, asked for by Sudoku Hurdle). Additive; nothing existing changes shape.

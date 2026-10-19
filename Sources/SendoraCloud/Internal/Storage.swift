@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 // MARK: - Store backends
 //
@@ -138,10 +139,30 @@ final class SendoraStorage {
         "sendora_auth_user",
     ]
 
+    /// 5.6.0 (F67 / backend F23) — the `knownDeviceToken` each password sign-in
+    /// returns, per account, sent back on the next `/auth-service/login` for that
+    /// address (it exempts this device from the account-wide guessing-attack
+    /// refusal). A DEVICE credential, not a session: deliberately NOT in
+    /// `clearAuthTokens()` (it survives `signOut`).
+    /// Keychain tier; entries keyed by SHA-256 of the normalised email (no
+    /// address at rest), newest first, at most `knownDevicesMax`. Survives the RESET
+    /// row too; `deleteAccount` removes that account's entry.
+    static let knownDevicesKey = "sendora_auth_known_devices"
+    static let knownDevicesMax = 20
+    static let knownDeviceTokenMaxLength = 2048
+
+    /// 5.6.0 (backend F34) — shortcode → the mint's `revokeToken` (`lrt_…`), which
+    /// makes a `links.revoke` FINAL. Only the device that minted a link holds it.
+    /// Keychain tier (a capability), NOT an auth key; at most `linkRevokeTokensMax`.
+    static let linkRevokeTokensKey = "sendora_link_revoke_tokens"
+    static let linkRevokeTokensMax = 200
+    static let linkRevokeTokenMaxLength = 200
+
     /// The CLOSED set of Keychain keys this SDK may write. The auth machine's
     /// recording double asserts every secure write lands on one of these.
     static let secureKeys: [String] =
         ["sendora_user_id", "sendora_device_id"] + frozenAuthKeys + [authSessionKey] + heldSlotKeys
+        + [knownDevicesKey, linkRevokeTokensKey]
 
     init() {
         let defaults = UserDefaults(suiteName: "com.sendora.sdk") ?? .standard
@@ -308,6 +329,99 @@ final class SendoraStorage {
         guard SendoraStorage.heldSlotKeys.indices.contains(index) else { return }
         let key = SendoraStorage.heldSlotKeys[index]
         if let v = json { secure.set(key, v) } else { secure.delete(key) }
+    }
+
+    // MARK: - Known-device tokens (5.6.0, Keychain-backed, survives signOut)
+
+    private struct KnownDevice: Codable {
+        /// SHA-256 hex of the normalised email.
+        let k: String
+        let t: String
+        let at: Int64
+    }
+
+    /// The backend's `normalizeEmail`: trim + lowercase.
+    static func normaliseEmail(_ email: String) -> String {
+        return email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func emailKey(_ email: String) -> String {
+        let digest = SHA256.hash(data: Data(normaliseEmail(email).utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func loadKnownDevices() -> [KnownDevice] {
+        guard let json = secure.get(SendoraStorage.knownDevicesKey), let data = json.data(using: .utf8),
+              let list = try? JSONDecoder().decode([KnownDevice].self, from: data) else { return [] }
+        return list
+    }
+
+    /// The token the last password sign-in for `email` returned on this device, or nil.
+    func knownDeviceToken(forEmail email: String) -> String? {
+        let key = Self.emailKey(email)
+        guard let t = loadKnownDevices().first(where: { $0.k == key })?.t,
+              !t.isEmpty, t.count <= SendoraStorage.knownDeviceTokenMaxLength else { return nil }
+        return t
+    }
+
+    /// Remember (or replace) `email`'s token, newest first, keeping at most 20 accounts.
+    /// Only `SendoraCloudAuth.commitKnownDeviceToken` calls this (INV-1).
+    func setKnownDeviceToken(_ token: String, forEmail email: String, atMs: Int64) {
+        guard !token.isEmpty, token.count <= SendoraStorage.knownDeviceTokenMaxLength else { return }
+        let key = Self.emailKey(email)
+        var list = loadKnownDevices().filter { $0.k != key }
+        list.insert(KnownDevice(k: key, t: token, at: atMs), at: 0)
+        if list.count > SendoraStorage.knownDevicesMax { list = Array(list.prefix(SendoraStorage.knownDevicesMax)) }
+        guard let data = try? JSONEncoder().encode(list), let json = String(data: data, encoding: .utf8) else { return }
+        secure.set(SendoraStorage.knownDevicesKey, json)
+    }
+
+    func forgetKnownDeviceToken(forEmail email: String) {
+        let key = Self.emailKey(email)
+        let list = loadKnownDevices()
+        let kept = list.filter { $0.k != key }
+        guard kept.count != list.count else { return }
+        if kept.isEmpty { secure.delete(SendoraStorage.knownDevicesKey); return }
+        guard let data = try? JSONEncoder().encode(kept), let json = String(data: data, encoding: .utf8) else { return }
+        secure.set(SendoraStorage.knownDevicesKey, json)
+    }
+
+    // MARK: - Link revoke tokens (5.6.0, Keychain-backed)
+
+    private struct LinkRevokeToken: Codable {
+        let s: String
+        let t: String
+    }
+
+    private func loadLinkRevokeTokens() -> [LinkRevokeToken] {
+        guard let json = secure.get(SendoraStorage.linkRevokeTokensKey), let data = json.data(using: .utf8),
+              let list = try? JSONDecoder().decode([LinkRevokeToken].self, from: data) else { return [] }
+        return list
+    }
+
+    private func saveLinkRevokeTokens(_ list: [LinkRevokeToken]) {
+        if list.isEmpty { secure.delete(SendoraStorage.linkRevokeTokensKey); return }
+        guard let data = try? JSONEncoder().encode(list), let json = String(data: data, encoding: .utf8) else { return }
+        secure.set(SendoraStorage.linkRevokeTokensKey, json)
+    }
+
+    func linkRevokeToken(forShortcode shortcode: String) -> String? {
+        return loadLinkRevokeTokens().first(where: { $0.s == shortcode })?.t
+    }
+
+    /// Newest first; the oldest is forgotten past 200 links.
+    func setLinkRevokeToken(_ token: String, forShortcode shortcode: String) {
+        guard !token.isEmpty, token.count <= SendoraStorage.linkRevokeTokenMaxLength, !shortcode.isEmpty else { return }
+        var list = loadLinkRevokeTokens().filter { $0.s != shortcode }
+        list.insert(LinkRevokeToken(s: shortcode, t: token), at: 0)
+        if list.count > SendoraStorage.linkRevokeTokensMax { list = Array(list.prefix(SendoraStorage.linkRevokeTokensMax)) }
+        saveLinkRevokeTokens(list)
+    }
+
+    func forgetLinkRevokeToken(forShortcode shortcode: String) {
+        let list = loadLinkRevokeTokens()
+        let kept = list.filter { $0.s != shortcode }
+        if kept.count != list.count { saveLinkRevokeTokens(kept) }
     }
 
     // MARK: - Event queue (PII-stripped)

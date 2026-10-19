@@ -124,15 +124,64 @@ extension SendoraCloudAuth {
         if let unsettled = settleUnknownIfNeeded() { return .failure(unsettled) }
         awaitRefreshInflight()
         let (previous, cas) = snapshotForAttempt()
+        // 5.6.0 (F67 / backend F23): EVERY `/login` body is built here, so this is
+        // the one place the device's `knownDeviceToken` for that address is sent.
+        var body = body
+        let deviceEmail = knownDeviceEmail(path: path, body: body)
+        if path == Self.passwordLoginPath, let email = deviceEmail,
+           let token = storage.knownDeviceToken(forEmail: email) {
+            body["knownDeviceToken"] = token
+        }
         let rich = requestSync(method: "POST", path: path, body: body)
         if let err = parseError(rich) { return .failure(err) }
-        if let data = rich.body?["data"] as? [String: Any],
+        let data = rich.body?["data"] as? [String: Any]
+        // Filed under the address it was minted for. An `/mfa/challenge` whose
+        // `/login` ran in another process falls back to the account's own email.
+        var tokenEmail = deviceEmail
+        if tokenEmail == nil, path == Self.mfaChallengePath {
+            tokenEmail = (data?["user"] as? [String: Any])?["email"] as? String
+        }
+        if let email = tokenEmail, !email.isEmpty,
+           let token = data?["knownDeviceToken"] as? String, !token.isEmpty {
+            commitKnownDeviceToken(email: email, token: token)
+        }
+        if let data = data,
            data["mfaRequired"] as? Bool == true,
            let challengeToken = data["mfaChallengeToken"] as? String {
+            if path == Self.passwordLoginPath, let email = deviceEmail { rememberMfaEmail(challengeToken: challengeToken, email: email) }
             let userId = ((data["user"] as? [String: Any])?["id"] as? String) ?? ""
             return .success(.mfaRequired(challengeToken: challengeToken, userId: userId))
         }
+        if path == Self.mfaChallengePath, let challengeToken = body["challengeToken"] as? String {
+            forgetMfaEmail(challengeToken: challengeToken)
+        }
         return installSwitchResponse(rich.body, previous: previous, cas: cas)
+    }
+
+    internal static let passwordLoginPath = "/auth-service/login"
+    internal static let mfaChallengePath = "/auth-service/mfa/challenge"
+
+    /// The address a `knownDeviceToken` belongs to: the `/login` body's email, or
+    /// the email of the `/login` that issued this `/mfa/challenge` token.
+    private func knownDeviceEmail(path: String, body: [String: Any]) -> String? {
+        if path == Self.passwordLoginPath { return (body["email"] as? String).flatMap { $0.isEmpty ? nil : $0 } }
+        if path == Self.mfaChallengePath, let challengeToken = body["challengeToken"] as? String {
+            lock.lock(); defer { lock.unlock() }
+            return pendingMfaEmails.first(where: { $0.challengeToken == challengeToken })?.email
+        }
+        return nil
+    }
+
+    private func rememberMfaEmail(challengeToken: String, email: String) {
+        lock.lock(); defer { lock.unlock() }
+        pendingMfaEmails.removeAll { $0.challengeToken == challengeToken }
+        pendingMfaEmails.append((challengeToken, email))
+        if pendingMfaEmails.count > 8 { pendingMfaEmails.removeFirst(pendingMfaEmails.count - 8) }
+    }
+
+    private func forgetMfaEmail(challengeToken: String) {
+        lock.lock(); defer { lock.unlock() }
+        pendingMfaEmails.removeAll { $0.challengeToken == challengeToken }
     }
 
     /// Apply a sign-in response: validate → await refresh at commit → sid-CAS →

@@ -376,30 +376,24 @@ public final class SendoraCloudSupport: @unchecked Sendable {
         widgetId: String,
         completion: @escaping (Int) -> Void
     ) {
-        guard !widgetId.isEmpty else { completion(0); return }
+        guard !widgetId.isEmpty, let client = client else { completion(0); return }
         tokenProvider { token in
             guard let token = token, !token.isEmpty else {
                 DispatchQueue.main.async { completion(0) }
                 return
             }
-            // 5.5.0: the CONFIGURED API base (this was always production).
-            let url = self.apiBaseUrl
-                .appendingPathComponent("/api/v1/widgets")
-                .appendingPathComponent(widgetId)
-                .appendingPathComponent("/my-tickets/unread-count")
-            var req = URLRequest(url: url)
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            req.timeoutInterval = 10
-            URLSession.shared.dataTask(with: req) { data, _, _ in
+            // 5.6.0: through the SDK's `APIClient` like every other call — it went out
+            // on `URLSession.shared`, i.e. with NO `X-API-Key` / SDK headers, the shared
+            // cookie jar, no pinning and outside the breaker.
+            client.get(path: Self.myTicketsPath(widgetId) + "/unread-count", headers: ["Authorization": "Bearer \(token)"]) { json in
                 var count = 0
-                if let data = data,
-                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let inner = obj["data"] as? [String: Any],
+                if json?["success"] as? Bool == true,
+                   let inner = json?["data"] as? [String: Any],
                    let n = inner["count"] as? Int {
                     count = n
                 }
                 DispatchQueue.main.async { completion(count) }
-            }.resume()
+            }
         }
     }
 }

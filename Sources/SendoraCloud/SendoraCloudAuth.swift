@@ -548,6 +548,10 @@ public final class SendoraCloudAuth {
     private var proactiveAppActiveObserver: NSObjectProtocol?
     internal var lastSignedInCauseValue: SendoraCloudAuthSignedInCause?
     internal var lastSignedOutEndReasonValue: SendoraCloudRefreshEndReason?
+    /// 5.6.0: `mfaChallengeToken` → the email its `/login` was for, so the
+    /// `knownDeviceToken` an `/mfa/challenge` returns is filed under the right
+    /// account. Memory only, on `opsQueue`, at most 8 entries.
+    internal var pendingMfaEmails: [(challengeToken: String, email: String)] = []
 
     internal struct LimboRecord {
         var refreshToken: String

@@ -44,9 +44,20 @@ public enum SendoraCloudPushError: Error {
 @MainActor
 public final class SendoraCloudPush {
     private let client: APIClient
+    /// 5.6.0: the signed-in player's access token, or nil. A seam for tests;
+    /// production reads `SendoraCloud.auth` (built after this object).
+    private let accessTokenProvider: (@escaping (String?) -> Void) -> Void
+    /// 5.6.0: the longest registration waits for the token (a refresh on a bad network)
+    /// before it registers WITHOUT the Bearer.
+    private let tokenTimeout: TimeInterval
 
-    init(client: APIClient) {
+    init(client: APIClient, accessTokenProvider: ((@escaping (String?) -> Void) -> Void)? = nil, tokenTimeout: TimeInterval = 5) {
         self.client = client
+        self.tokenTimeout = tokenTimeout
+        self.accessTokenProvider = accessTokenProvider ?? { done in
+            guard let auth = SendoraCloud.auth else { done(nil); return }
+            auth.getAccessToken(completion: done)
+        }
     }
 
     /// Register an APNs device token with Sendora. Token is bound to the
@@ -84,7 +95,28 @@ public final class SendoraCloudPush {
         body["timezone"] = timezone ?? TimeZone.current.identifier
         body["appVersion"] = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
 
-        client.post(path: "/push/tokens", body: body) { response in
+        // 5.6.0 (backend F53): the player's own Bearer is what PROVES whose device
+        // this is (a body `userId` from a publishable key is only a hint, and a
+        // project in `enforce` skips unproven devices on user-addressed sends).
+        // Best-effort: no session → registered exactly as before, unproven.
+        let once = OnceGate()
+        let client = self.client
+        let proceed: (String?) -> Void = { accessToken in
+            guard once.claim() else { return }
+            let headers = accessToken.flatMap { $0.isEmpty ? nil : ["Authorization": "Bearer \($0)"] }
+            Self.register(client: client, body: body, headers: headers, completion: completion)
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + tokenTimeout) { proceed(nil) }
+        accessTokenProvider { proceed($0) }
+    }
+
+    private nonisolated static func register(
+        client: APIClient,
+        body: [String: Any],
+        headers: [String: String]?,
+        completion: @escaping (Result<String, SendoraCloudPushError>) -> Void
+    ) {
+        client.post(path: "/push/tokens", body: body, headers: headers) { response in
             guard let response = response else {
                 completion(.failure(.invalidResponse))
                 return
@@ -125,6 +157,18 @@ public final class SendoraCloudPush {
             "action": clickAction ?? "body",
         ]
         client.post(path: "/push/track-open", body: body) { _ in }
+    }
+}
+
+/// First caller wins (the token or the timeout).
+private final class OnceGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }
 

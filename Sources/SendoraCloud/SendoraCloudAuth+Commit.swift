@@ -472,6 +472,20 @@ extension SendoraCloudAuth {
         storage.pendingMintKey = key
     }
 
+    /// 5.6.0 (F67 / backend F23): file the `knownDeviceToken` a password sign-in
+    /// (or MFA completion) returned under its account. A device credential, not
+    /// session state — no listener, no state change, and `commitClear` never
+    /// touches it (it survives `signOut`). Never logged.
+    internal func commitKnownDeviceToken(email: String, token: String) {
+        storage.setKnownDeviceToken(token, forEmail: email, atMs: nowMs())
+    }
+
+    /// `deleteAccount` removes THAT account's entry. Nothing else clears the map:
+    /// it survives `signOut` AND the RESET row (the rule on all four SDKs).
+    internal func commitForgetKnownDevice(email: String) {
+        storage.forgetKnownDeviceToken(forEmail: email)
+    }
+
     internal func setLastSignedInCause(_ cause: SendoraCloudAuthSignedInCause) {
         lock.lock()
         lastSignedInCauseValue = cause

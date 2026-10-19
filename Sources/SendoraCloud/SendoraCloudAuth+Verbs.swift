@@ -685,6 +685,7 @@ extension SendoraCloudAuth {
                 completion(.failure(SendoraCloudAuthError.unauthorized("deleteAccount requires a signed-in user")))
                 return
             }
+            let deletedEmail: String? = { self.lock.lock(); defer { self.lock.unlock() }; return self.current?.user.email }()
             let rich = self.requestSync(method: "DELETE", path: "/auth-service/me", body: nil, headers: ["Authorization": "Bearer \(token)"])
             if rich.statusCode == 0 {
                 completion(.failure(SendoraCloudAuthError.network("deleteAccount failed (network error)")))
@@ -703,6 +704,8 @@ extension SendoraCloudAuth {
             // Account is gone / deactivated server-side — clear local identity,
             // keep the held guests, suppress their auto-restore (test 9).
             self.commitClear(reason: .accountDeleted, suppressHeldAutoRestore: true)
+            // 5.6.0: that account's known-device token goes with it (every other account's stays).
+            if let email = deletedEmail { self.commitForgetKnownDevice(email: email) }
             var failed: [String] = []
             if alsoDiscardHeldGuests {
                 for held in self.heldSlotsNewestFirst() {

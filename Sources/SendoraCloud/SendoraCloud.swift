@@ -178,12 +178,16 @@ public final class SendoraCloud {
             self.apiClient = client
 
             let queue = EventQueue(storage: store, flushAt: finalConfig.flushAt, maxSize: finalConfig.maxQueueSize)
+            queue.decorator = { event in
+                let (uid, token) = serialQueue.sync { (currentUserId, currentIdentityToken) }
+                return decorateForSend(event, currentUserId: uid, identityToken: token)
+            }
             queue.setFlushHandler { events, completion in
                 // Gate flushes on consent. Report `true` so the queue treats a
                 // consent-gated chunk as handled (it's intentionally not sent;
                 // re-queuing forever would never drain).
                 if !consent.isGranted {
-                    completion(true)
+                    completion(.accepted)
                     return
                 }
                 flushEvents(events, client: client, completion: completion)
@@ -226,7 +230,8 @@ public final class SendoraCloud {
             self._links = SendoraCloudLinks(
                 client: client,
                 bundleId: Bundle.main.bundleIdentifier,
-                linkHosts: finalConfig.linkHosts
+                linkHosts: finalConfig.linkHosts,
+                storage: store
             )
 
         }
@@ -413,7 +418,8 @@ public final class SendoraCloud {
         }
 
         DispatchQueue.global(qos: .utility).async {
-            var body: [String: Any] = ["projectId": config.projectId]
+            var body: [String: Any] = [:]
+            if let projectId = config.projectId { body["projectId"] = projectId } // never `null` (see buildEvent)
             body["deviceId"] = storage.deviceId
 
             client.post(path: "/attribution/deferred", body: body) { response in
@@ -447,31 +453,20 @@ public final class SendoraCloud {
             return
         }
 
-        var event: [String: Any] = [
-            "projectId": config.projectId,
-            "module": "custom",
-            "eventType": name,
-            "timestamp": isoFormatter.string(from: Date()),
-            "properties": properties ?? [:],
-            "context": [
-                "device": deviceContext?.toDictionary() ?? [:],
-                "sdk": ["name": sdkName, "version": sdkVersion],
-            ],
-            "sessionId": storage?.sessionId ?? "",
-            // Reflect the SDK's actual (boolean) consent state rather than
-            // stamping a constant claim. The flush gate only sends events
-            // while granted, so this is just an honest in-payload record.
-            "consent": consent.isGranted ? ["analytics"] : [],
-        ]
-        if let uid = currentUserId {
-            event["userId"] = uid
-        } else if let anonId = storage?.deviceId {
-            // No identified user yet — attach the stable Keychain device id
-            // as anonymousId so the backend can stitch pre-identify activity
-            // to the user once identify() runs (events.ts `anonymousId`).
-            event["anonymousId"] = anonId
-        }
-        if let tok = currentIdentityToken { event["identityToken"] = tok }
+        let event = buildEvent(
+            name: name,
+            properties: properties,
+            projectId: config.projectId,
+            device: deviceContext?.toDictionary() ?? [:],
+            sessionId: storage?.sessionId ?? "",
+            consentGranted: consent.isGranted,
+            userId: currentUserId,
+            anonymousId: currentUserId == nil ? storage?.deviceId : nil,
+            timestamp: Date()
+        )
+        // 5.6.0: the identity token is attached at SEND time (`decorateForSend`), not here — an event queued
+        // before `identify()` handed over a token could otherwise never gain one, and the token would be
+        // written into the persisted queue.
 
         queue.add(event: event)
     }
@@ -484,6 +479,11 @@ public final class SendoraCloud {
     /// the data stays clean.
     public static func trackScreen(_ name: String, properties: [String: Any]? = nil) {
         guard isConfigured, let config = config else { return }
+        // 5.6.0: the backend refuses a name over 128 characters (it would 400 the whole batch).
+        guard !name.isEmpty, name.count <= 128 else {
+            SendoraCloudLogger.shared.error("trackScreen: name must be 1-128 characters — not tracked")
+            return
+        }
         // Flush the previous screen's foreground span, then start the new one.
         if config.autoTrackEngagement { engFlush() }
         var props = properties ?? [:]
@@ -595,13 +595,13 @@ public final class SendoraCloud {
         // signals only (see the compliance note at init). Removing it here is the
         // silent-default fix; App Review scrutinises exactly this on-first-launch,
         // pre-ATT transmission.
-        let body: [String: Any] = [
-            "projectId": config.projectId,
+        var body: [String: Any] = [
             "deviceId": storage.deviceId,
             "appVersion": deviceContext?.appVersion ?? "",
             "os": "iOS",
             "osVersion": deviceContext?.osVersion ?? "",
         ]
+        if let projectId = config.projectId { body["projectId"] = projectId } // never `null` (see buildEvent)
         client.post(path: "/attribution/install", body: body) { _ in }
     }
 
@@ -615,28 +615,78 @@ public final class SendoraCloud {
         trackEvent("session.ended", properties: ["sessionId": storage?.sessionId ?? ""])
     }
 
+    /// The wire shape of one tracked event (what `trackEvent` queues). A seam so the live staging test sends
+    /// exactly what an app sends.
+    internal static func buildEvent(
+        name: String,
+        properties: [String: Any]?,
+        projectId: String?,
+        device: [String: Any],
+        sessionId: String,
+        consentGranted: Bool,
+        userId: String?,
+        anonymousId: String?,
+        timestamp: Date
+    ) -> [String: Any] {
+        var event: [String: Any] = [
+            "module": "custom",
+            "eventType": name,
+            "timestamp": isoFormatter.string(from: timestamp),
+            "properties": properties ?? [:],
+            "context": [
+                "device": device,
+                "sdk": ["name": sdkName, "version": sdkVersion],
+            ],
+            "sessionId": sessionId,
+            // Reflect the SDK's actual (boolean) consent state rather than
+            // stamping a constant claim. The flush gate only sends events
+            // while granted, so this is just an honest in-payload record.
+            "consent": consentGranted ? ["analytics"] : [],
+        ]
+        // ⚠ 5.6.0 (found by the live staging run): `projectId` is OPTIONAL since 3.0.0, and a nil `String?`
+        // stored in `[String: Any]` serialises as JSON `null` (Optional bridges to NSNull). The schema is
+        // `z.string().uuid().optional()` — absent is fine, `null` is a 422 — so an app configured with the key
+        // only had EVERY event refused. The key binding supplies the project; omit the field.
+        if let projectId = projectId { event["projectId"] = projectId }
+        if let uid = userId {
+            event["userId"] = uid
+        } else if let anonId = anonymousId {
+            // No identified user yet — attach the stable Keychain device id
+            // as anonymousId so the backend can stitch pre-identify activity
+            // to the user once identify() runs (events.ts `anonymousId`).
+            event["anonymousId"] = anonId
+        }
+        return event
+    }
+
+    /// The CURRENT identity token goes on an event only when the event is that identified user's.
+    internal static func decorateForSend(_ event: [String: Any], currentUserId: String?, identityToken: String?) -> [String: Any] {
+        guard let token = identityToken, !token.isEmpty, let uid = currentUserId,
+              let eventUser = event["userId"] as? String, eventUser == uid else { return event }
+        var e = event
+        e["identityToken"] = token
+        return e
+    }
+
     /// Send one chunk of events (already capped at <=100 by EventQueue) and
-    /// report whether the backend ACCEPTED it. The queue only drops events on
-    /// `true`; `false` keeps them buffered for the next flush so nothing is
-    /// lost on an offline / 4xx / 5xx response.
-    private static func flushEvents(
+    /// report what the backend made of it (5.6.0: accepted / permanently
+    /// rejected / retry later — see `APIClient.DeliveryOutcome`). The queue keeps
+    /// the chunk only on `retryLater`.
+    internal static func flushEvents(
         _ events: [[String: Any]],
         client: APIClient,
-        completion: @escaping (Bool) -> Void
+        completion: @escaping (APIClient.DeliveryOutcome) -> Void
     ) {
         guard !events.isEmpty else {
-            completion(true)
+            completion(.accepted)
             return
         }
-        if events.count == 1, let event = events.first {
-            client.post(path: "/events", body: event) { response in
-                let success = (response?["success"] as? Bool) ?? false
-                completion(success)
-            }
+        // `/events` caps its body at 32 KB, `/events/batch` at 64 KB: a single large event goes as a batch of one.
+        if events.count == 1, let event = events.first,
+           ((try? JSONSerialization.data(withJSONObject: event).count) ?? 0) <= 30_000 {
+            client.postEvents(path: "/events", body: event, completion: completion)
         } else {
-            client.postBatch(path: "/events/batch", events: events) { success in
-                completion(success)
-            }
+            client.postBatch(path: "/events/batch", events: events, completion: completion)
         }
     }
 }
