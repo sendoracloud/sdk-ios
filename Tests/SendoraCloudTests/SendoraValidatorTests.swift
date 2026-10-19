@@ -16,6 +16,15 @@ final class SendoraValidatorTests: XCTestCase {
         XCTAssertThrowsError(try SendoraCloudValidator.validateApiKey("pk_short"))
     }
 
+    /// s58.405: the message said "17+ chars" while the pattern needs `pk_` + 16 (19+).
+    func test_malformedKeyMessageMatchesThePattern() {
+        XCTAssertNoThrow(try SendoraCloudValidator.validateApiKey("pk_" + String(repeating: "a", count: 16)))
+        XCTAssertThrowsError(try SendoraCloudValidator.validateApiKey("pk_" + String(repeating: "a", count: 15))) { error in
+            guard case SendoraError.invalidApiKey(let message) = error else { return XCTFail("\(error)") }
+            XCTAssertEqual(message, "expected pk_ followed by 16+ letters, digits, _ or - (19+ chars)")
+        }
+    }
+
     func test_rejectsHttpUrl() {
         XCTAssertThrowsError(try SendoraCloudValidator.validateApiUrl("http://api.sendoracloud.com"))
     }

@@ -5,6 +5,11 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+
+## 5.7.1 (s58.405) — built, not published
+
+`saveEventQueue` no longer strips `userId` / `properties.traits` (nothing ever restored them; a restored identified event went out with neither `userId` nor `anonymousId` and never got its send-time token) and removes any `identityToken` as a belt; old files decode with `userId` absent. Key error says 19+ chars (was "17+"). Guard `PersistedQueueIdentityTests.swift` (4; re-adding the strip → 5 red) + `test_malformedKeyMessageMatchesThePattern`; `swift test` 113 (3 skipped).
+
 ## 5.7.0 — server consent + feature flags, with identify()'s identityToken
 
 **What.** `SendoraCloud.consent.record(purpose:granted:entityId:userId:email:source:identityToken:)` →
@@ -654,7 +659,7 @@ Sendora.consent.grant() / revoke()
 
 - `SendoraValidator` refuses `sk_` keys, non-HTTPS URLs, bad event names, deep props.
 - userId + deviceId in Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`).
-- Event queue persisted with PII stripped.
+- Event queue persisted as sent (s58.405: `userId` kept; the identity token never written).
 - `handleDeepLink` host-allowlists via `config.linkHosts`.
 
 ## Push action buttons (s58.18)

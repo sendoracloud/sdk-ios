@@ -487,22 +487,32 @@ final class SendoraStorage {
         if kept.count != list.count { saveLinkRevokeTokens(kept) }
     }
 
-    // MARK: - Event queue (PII-stripped)
+    // MARK: - Event queue
 
-    /// Persist events to disk. `userId` and `traits` are stripped — they'll be
-    /// repopulated from `currentUserId` when the queue is flushed.
+    /// Persist events to disk exactly as they will be sent (plus the queue's own
+    /// `_sendoraAttempts`, stripped at send time).
+    ///
+    /// ⚠ s58.405: this used to strip `userId` (and a `properties.traits` key),
+    /// claiming they would be "repopulated from `currentUserId` when the queue is
+    /// flushed". Nothing ever did that, and it could not be right anyway — the
+    /// user at flush time is not necessarily the user who produced the event. An
+    /// identified event carries `userId` INSTEAD of `anonymousId`, so a restored
+    /// event went out with NEITHER (unattributed) and could never get its send-time
+    /// identity token (`decorateForSend` matches on `userId`). The strip never
+    /// covered `identify()`'s traits either: they are the `properties` of
+    /// `user.identified`, not a `traits` key. The identity token is never
+    /// stored — it is attached at send time only, and removed here as a belt.
+    /// Backward compatible: a file written by ≤ 5.7.0 simply has no `userId`
+    /// (decodes as absent → nil), exactly what those builds sent.
     func saveEventQueue(_ events: [[String: Any]]) {
-        let stripped = events.map { event -> [String: Any] in
+        let persisted = events.map { event -> [String: Any] in
+            guard event["identityToken"] != nil else { return event }
             var e = event
-            e.removeValue(forKey: "userId")
-            if var props = e["properties"] as? [String: Any] {
-                props.removeValue(forKey: "traits")
-                e["properties"] = props
-            }
+            e.removeValue(forKey: "identityToken")
             return e
         }
         do {
-            let data = try JSONSerialization.data(withJSONObject: stripped)
+            let data = try JSONSerialization.data(withJSONObject: persisted)
             plain.setData(data, forKey: "sendora_event_queue")
         } catch {
             SendoraCloudLogger.shared.error("Failed to save event queue: \(error)")

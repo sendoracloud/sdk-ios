@@ -40,7 +40,7 @@ enum SendoraCloudValidator {
             )
         }
         if key.range(of: keyPattern, options: .regularExpression) == nil {
-            throw SendoraError.invalidApiKey("expected pk_... (17+ chars)")
+            throw SendoraError.invalidApiKey("expected pk_ followed by 16+ letters, digits, _ or - (19+ chars)")
         }
     }
 

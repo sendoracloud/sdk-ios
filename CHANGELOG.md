@@ -1,5 +1,18 @@
 # Changelog
 
+## 5.7.1 — queued events keep their user across a relaunch
+
+- **License: Apache-2.0.** The package now ships the full license text in `LICENSE` (none shipped before).
+
+- **Fix: events queued before a relaunch keep their user.** The saved event queue dropped `userId`. An identified
+  event carries `userId` instead of `anonymousId`, so an event restored after a relaunch was sent with neither
+  (attributed to no one), and it could never get the identity token from `identify(…, identityToken:)`, which is
+  attached when the event is sent and only to that user's events. The queue is now saved exactly as it will be
+  sent; a `traits` key inside an event's properties is no longer removed either. The identity token is still never
+  written to disk. A queue saved by an older version still loads (its events simply have no `userId`, as before).
+- The invalid-key error now states the real minimum: `expected pk_ followed by 16+ letters, digits, _ or -
+  (19+ chars)` (it said "17+ chars"; which keys are accepted is unchanged).
+
 ## 5.7.0 — server consent + feature flags, with identify()'s identity token
 
 Additive; nothing existing changes shape.

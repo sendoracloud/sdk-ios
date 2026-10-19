@@ -17,7 +17,7 @@ Choose **Up to Next Major Version**, with the current release as the minimum.
 Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.7.0"),
+.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.7.1"),
 ```
 
 ### Upgrading from 4.x
