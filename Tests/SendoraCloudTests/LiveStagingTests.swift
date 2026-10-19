@@ -26,6 +26,8 @@ final class LiveStagingTests: XCTestCase {
         let hasBearer: Bool
         let hasKnownDeviceToken: Bool
         let hasRevokeToken: Bool
+        var hasIdentityToken: Bool = false
+        var bodyUserId: String? = nil
         let at: Date
     }
 
@@ -51,7 +53,9 @@ final class LiveStagingTests: XCTestCase {
                               dataCount: ((json?["data"] as? [String: Any])?["count"] as? NSNumber)?.intValue,
                               errorCode: (json?["error"] as? [String: Any])?["code"] as? String,
                               hasBearer: bearer, hasKnownDeviceToken: body?["knownDeviceToken"] != nil,
-                              hasRevokeToken: body?["revokeToken"] != nil, at: Date())
+                              hasRevokeToken: body?["revokeToken"] != nil,
+                              hasIdentityToken: body?["identityToken"] != nil,
+                              bodyUserId: body?["userId"] as? String, at: Date())
                 self?.lock.lock(); self?.recs.append(rec); self?.lock.unlock()
                 completion(data, http, error)
             }
@@ -62,28 +66,32 @@ final class LiveStagingTests: XCTestCase {
         var count: Int { snapshot().count }
     }
 
+    final class Flag { private let l = NSLock(); private var v = false
+        var isSet: Bool { l.lock(); defer { l.unlock() }; return v }
+        func set() { l.lock(); v = true; l.unlock() } }
+
     // MARK: - Setup
 
     private var apiKey = ""
+    private var base = ""
     private var transport: LiveTransport!
     private var client: APIClient!
     private var results: [(String, Bool, String)] = []
 
     override func setUpWithError() throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["SENDORA_LIVE"] == "1", "live staging test: set SENDORA_LIVE=1")
-        let key = ProcessInfo.processInfo.environment["SENDORA_PK"] ?? ""
-        guard key.hasPrefix("pk_dev_") else {
-            throw XCTSkip("SENDORA_PK must be a staging pk_dev_ key (refusing anything else, incl. pk_prod_ / pk_live_)")
-        }
-        apiKey = key
+        let cfg = try LiveEnv.require()     // SENDORA_LIVE=1, staging host only, no prod/live key
+        apiKey = cfg.apiKey
+        base = cfg.base
         transport = LiveTransport()
-        client = APIClient(baseUrl: Self.base, apiKey: apiKey, transport: transport)
+        client = APIClient(baseUrl: cfg.base, apiKey: apiKey, transport: transport)
     }
 
+    /// Scenario `"<n><sub> …"` reports contract step `T<n>` (a sub-case that fails fails the step).
     private func report(_ name: String, _ ok: Bool, _ evidence: String) {
         results.append((name, ok, evidence))
-        print("LIVE \(ok ? "PASS" : "FAIL") \(name) — \(evidence)")
-        if !ok { XCTFail("\(name): \(evidence)") }
+        let digits = name.prefix(while: { $0.isNumber })
+        LiveReport.shared.record("T\(digits)", pass: ok, detail: "\(name): \(evidence)")
+        if !ok { XCTFail("\(name): \(LiveReport.scrub(evidence))") }
     }
 
     private func waitUntil(_ timeout: TimeInterval, poll: TimeInterval = 0.2, _ cond: () -> Bool) -> Bool {
@@ -134,6 +142,7 @@ final class LiveStagingTests: XCTestCase {
         scenarioLargeEvents()
         scenarioBadEventAmongGood()
         scenarioAuthLinksPush()
+        scenarioConsentAndFlags()
         scenarioRateLimit()
         print("LIVE SUMMARY " + results.map { "\($0.0)=\($0.1 ? "PASS" : "FAIL")" }.joined(separator: " "))
     }
@@ -287,6 +296,47 @@ final class LiveStagingTests: XCTestCase {
                "DELETE=\(delRec?.status ?? 0) status=\(delStatus) kdtRemoved=\(gone) authStatus=\(auth.status())")
     }
 
+    // 8. Server consent + flags carry identify()'s token for the identified user, never for another userId.
+    // (The token cannot be a VALID HMAC here — that needs the project's identity secret — so the server answers
+    // "unproven"; T8 proves the four routes accept the SDK's bodies and which body carried the token.)
+    private func scenarioConsentAndFlags() {
+        let uid = "f67-live-ios-\(UUID().uuidString.prefix(8).lowercased())"
+        let identity = SendoraIdentitySnapshot(currentUserId: uid, tokenUserId: uid,
+                                               token: "hmac_v1:" + String(repeating: "0", count: 64))
+        let flags = SendoraCloudFlags(client: client, identity: { identity })
+        let consent = SendoraCloudConsent(initial: false)
+        consent.attach(client: client, identity: { identity })
+        let mark = transport.count
+        var errors: [String] = []
+        func run<T>(_ label: String, _ op: @escaping () async throws -> T) -> T? {
+            let sem = DispatchSemaphore(value: 0)
+            var out: T?
+            // Detached: the test method runs on the main actor, which this semaphore blocks.
+            Task.detached {
+                do { out = try await op() } catch let e as SendoraCloudAPIError { errors.append("\(label) \(e.status) \(e.code)") } catch { errors.append("\(label) \(error)") }
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 30)
+            return out
+        }
+        let rec = run("consent.record") { try await consent.record(purpose: .analytics, granted: false, userId: uid, source: "f67-live-ios") }
+        let del = run("consent.requestDeletion") { try await consent.requestDeletion(userId: uid, reason: "f67 live test (no data)") }
+        let one = run("flags.evaluate") { try await flags.evaluate(key: "f67_live_ios_missing_flag") }
+        let all = run("flags.evaluateAll") { try await flags.evaluateAll() }
+        let other = run("flags.evaluate(other user)") { try await flags.evaluate(key: "f67_live_ios_missing_flag", userId: uid + "-other") }
+        let recs = transport.since(mark)
+        func r(_ suffix: String) -> [Rec] { recs.filter { $0.path.hasSuffix(suffix) } }
+        let carried = r("/consent/record").first?.hasIdentityToken == true && r("/consent/deletion-request").first?.hasIdentityToken == true
+            && r("/feature-flags/evaluate").first?.hasIdentityToken == true && r("/feature-flags/evaluate-all").first?.hasIdentityToken == true
+        let otherRec = r("/feature-flags/evaluate").last
+        let notForOther = otherRec?.bodyUserId == uid + "-other" && otherRec?.hasIdentityToken == false
+        let statuses = recs.map { "\($0.path.components(separatedBy: "/").suffix(2).joined(separator: "/")) \($0.status)" }
+        report("8 consent+flags identityToken",
+               errors.isEmpty && rec != nil && del != nil && one != nil && all != nil && other != nil && carried && notForOther
+                   && recs.allSatisfy { (200..<300).contains($0.status) },
+               "statuses=\(statuses) tokenOnIdentified=\(carried) tokenOnOtherUser=\(!notForOther) record.sourceVerified=\(rec?.sourceVerified.map(String.init) ?? "-") deletion.status=\(del?.status ?? "-") flag.reason=\(one?.reason ?? "-") flags=\(all?.count ?? -1) errors=\(errors)")
+    }
+
     // 4. Real 429 on the ingest lane.
     private func scenarioRateLimit() {
         // A guest session first, so a NON-event call (token refresh) can be timed while the lane is held.
@@ -300,40 +350,47 @@ final class LiveStagingTests: XCTestCase {
             Thread.sleep(forTimeInterval: 2.5)
         }
         // Exhaust the lane with raw (cheap, invalid) batch posts on a SEPARATE client — the SDK client's breaker
-        // must only learn of the 429 from its own request.
-        let raw = APIClient(baseUrl: Self.base, apiKey: apiKey, transport: transport)
-        var got429: Rec?
-        let mark = transport.count
-        let group = DispatchGroup()
-        for _ in 0..<12 where got429 == nil {
-            for _ in 0..<30 {
-                group.enter()
-                raw.requestWithDetails(method: "POST", path: "/events/batch", body: ["events": []]) { _ in group.leave() }
+        // must only learn of the 429 from its own request. Staging's ingest lane refills in ~1 s, so the queue
+        // flushes the moment a 429 is seen, and the whole round is retried if the lane refilled first.
+        var policy = "-"
+        var q: EventQueue!
+        var qMark = 0
+        var firstPost: Rec?
+        for _ in 0..<4 {
+            // Continuous pressure (~50 req/s against a lane that refills ~3.3/s) until the queue's own post lands.
+            let stop = Flag()
+            let pressure = Thread {
+                while !stop.isSet {
+                    // A fresh client per request: one client's own breaker would stop the pressure at the first 429.
+                    APIClient(baseUrl: self.base, apiKey: self.apiKey, transport: self.transport)
+                        .requestWithDetails(method: "POST", path: "/events/batch", body: ["events": []]) { _ in }
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
             }
-            group.wait()
-            got429 = transport.since(mark).first { $0.status == 429 && $0.path == "/events/batch" }
+            let mark = transport.count
+            pressure.start()
+            let saw429 = waitUntil(20) { transport.since(mark).contains { $0.status == 429 && $0.eventCount == 0 } }
+            if let hit = transport.since(mark).first(where: { $0.status == 429 }) { policy = hit.rateLimitPolicy ?? "-" }
+            guard saw429 else { stop.set(); continue }
+            q = queue()
+            q.add(event: event("f67_live_ios_after429"))
+            qMark = transport.count
+            q.flush()
+            _ = waitUntil(15) { ingestRecs(transport.since(qMark)).contains { $0.eventCount == 1 } }
+            stop.set()
+            firstPost = ingestRecs(transport.since(qMark)).first { $0.eventCount == 1 }
+            if firstPost?.status == 429 { break }
+            _ = waitUntil(5) { q.count == 0 }
         }
-        guard let first429 = got429 else {
-            return report("4 rate limit", false, "no 429 after \(transport.since(mark).count) raw posts")
-        }
-        let policy = first429.rateLimitPolicy ?? "-"
-
-        // The SDK queue meets the 429.
-        let q = queue()
-        q.add(event: event("f67_live_ios_after429"))
-        let qMark = transport.count
-        q.flush()
-        _ = waitUntil(15) { ingestRecs(transport.since(qMark)).count >= 1 }
-        let firstPost = ingestRecs(transport.since(qMark)).first
         guard let fp = firstPost, fp.status == 429, let waitSec = fp.retryAfter.flatMap({ Int($0) }) else {
-            return report("4 rate limit", false, "the queue's first post was \(firstPost?.status ?? 0), not a 429 (lane recovered: \(policy))")
+            return report("4 rate limit", false, "the queue never met a 429 in 6 rounds (last first-post \(firstPost?.status ?? 0), \(policy))")
         }
         let held = client.breakerOpenUntil.timeIntervalSince(fp.at)
         let attempts = (q.snapshot.first?[EventQueue.attemptsKey] as? NSNumber)?.intValue ?? 0
         // Flushes inside the wait send nothing.
         for _ in 0..<5 { q.flush(); Thread.sleep(forTimeInterval: 0.3) }
         // Requests the queue sent AFTER the 429 and before its Retry-After ran out (must be none).
-        let postsDuringWait = ingestRecs(transport.since(qMark)).dropFirst().filter { $0.at < fp.at.addingTimeInterval(Double(waitSec) - 0.2) }.count
+        let postsDuringWait = ingestRecs(transport.since(qMark)).filter { $0.eventCount == 1 }.dropFirst().filter { $0.at < fp.at.addingTimeInterval(Double(waitSec) - 0.2) }.count
 
         // A non-event call while the lane is held: the client must let it out within 60 s.
         var refreshAt: Date?
@@ -350,7 +407,7 @@ final class LiveStagingTests: XCTestCase {
 
         // Delivered after the wait.
         let delivered = waitUntil(Double(waitSec) + 90, poll: 1) { q.flush(); return q.count == 0 }
-        let okPost = ingestRecs(transport.since(qMark)).first { (200..<300).contains($0.status) }
+        let okPost = ingestRecs(transport.since(qMark)).first { (200..<300).contains($0.status) && $0.eventCount == 1 }
         let gap = okPost.map { $0.at.timeIntervalSince(fp.at) } ?? -1
         report("4 rate limit",
                delivered && gap >= Double(waitSec) - 1 && attempts == 0 && postsDuringWait == 0 && held <= 61

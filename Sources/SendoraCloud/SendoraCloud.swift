@@ -41,6 +41,9 @@ public final class SendoraCloud {
     private static var deviceContext: DeviceContext?
     internal static var currentUserId: String?
     private static var currentIdentityToken: String?
+    /// 5.7.0: the user `currentIdentityToken` was issued for — a token only ever travels with THAT userId (auth can
+    /// later switch `currentUserId` to someone else without clearing the token).
+    private static var identityTokenUserId: String?
     private static var isConfigured = false
 
     // --- Engagement time (foreground-only, Wave 75) ---
@@ -82,6 +85,15 @@ public final class SendoraCloud {
     /// `deviceContext()` — every platform (5.5.0); plus, on iOS, the hosted contact form and ticket history
     /// (`presentContactWidget(widgetId:from:)`, `presentTicketHistory(widgetId:from:)`).
     public private(set) static var support: SendoraCloudSupport?
+    /// 5.7.0: server feature flags (`evaluate` / `evaluateAll`). `nil` until `configure()`.
+    public private(set) static var flags: SendoraCloudFlags?
+
+    /// The identity identify() established, read at call time (never persisted).
+    internal static func identitySnapshot() -> SendoraIdentitySnapshot {
+        serialQueue.sync {
+            SendoraIdentitySnapshot(currentUserId: currentUserId, tokenUserId: identityTokenUserId, token: currentIdentityToken)
+        }
+    }
 
     /// iOS Live Activities helper (iOS 16.1+, ActivityKit). Wired on
     /// configure(). Use as `SendoraCloud.liveActivities?.track(activity:...)`.
@@ -179,8 +191,10 @@ public final class SendoraCloud {
 
             let queue = EventQueue(storage: store, flushAt: finalConfig.flushAt, maxSize: finalConfig.maxQueueSize)
             queue.decorator = { event in
-                let (uid, token) = serialQueue.sync { (currentUserId, currentIdentityToken) }
-                return decorateForSend(event, currentUserId: uid, identityToken: token)
+                // 5.7.0: only the user the token was issued for, while still identified.
+                let id = identitySnapshot()
+                let proven = (id.tokenUserId != nil && id.tokenUserId == id.currentUserId) ? id.tokenUserId : nil
+                return decorateForSend(event, currentUserId: proven, identityToken: proven == nil ? nil : id.token)
             }
             queue.setFlushHandler { events, completion in
                 // Gate flushes on consent. Report `true` so the queue treats a
@@ -194,6 +208,10 @@ public final class SendoraCloud {
             }
             queue.startTimer(interval: finalConfig.flushInterval)
             self.eventQueue = queue
+
+            // 5.7.0: server consent + flags on the same client, with identify()'s identity.
+            consent.attach(client: client, identity: { identitySnapshot() })
+            self.flags = SendoraCloudFlags(client: client, identity: { identitySnapshot() })
 
             // 5.5.0: every platform, and the CONFIGURED API base (support calls always went to production).
             self.support = SendoraCloudSupport(
@@ -265,6 +283,7 @@ public final class SendoraCloud {
                     self.serialQueue.sync {
                         self.currentUserId = nil
                         self.currentIdentityToken = nil
+                        self.identityTokenUserId = nil
                         store.cachedUserId = nil
                         if effects.rotateDeviceId {
                             store.regenerateDeviceId()
@@ -284,6 +303,7 @@ public final class SendoraCloud {
                     self.serialQueue.sync {
                         self.currentUserId = nil
                         self.currentIdentityToken = nil
+                        self.identityTokenUserId = nil
                     }
                 }
             )
@@ -548,6 +568,7 @@ public final class SendoraCloud {
         serialQueue.sync {
             currentUserId = userId
             currentIdentityToken = options?.identityToken
+            identityTokenUserId = options?.identityToken == nil ? nil : userId
             storage?.cachedUserId = userId
         }
         trackEvent("user.identified", properties: traits)
@@ -578,6 +599,7 @@ public final class SendoraCloud {
         serialQueue.sync {
             currentUserId = nil
             currentIdentityToken = nil
+            identityTokenUserId = nil
             storage?.cachedUserId = nil
             storage?.regenerateDeviceId()
             storage?.sessionId = UUID().uuidString

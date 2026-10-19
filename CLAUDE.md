@@ -5,6 +5,87 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 > ⚠ **ADR-023 frozen contract.** UserDefaults/Keychain keys (`sendora_*`), the `X-Sendora-SDK-{Name,Version}` headers, and the `sendora_schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. The version lives ONLY in `SDKVersion.swift`. Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+## 5.7.0 — server consent + feature flags, with identify()'s identityToken
+
+**What.** `SendoraCloud.consent.record(purpose:granted:entityId:userId:email:source:identityToken:)` →
+`POST /consent/record`, `requestDeletion(entityId:userId:email:reason:identityToken:)` → `POST /consent/deletion-request`
+(methods ADDED to the same `SendoraCloudConsent`; `grant()` / `revoke()` / `isGranted` untouched — `attach(client:identity:)`
+wires the server half at `configure()`). `SendoraCloud.flags?.evaluate(key:userId:entityId:environment:identityToken:)` /
+`evaluateAll(…)` (`SendoraCloudFlags.swift`). All `async throws` → `SendoraCloudAPIError(code, status, message,
+retryAfterSeconds)`: a non-2xx / `success:false` / offline / unconfigured is THROWN, never nil. Bodies omit nil fields.
+**Real server shapes** (found here and by the Android port; RN's types say `{value, variant, reason}` keyed by flag — wrong):
+`evaluate` → `data: {key, value, ruleMatched}`, `evaluate-all` → `data: [{key, value, ruleMatched}]`, decoded into
+`SendoraFlagValue(key, value: SendoraJSONValue, variant (only if sent), reason: ruleMatched)` and a `[key: SendoraFlagValue]`
+map (a map is tolerated too). `SendoraJSONValue` keeps a JSON bool a bool (CFBoolean check).
+**Token rule** (`SendoraIdentityRequest.identityToken`, port of RN `withInputIdentityToken`, one function): explicit wins
+as given; else identify()'s token only when the call's userId (flags: default = identified user; consent: explicit
+`userId` only, as RN) equals the user the token was ISSUED FOR (`identityTokenUserId`, new, memory only) AND the
+current user, and it fits the route (flags ≤ 128, consent ≤ 256). `reset()` / an identity clear drop both. ⚠ This is
+stricter than RN: auth's `onIdentityChange` switches `currentUserId` without clearing the token, so RN/old iOS could pair
+user A's token with user B; the event decorator now uses the same snapshot.
+**Guards.** `IdentityRequestsTests.swift` (6): rule table, flags/consent bodies + decoding, error mapping. 103 / 103
+offline (2 live skipped). Mutations (`scratchpad/mutate570.py`, backups `sdkios570_<M>_bak_<path>`), all red / 103:
+
+| # | Mutation | Red |
+|---|---|---|
+| M64 | an explicit identityToken does not win | 2 |
+| M65 | the remembered token goes with ANY userId | 4 |
+| M66 | the token's own user is not checked | 1 |
+| M67 | no route length limit | 1 |
+| M68 | flags limit 256 instead of 128 | 2 |
+| M69 | flags do not default to the identified user | 3 |
+| M70 | nil fields sent as null | 4 |
+| M71 | a refusal returns an empty answer | 3 |
+| M72 | the server code is dropped | 2 |
+| M73 | evaluateAll does not decode the server array | 1 |
+| M74 | reason not read from `ruleMatched` | 2 |
+| M75 | a JSON bool decoded as a number | 1 |
+| M76 | `consent.record` never sends the token | 1 |
+
+⚠ Not unit-tested (need `configure()`'s statics): `identify()` recording `identityTokenUserId`, and the event decorator's
+switch to the snapshot. **Live T8** (`LiveStagingTests.scenarioConsentAndFlags`): record 201, deletion 201, evaluate 200,
+evaluate-all 200, evaluate for another userId 200; the token rode the four identified bodies and NOT the other-user one.
+The token is a placeholder (a valid HMAC needs the project's identity secret), so staging answers unproven
+(`sourceVerified:false`, deletion `unconfirmed`) — T8 proves routing + which body carried it, not verification.
+Full live run 2026-10-19: 29/29 required steps (A/B/W1/T1–T8), `judgeLiveRun` ok, `sdkReportedVersion` 5.7.0.
+README: "Consent + feature flags (5.7.0)" section (snippet gate green; a broken label in it fails the gate — checked).
+
+**5.7.0 pre-publish consumer test (iOS Simulator, real Keychain) — three fixes.**
+(1) ⚠⚠ **Device-id race, pre-existing since 4/2026.** `SendoraStorage.deviceId` was `get` → `set` with no lock.
+On a fresh install `reportInstallIfNeeded` (background queue) and `app.opened` (main) both missed, both minted, the
+loser's add failed `-25299` and it KEPT its unsaved UUID: a request trace in a consumer app showed
+`/attribution/install` with one id and `/events` with another (HEAD `9020007b`). Never visible on macOS — the live
+gate runs on in-memory stores. Now: one process-wide `deviceIdLock` (all `SendoraStorage`s share one Keychain);
+`SendoraSecureStore.addIfAbsent` (add-only, never delete-then-add; `.added | .duplicate | .failed(OSStatus)`, an
+extension default for in-memory doubles); `.duplicate` → re-read and ADOPT the stored id; `.failed` (e.g.
+`errSecInteractionNotAllowed` before first unlock) → `unsavedDeviceId` memo, reused and retried until a write lands
+(a readable stored id always wins; `regenerateDeviceId` clears it). Same consumer trace after: ONE id across
+install + events + batch on 4 of 4 fresh installs (`simctl keychain reset` + reinstall each time); relaunch restores
+the same user. Key name unchanged (ADR-023). ⚠ A HOSTLESS `xcodebuild test` bundle has no keychain entitlement (every
+add is -34018), so `test_realKeychain_…` skips there — the real-Keychain proof is the consumer-app run.
+(2) Flaky `test_everyTransitionRowIsReplayed` on the simulator only (4/12 red, macOS 0/12): `TestJWT.make` serialised
+the header/claims without `.sortedKeys`, so two tokens from the same claims could differ byte-wise. Test-only fix;
+simulator 12/12 green after.
+(3) `SendoraCloudPush.init` is `nonisolated` (it only stores constants; `configure()` builds it inside
+`serialQueue.sync`, off main) and `accessTokenProvider` is `@Sendable` (internal init — no public API change). The
+`SendoraCloud.swift:242` ActorIsolatedCall warning is gone; consumer-app `push.registerToken` → 201 after.
+**Guards.** `DeviceIdTests.swift` (5; a Keychain-semantics double with widened read→add windows): 50 concurrent
+callers on two storages → one id, persisted; injected duplicate → adopts; unwritable Keychain → one id, then that
+same id is stored; regenerate; real Keychain (iOS, hosted only). `swift test` 108 (3 skipped: 2 live + real-Keychain),
+simulator `xcodebuild test` 108 (3 skipped) 12/12 green, live `swift test --filter Live` 29/29 on macOS after the fix.
+Mutations (`scratchpad/mutate570b.py`, backups `sdkios570_<M>_bak_<path>`, restored byte-identical), red / 107:
+
+| # | Mutation | Red |
+|---|---|---|
+| M77 | the device-id lock removed | 3 |
+| M78 | -25299 keeps its own unsaved id | 1 |
+| M79 | the pre-5.7.0 get-then-set (no lock, overwrite) | 10 |
+| M80 | no memo: an unwritable Keychain mints per call | 3 |
+
+⚠ M77 is caught ONLY by the unwritable-Keychain test (3/3 runs): with the Keychain working, `.duplicate` → adopt
+already yields one id, so the 50-caller test stays green without the lock. The lock is what keeps the memo path to one
+id. ⚠ Not test-covered: the push isolation fix (a compiler diagnostic — verified by the build log, not a test).
+
 ## 5.6.0 — the response contract, client half (audit F67, backend s58.402; + adversarial review)
 
 **What.** (1) `APIClient`: `Retry-After` (delta-seconds or HTTP-date, else `error.details.retryAfterSeconds`) on a
@@ -139,6 +220,18 @@ posts; signUp→signIn sends `knownDeviceToken`, SHA-256-keyed, RESET keeps it, 
 it; push 201 with Bearer; link create → `revokeToken` stored → revoke sent it → 200 `final: true`; a real ingest 429
 (`RateLimit-Policy: "ingest";q=200;w=60`, `Retry-After` 1–2 s) → no POST inside the wait, 0 attempts, refresh out in
 1 s, delivered after 2 s.
+**Live-run gate (contract 2, `scripts/e2e/live-run-contract.mjs`; suite `swift test --filter Live`).**
+`LiveLifecycleTests.swift` ports `scripts/e2e/auth-lifecycle.mts` (A1–A7, B1–B5, W1-a/b/c/d/g/g2/e, B8, B9) onto the
+iOS public API over a COOKIE-KEEPING `URLSession` (`.default` + its own `HTTPCookieStorage` — the phone condition;
+W1-a asserts the jar holds the ACCOUNT's `sd_rt`); `LiveStagingTests` reports T1–T7. `LiveReport.swift` (shared) =
+the guard (`LiveEnv.require`: `SENDORA_LIVE=1`, host `api-dev.sendoracloud.com` only, no `pk_|sk_(prod|live)_`) and the
+result file (`SENDORA_LIVE_RESULT`, rewritten after every step; `sdkReportedVersion` = `SendoraCloud.sdkVersion` at
+runtime; details scrubbed of JWT / key / email shapes). Fail-fast per step like the reference; created accounts are
+deleted. Run 2026-10-19: **28/28 required steps pass**, `judgeLiveRun` ok. iOS readings: W1-g's 409 `CONFLICT`
+surfaces as the frozen pre-4.13 case `.emailAlreadyTaken` (no `code` / `status` on that case — by design, though the
+`status` doc comment "nil when the request never reached the server" over-promises); B8 uses a fresh instance (iOS
+has no cross-instance rehydrate after W1-e's `discardWithheld`). T4 needs continuous raw pressure (a fresh client per
+request — one client's own breaker stops at the first 429) because staging's ingest lane refills ~3.3/s.
 ⚠⚠ **Bug the live run found (every earlier test was green): a nil `projectId` went out as JSON `null`.** `projectId`
 is optional since 3.0.0; a nil `String?` in `[String: Any]` bridges to `NSNull`, and the schema is
 `z.string().uuid().optional()` — absent passes, `null` is `422 events.0.projectId: Expected string, received null`.

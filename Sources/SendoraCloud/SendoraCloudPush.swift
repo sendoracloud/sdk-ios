@@ -46,12 +46,14 @@ public final class SendoraCloudPush {
     private let client: APIClient
     /// 5.6.0: the signed-in player's access token, or nil. A seam for tests;
     /// production reads `SendoraCloud.auth` (built after this object).
-    private let accessTokenProvider: (@escaping (String?) -> Void) -> Void
+    private let accessTokenProvider: @Sendable (@escaping (String?) -> Void) -> Void
     /// 5.6.0: the longest registration waits for the token (a refresh on a bad network)
     /// before it registers WITHOUT the Bearer.
     private let tokenTimeout: TimeInterval
 
-    init(client: APIClient, accessTokenProvider: ((@escaping (String?) -> Void) -> Void)? = nil, tokenTimeout: TimeInterval = 5) {
+    /// `nonisolated` (5.7.0): `configure()` builds this inside `serialQueue.sync`, off the main actor. The init
+    /// only stores constants — no main-actor state — so it needs no hop (and `configure()` never blocks on main).
+    nonisolated init(client: APIClient, accessTokenProvider: (@Sendable (@escaping (String?) -> Void) -> Void)? = nil, tokenTimeout: TimeInterval = 5) {
         self.client = client
         self.tokenTimeout = tokenTimeout
         self.accessTokenProvider = accessTokenProvider ?? { done in

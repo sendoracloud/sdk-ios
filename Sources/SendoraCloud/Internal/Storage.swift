@@ -15,6 +15,24 @@ protocol SendoraSecureStore: AnyObject {
     func get(_ key: String) -> String?
     func set(_ key: String, _ value: String)
     func delete(_ key: String)
+    /// 5.7.0 — write ONLY if the key is absent (never delete-then-add). `.duplicate` = someone else's value is
+    /// already stored; the caller must re-read and adopt it (Keychain `errSecDuplicateItem`, -25299).
+    func addIfAbsent(_ key: String, _ value: String) -> SendoraSecureAddResult
+}
+
+enum SendoraSecureAddResult: Equatable {
+    case added
+    case duplicate
+    case failed(OSStatus)
+}
+
+extension SendoraSecureStore {
+    /// Default for in-memory doubles: models the Keychain's add semantics on top of get/set.
+    func addIfAbsent(_ key: String, _ value: String) -> SendoraSecureAddResult {
+        if get(key) != nil { return .duplicate }
+        set(key, value)
+        return .added
+    }
 }
 
 /// The non-sensitive tier (UserDefaults in production).
@@ -79,6 +97,24 @@ final class KeychainSecureStore: SendoraSecureStore {
             kSecAttrService as String: service,
         ]
         SecItemDelete(query as CFDictionary)
+    }
+
+    func addIfAbsent(_ key: String, _ value: String) -> SendoraSecureAddResult {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecAttrService as String: service,
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        switch status {
+        case errSecSuccess: return .added
+        case errSecDuplicateItem: return .duplicate
+        default:
+            SendoraCloudLogger.shared.error("Keychain add failed for key=\(key) status=\(status)")
+            return .failed(status)
+        }
     }
 }
 
@@ -236,18 +272,45 @@ final class SendoraStorage {
         }
     }
 
+    /// 5.7.0 — one lock for every `SendoraStorage` in the process (they share one Keychain), so read-then-create
+    /// is atomic. Before, the first launch's concurrent callers (attribution on a background queue, `app.opened` on
+    /// main, the first `trackEvent`) each minted a UUID; the loser's add failed with -25299 and it kept sending an
+    /// id that was never stored — two anonymous ids in the install's first session.
+    private static let deviceIdLock = NSLock()
+    /// An id the Keychain refused to store (e.g. before first unlock). Reused — and retried — until a write
+    /// lands, so every caller in this process still sees ONE id. A readable stored id always wins.
+    private static var unsavedDeviceId: String?
+
     var deviceId: String {
+        Self.deviceIdLock.lock(); defer { Self.deviceIdLock.unlock() }
         if let existing = secure.get("sendora_device_id") {
+            Self.unsavedDeviceId = nil
             return existing
         }
-        let newId = UUID().uuidString
-        secure.set("sendora_device_id", newId)
-        return newId
+        let candidate = Self.unsavedDeviceId ?? UUID().uuidString
+        switch secure.addIfAbsent("sendora_device_id", candidate) {
+        case .added:
+            Self.unsavedDeviceId = nil
+            return candidate
+        case .duplicate:
+            // Someone else stored one between our read and our add: adopt THEIRS.
+            if let stored = secure.get("sendora_device_id") {
+                Self.unsavedDeviceId = nil
+                return stored
+            }
+            Self.unsavedDeviceId = candidate
+            return candidate
+        case .failed:
+            Self.unsavedDeviceId = candidate
+            return candidate
+        }
     }
 
     /// Regenerate the device id. Called by `SendoraCloud.reset()` so we don't leave
     /// an un-erasable fingerprint across logout.
     func regenerateDeviceId() {
+        Self.deviceIdLock.lock(); defer { Self.deviceIdLock.unlock() }
+        Self.unsavedDeviceId = nil
         secure.delete("sendora_device_id")
     }
 

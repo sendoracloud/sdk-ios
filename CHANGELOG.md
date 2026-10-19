@@ -1,5 +1,31 @@
 # Changelog
 
+## 5.7.0 — server consent + feature flags, with identify()'s identity token
+
+Additive; nothing existing changes shape.
+
+- **`SendoraCloud.consent.record(purpose:granted:entityId:userId:email:source:identityToken:)`** and
+  **`requestDeletion(entityId:userId:email:reason:identityToken:)`** (`async throws`) — the server consent API, on the
+  same `SendoraCloud.consent` object. `grant()` / `revoke()` / `isGranted` are unchanged (the local event gate).
+- **`SendoraCloud.flags?.evaluate(key:userId:entityId:environment:identityToken:)`** → `SendoraFlagValue { key, value,
+  variant, reason }` and **`evaluateAll(…)`** → `[String: SendoraFlagValue]`. `value` is a `SendoraJSONValue`
+  (`boolValue`, `stringValue`, `doubleValue`, …); `reason` is the server's `ruleMatched`.
+- **The identity token.** An explicit `identityToken:` wins. Otherwise the token given to
+  `identify(userId:options:)` is sent ONLY when the call's `userId` (flags: defaulting to the identified user) is the
+  user it was issued for — never for another userId, never after `reset()`, never over the route's limit (flags 128,
+  consent 256). It is never stored. Events now use the same rule (a token is no longer attached once sign-in switched
+  to a different user).
+- Refusals throw `SendoraCloudAPIError` (`code`, `status`, `retryAfterSeconds`) — never an empty answer.
+- **Fix: one anonymous id on a fresh install.** The device id (the `anonymousId` on every event before `identify`,
+  and the attribution key) was created with an unlocked read-then-write. On first launch the install report and
+  the first events each created one; the Keychain refused the second write (-25299), and that caller kept sending an
+  id that was never stored — so the install's first session carried TWO anonymous ids (attribution under one,
+  `app.opened` under the other; seen on 4 of 4 fresh simulator installs). Creation is now atomic, a refused duplicate
+  adopts the stored id, and an unwritable Keychain (before first unlock) still hands every caller the same id.
+- `SendoraCloud.push` is no longer built from a main-actor initializer off the main thread inside `configure()`
+  (a Swift-concurrency warning; an error in Swift 6 mode). No API change.
+
+
 ## 5.6.0 — the server's wait is honoured, Cloudflare challenges are never refusals, a poison event no longer blocks the queue
 
 Additive; no frozen key, header or route changed. One NEW public overload, one new optional property.

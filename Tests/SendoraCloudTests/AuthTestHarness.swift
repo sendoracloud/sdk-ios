@@ -171,8 +171,10 @@ enum TestJWT {
                      exp: Int = 4_000_000_000) -> String {
         var claims: [String: Any] = ["sub": sub, "sid": sid, "is_anonymous": isAnonymous, "iat": 1_760_000_000, "exp": exp]
         if let p = project { claims["project"] = p.map { $0 as Any } ?? NSNull() }
-        let header = base64url(try! JSONSerialization.data(withJSONObject: ["alg": "RS256", "typ": "JWT"]))
-        let payload = base64url(try! JSONSerialization.data(withJSONObject: claims))
+        // `.sortedKeys`: the same claims must make the same bytes. Unsorted, the header came out as
+        // {"typ","alg"} on some iOS-Simulator runs and a test comparing two minted tokens flaked (5.7.0).
+        let header = base64url(try! JSONSerialization.data(withJSONObject: ["alg": "RS256", "typ": "JWT"], options: [.sortedKeys]))
+        let payload = base64url(try! JSONSerialization.data(withJSONObject: claims, options: [.sortedKeys]))
         return "\(header).\(payload).c2ln"
     }
 }

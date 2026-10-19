@@ -17,7 +17,7 @@ Choose **Up to Next Major Version**, with the current release as the minimum.
 Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.6.0"),
+.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.7.0"),
 ```
 
 ### Upgrading from 4.x
@@ -297,6 +297,24 @@ let created = try await SendoraCloud.support?.createTicket(subject: "Purchase no
 ```
 
 Refusals throw `SendoraSupportError` (`code` — e.g. `PROJECT_MISMATCH`, `NOT_SIGNED_IN` — and `status`).
+
+## Consent + feature flags (5.7.0)
+
+Server consent records and flags. Give `identify` the HMAC `identityToken` your backend signs for the user, and these
+calls send it for that user (and only that user) — the server then counts the consent / audience rule as proven.
+
+```swift
+SendoraCloud.identify(userId: "user_123", options: SendoraCloudIdentifyOptions(identityToken: tokenFromYourBackend))
+
+let flag = try await SendoraCloud.flags?.evaluate(key: "new_onboarding")
+if flag?.value.boolValue == true { /* show it */ }
+let all = try await SendoraCloud.flags?.evaluateAll()
+
+let record = try await SendoraCloud.consent.record(purpose: .marketing, granted: true, userId: "user_123", source: "settings")
+let request = try await SendoraCloud.consent.requestDeletion(userId: "user_123", reason: "user asked")
+```
+
+`consent.grant()` / `revoke()` stay the local event gate. Refusals throw `SendoraCloudAPIError` (`code`, `status`).
 
 ## Push
 
