@@ -6,7 +6,13 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 
 
 
-## 5.7.1 (s58.405) — built, not published
+## 5.8.0 (s58.405-j) — built, not published — `account_locked` is retryable only with a wait
+
+`retryable` for `account_locked` = `retryAfterSeconds` present. The server's per-network and 20/hour waits send one;
+the 100-failure hard stop sends none and does not lift with time (reset the password / sign in another way). Every
+other kind unchanged. Guard `SendoraCloudAuthErrorTests.test_accountLockedIsRetryableOnlyWithAWait` (+ the classify table row flipped to false); mutation (always true for `account_locked`) → 2 red.
+
+## 5.7.1 (s58.405) — published
 
 `saveEventQueue` no longer strips `userId` / `properties.traits` (nothing ever restored them; a restored identified event went out with neither `userId` nor `anonymousId` and never got its send-time token) and removes any `identityToken` as a belt; old files decode with `userId` absent. Key error says 19+ chars (was "17+"). Guard `PersistedQueueIdentityTests.swift` (4; re-adding the strip → 5 red) + `test_malformedKeyMessageMatchesThePattern`; `swift test` 113 (3 skipped).
 

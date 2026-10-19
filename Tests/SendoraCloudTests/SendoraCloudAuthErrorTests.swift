@@ -23,7 +23,8 @@ final class SendoraCloudAuthErrorTests: XCTestCase {
     func test_classifiesServerCodes() {
         let cases: [(String, Int, SendoraCloudAuthErrorKind, Bool)] = [
             ("RATE_LIMIT_EXCEEDED", 429, .rateLimited, true),
-            ("ACCOUNT_LOCKED", 403, .accountLocked, true),
+            // No wait given = the hard stop, which does not lift with time (s58.405).
+            ("ACCOUNT_LOCKED", 403, .accountLocked, false),
             ("INVALID_CREDENTIALS", 401, .invalidCredential, false),
             ("CREDENTIAL_IN_USE", 409, .credentialInUse, false),
             ("NOT_ANONYMOUS", 409, .alreadyIdentified, false),
@@ -122,6 +123,19 @@ final class SendoraCloudAuthErrorTests: XCTestCase {
         XCTAssertEqual(err.retryAfterSeconds, 900)
         XCTAssertEqual(err.message, "locked")
         XCTAssertNil(SendoraCloudAuthError.rejected(code: "ACCOUNT_LOCKED", message: "l", status: 403, retryAfterSeconds: nil).retryAfterSeconds)
+    }
+
+    // s58.405: a lock is retryable only when the server said when it lifts. The per-network and 20-an-hour waits send
+    // `retryAfterSeconds`; the 100-failure hard stop sends none and needs a password reset or another sign-in method.
+    func test_accountLockedIsRetryableOnlyWithAWait() {
+        let cooling = SendoraCloudAuthError.rejected(code: "ACCOUNT_LOCKED", message: "l", status: 403, retryAfterSeconds: 900)
+        let hardStop = SendoraCloudAuthError.rejected(code: "ACCOUNT_LOCKED", message: "l", status: 403, retryAfterSeconds: nil)
+        XCTAssertEqual(cooling.kind, .accountLocked)
+        XCTAssertTrue(cooling.retryable, "a cool-off lifts on its own")
+        XCTAssertEqual(hardStop.kind, .accountLocked)
+        XCTAssertFalse(hardStop.retryable, "the hard stop does not lift with time")
+        // Other kinds are unchanged by the wait.
+        XCTAssertTrue(SendoraCloudAuthError.rejected(code: "RATE_LIMIT_EXCEEDED", message: "r", status: 429, retryAfterSeconds: nil).retryable)
     }
 
     // MARK: - Behavioural guarantees (formerly source-text pins)

@@ -245,17 +245,22 @@ public extension SendoraCloudAuthError {
     }
 
     /// True when retrying the SAME input can plausibly succeed later.
+    /// `accountLocked` is retryable ONLY when the server said when the lock lifts
+    /// (`retryAfterSeconds`): the 100-failure hard stop carries no wait and does
+    /// not lift with time.
     var retryable: Bool {
         switch kind {
-        case .network, .server, .rateLimited, .accountLocked: return true
+        case .network, .server, .rateLimited: return true
+        case .accountLocked: return retryAfterSeconds != nil
         default: return false
         }
     }
 
     /// Seconds to wait before retrying, when the server said so (429 backoff, or
     /// an ACCOUNT_LOCKED cool-off). `nil` means no server hint — for
-    /// `accountLocked` specifically that means the lock does NOT expire on its
-    /// own and needs support.
+    /// `accountLocked` specifically that means the lock does NOT lift with time:
+    /// reset the password, or sign in another way (magic link, email code,
+    /// social), to continue — and `retryable` is false.
     var retryAfterSeconds: Int? {
         if case .rejected(_, _, _, let seconds) = self { return seconds }
         return nil
