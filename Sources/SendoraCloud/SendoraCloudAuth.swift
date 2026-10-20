@@ -308,6 +308,10 @@ public extension SendoraCloudAuthError {
         // the closed `AuthErrorKind` is NOT widened.
         case "SESSION_WITHHELD", "PROJECT_MISMATCH", "HELD_GUEST_LIMIT", "HELD_GUEST_PROJECT_MISMATCH", "AMBIGUOUS_HELD_GUEST":
             return .config
+        // 5.9.0: `discardHeldGuest(keepSupportTickets: true)` outside an
+        // identified session — the app must sign in first (client-side, no network).
+        case "KEEP_TICKETS_REQUIRES_IDENTIFIED":
+            return .config
         case "HELD_GUEST_GONE", "CREDENTIAL_CHANGED":
             return .invalidCredential
         case "RESTORE_FAILED":

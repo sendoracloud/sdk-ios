@@ -541,6 +541,43 @@ extension SendoraCloudAuth {
         }
     }
 
+    /// `discardHeldGuest(id:)` with the 5.9.0 option to KEEP the guest's support
+    /// tickets: with `keepSupportTickets: true` the server moves the guest's
+    /// tickets (replies, rating, read state) to the signed-in account first, then
+    /// erases everything else. Needs an identified session — otherwise it fails
+    /// `KEEP_TICKETS_REQUIRES_IDENTIFIED` (kind `config`, not retryable) and sends
+    /// nothing; the account's access token goes as the Bearer. A refusal keeps the
+    /// slot. `keepSupportTickets: false` is exactly `discardHeldGuest(id:)`.
+    /// A separate overload (the label is required), so `discardHeldGuest(id:) { … }`
+    /// and unapplied references to the 5.4.0 declaration keep compiling.
+    public func discardHeldGuest(id: String? = nil, keepSupportTickets: Bool, completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        guard keepSupportTickets else {
+            discardHeldGuest(id: id, completion: completion)
+            return
+        }
+        opsQueue.async {
+            if let refusal = self.withheldRefusal() { completion(.failure(refusal)); return }
+            // Like CLAIM: not queued in `unknown` — any non-identified state
+            // refuses with no network and nothing mutated.
+            guard self.status() == .identified else {
+                completion(.failure(.rejected(code: "KEEP_TICKETS_REQUIRES_IDENTIFIED",
+                                              message: "keepSupportTickets moves the guest's tickets to the signed-in account; sign in first",
+                                              status: 0, retryAfterSeconds: nil)))
+                return
+            }
+            // On-queue token (refreshes synchronously when past expiry, like
+            // `deleteAccount`) — `getAccessToken` would hop back onto `opsQueue`.
+            guard let token = self.bearerTokenOnQueue() else {
+                completion(.failure(.unauthorized("discardHeldGuest(keepSupportTickets:) requires a signed-in user")))
+                return
+            }
+            switch self.resolveSlotIndex(id: id) {
+            case .failure(let error): completion(.failure(error))
+            case .success(let index): completion(self.performDiscard(index: index, keepTicketsBearer: token))
+            }
+        }
+    }
+
     /// DEPRECATED alias of `claimHeldGuest(id:)`: a token that matches a held slot
     /// (its current or at-hold refresh token) claims THAT guest — a DESTRUCTIVE
     /// merge; any other token is sent to `POST /merge` raw. Requires an

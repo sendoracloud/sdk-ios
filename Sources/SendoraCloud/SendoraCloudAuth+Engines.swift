@@ -665,11 +665,23 @@ extension SendoraCloudAuth {
     // MARK: - DISCARD (§3.3 row 32)
 
     /// `POST /guest/discard { refreshToken: held }` — a REAL server delete (B5).
-    /// 2xx or 404 releases the slot; a 5xx / network error keeps it (the guest is
-    /// not gone).
-    internal func performDiscard(index: Int) -> Result<Void, SendoraCloudAuthError> {
+    /// 2xx or 404 releases the slot; any other failure (5xx / network / a 401 or
+    /// 422 refusal of the keep-tickets Bearer) keeps it (the guest is not gone).
+    ///
+    /// `keepTicketsBearer` (5.9.0): the CURRENT account's access token. When
+    /// present the body gains `keepSupportTickets: true` and the request carries
+    /// `Authorization: Bearer` — the server moves the guest's support tickets to
+    /// that account before erasing the guest. When nil the request is exactly the
+    /// pre-5.9.0 one (no extra key, no Authorization header).
+    internal func performDiscard(index: Int, keepTicketsBearer: String? = nil) -> Result<Void, SendoraCloudAuthError> {
         guard let slot = slotAt(index) else { return .failure(.heldGuestGone(userId: "", endReason: nil)) }
-        let rich = requestSync(method: "POST", path: "/auth-service/guest/discard", body: ["refreshToken": slot.refreshToken])
+        var body: [String: Any] = ["refreshToken": slot.refreshToken]
+        var headers: [String: String]? = nil
+        if let bearer = keepTicketsBearer {
+            body["keepSupportTickets"] = true
+            headers = ["Authorization": "Bearer \(bearer)"]
+        }
+        let rich = requestSync(method: "POST", path: "/auth-service/guest/discard", body: body, headers: headers)
         if (200..<300).contains(rich.statusCode) || rich.statusCode == 404 {
             if let released = commitRelease(index: index) {
                 emitAuthState(.guestReleased(userId: released.userId, reason: .discarded, endReason: nil))

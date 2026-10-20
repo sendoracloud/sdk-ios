@@ -6,7 +6,15 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 
 
 
-## 5.8.0 (s58.405-j) — built, not published — `account_locked` is retryable only with a wait
+## 5.9.0 (s58.405-k) — built, not published — keep a held guest's support tickets on discard
+
+New overload `discardHeldGuest(id:keepSupportTickets:completion:)` (no default on the flag, so existing calls stay unambiguous; the old verb forwards with false →
+byte-identical request). On: withheld gate → not identified → `KEEP_TICKETS_REQUIRES_IDENTIFIED` (config, nothing sent) →
+the account's access token via `bearerTokenOnQueue()` (on `opsQueue`; `getAccessToken` would deadlock) → body
+`keepSupportTickets: true` + `Authorization: Bearer`. Slot rules unchanged (2xx / 404 release). Guard `HeldGuestKeepTicketsTests.swift` (7); mutations
+(no Bearer; no identified check) → red.
+
+## 5.8.0 (s58.405-j) — published — `account_locked` is retryable only with a wait
 
 `retryable` for `account_locked` = `retryAfterSeconds` present. The server's per-network and 20/hour waits send one;
 the 100-failure hard stop sends none and does not lift with time (reset the password / sign in another way). Every
