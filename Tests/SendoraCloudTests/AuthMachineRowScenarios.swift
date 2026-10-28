@@ -85,6 +85,7 @@ extension AuthMachineConformanceTests {
             "sign_in.switch": scenario_sign_in_switch,
         ]
         for (k, v) in rowScenariosPart2() { map[k] = v }
+        for (k, v) in rowScenariosPart3() { map[k] = v }
         return map
     }
 
@@ -147,6 +148,34 @@ extension AuthMachineConformanceTests {
         nullClaim.seedSession(user: Self.anon, access: Self.anonToken(project: .some(nil)), refresh: "rt-n")
         nullClaim.boot()
         XCTAssertEqual(nullClaim.auth.status(), .withheld)
+        // (s58.415, G3) ORIGIN mismatch: a record issued by another API origin (a staging build over a prod install) →
+        // withheld{origin_mismatch} with NO guard configured — no network, byte-identical disk, the token sent nowhere.
+        let o = AuthHarness()
+        o.seedSession(user: Self.anon, access: Self.anonToken(), refresh: "rt-prod", origin: "https://api.sendoracloud.com")
+        o.seedRefreshMarker() // even a marker (hydrate.refresh_inflight) does not send it
+        o.secure.seed("sendora_user_id", Self.anon.id)
+        let oBefore = o.secure.snapshot(), oPlainBefore = o.plain.snapshot()
+        o.boot()
+        XCTAssertEqual(o.auth.status(), .withheld)
+        XCTAssertEqual(o.auth.withheld()?.reason, "origin_mismatch")
+        XCTAssertEqual(o.auth.withheld()?.userId, Self.anon.id)
+        if case .initial(let status, _, let w)? = o.event(at: 0) { XCTAssertEqual(status, .withheld); XCTAssertEqual(w?.reason, "origin_mismatch") } else { XCTFail("initial{withheld}") }
+        usleep(50_000)
+        XCTAssertEqual(o.transport.requestCount, 0, "NO network: the token is never sent to another origin")
+        XCTAssertEqual(o.secure.snapshot(), oBefore); XCTAssertEqual(o.plain.snapshot(), oPlainBefore)
+        XCTAssertEqual(o.secure.writeCount, 0)
+        XCTAssertFalse(o.auth.cronArmed)
+        XCTAssertNil(o.auth.getRefreshToken()); XCTAssertNil(o.getAccessToken())
+        XCTAssertEqual(o.signIn().failureError?.code, "SESSION_WITHHELD")
+        // The same record under its own origin, and an older record with NO origin, install normally.
+        let same = AuthHarness()
+        same.seedSession(user: Self.anon, access: Self.anonToken(), refresh: "rt-s", origin: AuthHarness.origin)
+        same.boot()
+        XCTAssertEqual(same.auth.status(), .anonymous)
+        let legacy = AuthHarness()
+        legacy.seedSession(user: Self.anon, access: Self.anonToken(), refresh: "rt-l")
+        legacy.boot()
+        XCTAssertEqual(legacy.auth.status(), .anonymous, "absent origin (a pre-s58.415 record) = matching")
     }
 
     func scenario_hydrate_gap_fill() {
@@ -213,10 +242,13 @@ extension AuthMachineConformanceTests {
             ("SIGN_IN", { h, done in h.auth.signIn(email: "a@b.co", password: "x") { _ in done() } }),
             ("LINK", { h, done in h.auth.linkEmailPassword(email: "a@b.co", password: "x") { _ in done() } }),
             ("RESTORE", { h, done in h.auth.restoreHeldGuest(id: "g-held") { _ in done() } }),
+            // rev 3: RECOVER_QUARANTINED queues like RESTORE.
+            ("RECOVER_QUARANTINED", { h, done in h.auth.recoverQuarantinedGuest("g-q") { _ in done() } }),
         ] {
             let q = AuthHarness()
             q.seedLimbo(refresh: "rt-limbo")
             q.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1))
+            q.seedQuarantine(0, userId: "g-q", refresh: "rt-q")
             q.boot()
             let g = q.transport.gate("/auth-service/token/refresh")
             q.transport.stub("POST", "/auth-service/token/refresh", Stub.refreshDead(endReason: "revoked"))
@@ -245,7 +277,9 @@ extension AuthMachineConformanceTests {
         assertNoGuestHint(req?.body, "mint")
         let mintKey = req?.body?["mintKey"] as? String
         XCTAssertTrue((mintKey?.count ?? 0) >= 16 && (mintKey?.count ?? 0) <= 128, "B10 mintKey 16–128 chars")
-        XCTAssertNil(h.plain.string(forKey: "sendora_auth_mint_key"), "the key is dropped on MINT_OK")
+        // ⚠ Pin converted (s58.415, C3 / Codex #7): the mint key moved from UserDefaults to the Keychain (a confirmed write).
+        XCTAssertNil(h.secure.get(SendoraStorage.mintKeyKey), "the key is dropped on MINT_OK")
+        XCTAssertNil(h.plain.string(forKey: "sendora_auth_mint_key"), "…and never left in UserDefaults")
         XCTAssertEqual(h.transitionEventNames, ["signed_in"])
         XCTAssertEqual(h.auth.lastSignedInCause(), .mint)
         // dual-write: the four frozen keys AND the record
@@ -259,7 +293,7 @@ extension AuthMachineConformanceTests {
         retry.transport.stub("POST", "/auth-service/anonymous", .offline)
         guard case .failure(let err) = retry.mint() else { return XCTFail("offline") }
         XCTAssertEqual(err.kind, .network)
-        let kept = retry.plain.string(forKey: "sendora_auth_mint_key")
+        let kept = retry.secure.get(SendoraStorage.mintKeyKey)
         XCTAssertNotNil(kept)
         retry.transport.stub("POST", "/auth-service/anonymous", Stub.session(user: Stub.user(id: "g", isAnonymous: true), tokens: Stub.tokens(access: TestJWT.make(sub: "g"), refresh: "rt-g"), status: 201))
         _ = retry.mint()
@@ -296,7 +330,11 @@ extension AuthMachineConformanceTests {
         fall.transport.stub("POST", "/auth-service/anonymous", Stub.session(user: Stub.user(id: "fresh", isAnonymous: true), tokens: Stub.tokens(access: TestJWT.make(sub: "fresh"), refresh: "rt-fresh"), status: 201))
         guard case .success(let fresh) = fall.mint() else { return XCTFail("ensureSession() must never resolve without a session because of a dead slot") }
         XCTAssertEqual(fresh.id, "fresh")
-        XCTAssertEqual(fall.transitionEventNames, ["guest_released", "signed_in"])
+        // (s58.415, C5) `expired` does not prove the guest gone: it is MOVED to quarantine —
+        // guest_released{quarantined} then guest_quarantined — and ensureSession() goes on to mint.
+        XCTAssertEqual(fall.transitionEventNames, ["guest_released", "guest_quarantined", "signed_in"])
+        if case .guestReleased(_, let reason, let end)? = fall.event(at: 1) { XCTAssertEqual(reason, .quarantined); XCTAssertEqual(end, .expired) } else { XCTFail("quarantined release") }
+        XCTAssertEqual(fall.quarantineSlot(0)?.refreshToken, "rt-dead")
         // transient error → abort, state untouched
         let transient = signedOutHarness()
         transient.seedSlot(0, AuthHarness.slot(userId: "g", refresh: "rt-g", heldAt: 1))
@@ -382,6 +420,7 @@ extension AuthMachineConformanceTests {
     func scenario_withheld_reject() {
         let h = withheldHarness()
         h.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1))
+        h.seedQuarantine(0, userId: "g-q", refresh: "rt-q")
         h.boot()
         XCTAssertEqual(h.auth.status(), .withheld)
         let mark = h.secure.writeCount
@@ -399,6 +438,9 @@ extension AuthMachineConformanceTests {
                 return nil
             }),
             ("SESSION_VERB", { h in (h.wait { done in h.auth.revokeAllSessions(completion: done) } as Result<Void, SendoraCloudAuthError>).failureError }),
+            // rev 3 §3.8
+            ("RECOVER_QUARANTINED", { h in (h.wait { done in h.auth.recoverQuarantinedGuest("g-q", completion: done) } as Result<SendoraCloudAuthUser, SendoraCloudAuthError>).failureError }),
+            ("DISCARD_QUARANTINED", { h in (h.wait { done in h.auth.discardQuarantinedGuest("g-q", completion: done) } as Result<Void, SendoraCloudAuthError>).failureError }),
         ]
         XCTAssertEqual(verbs.map { $0.0 }, fixture.rejectedInWithheld, "one representative verb per rejected event")
         for (name, verb) in verbs {
@@ -431,8 +473,15 @@ extension AuthMachineConformanceTests {
     }
 
     func scenario_withheld_discard() {
+        // ⚠ Pin converted (s58.415, G4 — zero guest-account loss): this used to drive an ANONYMOUS withheld session and
+        // assert "clear + revoke". That revoked ANOTHER project's / backend's guest — its only token — on a discard. The
+        // clear + revoke now applies to an IDENTIFIED withheld session only (below); the guest is MOVED to a held slot.
         for viaSignOut in [false, true] {
-            let h = withheldHarness()
+            let h = AuthHarness(expectedProjectId: TestJWT.projectA)
+            h.seedSession(user: Self.ident, access: Self.identToken(project: .some(TestJWT.projectB)), refresh: "rt-withheld")
+            h.secure.seed("sendora_user_id", Self.anon.id)
+            h.boot()
+            XCTAssertEqual(h.auth.status(), .withheld)
             h.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1))
             h.plain.seedString("sendora_event_queue_marker", "kept")
             let mark = h.secure.writeCount
@@ -453,6 +502,52 @@ extension AuthMachineConformanceTests {
             XCTAssertEqual(h.clearEffects.last?.rotateDeviceId, false, "keeps the anonymous analytics id")
             XCTAssertEqual(h.clearEffects.last?.clearQueue, false, "keeps the event queue")
         }
+        // (G4) An ANONYMOUS withheld session: MOVED to a free held slot {autoRestore:false, project, origin, accessToken}
+        // — confirmed BEFORE the clear — and NEVER revoked; signed_out{user}.
+        for viaSignOut in [false, true] {
+            let h = withheldHarness()
+            h.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1))
+            h.boot()
+            if viaSignOut {
+                h.waitVoid { done in h.auth.signOut(completion: done) }
+            } else {
+                XCTAssertTrue(h.wait { done in h.auth.discardWithheld(completion: done) })
+            }
+            XCTAssertEqual(h.auth.status(), .signedOut)
+            let moved = h.heldSlot(1)
+            XCTAssertEqual(moved?.userId, Self.anon.id); XCTAssertEqual(moved?.refreshToken, "rt-withheld")
+            XCTAssertEqual(moved?.autoRestore, false); XCTAssertEqual(moved?.project, TestJWT.projectB)
+            XCTAssertEqual(moved?.origin, AuthHarness.origin); XCTAssertEqual(moved?.accessToken, Self.anonToken(project: .some(TestJWT.projectB)))
+            XCTAssertNotNil(h.heldSlot(0), "the existing held slot kept")
+            XCTAssertNil(h.storedRefresh, "current keys cleared")
+            usleep(50_000)
+            XCTAssertEqual(h.transport.requests(to: "/auth-service/token/revoke").count, 0, "a guest is NEVER revoked")
+            XCTAssertEqual(h.transport.requests(to: "/auth-service/guest/discard").count, 0)
+            // (s58.415, C5) guest_held{userId} BEFORE signed_out{user}
+            XCTAssertEqual(h.transitionEventNames, ["guest_held", "signed_out"])
+            if case .guestHeld(let id, let count)? = h.event(at: 1) { XCTAssertEqual(id, Self.anon.id); XCTAssertEqual(count, 2) } else { XCTFail("guest_held first") }
+            XCTAssertEqual(h.auth.heldGuests().count, 2, "the moved guest is visible (same origin)")
+            XCTAssertEqual(h.transport.requests(to: "/auth-service/anonymous").count, 0)
+        }
+        // No free held slot → STAYS withheld: discardWithheld false, signOut(discardGuest:) HELD_GUEST_LIMIT, nothing written.
+        let full = withheldHarness()
+        for i in 0..<5 { full.seedSlot(i, AuthHarness.slot(userId: "g\(i)", refresh: "rt\(i)", heldAt: Int64(i + 1))) }
+        full.boot()
+        let mark = full.secure.writeCount
+        XCTAssertFalse(full.wait { done in full.auth.discardWithheld(completion: done) })
+        let r: Result<Void, SendoraCloudAuthError> = full.wait { done in full.auth.signOut(discardGuest: false, completion: done) }
+        XCTAssertEqual(r.failureError?.code, "HELD_GUEST_LIMIT")
+        full.waitVoid { done in full.auth.signOut(completion: done) }
+        XCTAssertEqual(full.auth.status(), .withheld, "the guest's token is never dropped")
+        XCTAssertEqual(full.secure.writeCount, mark)
+        XCTAssertEqual(full.transport.requestCount, 0)
+        // The held-slot write does not confirm → stays withheld (STORAGE_UNAVAILABLE).
+        let w = withheldHarness()
+        w.secure.failWrites = { $0.hasPrefix("sendora_auth_held_") }
+        let wr: Result<Void, SendoraCloudAuthError> = w.wait { done in w.auth.signOut(discardGuest: true, completion: done) }
+        XCTAssertEqual(wr.failureError?.code, "STORAGE_UNAVAILABLE")
+        XCTAssertEqual(w.auth.status(), .withheld)
+        XCTAssertEqual(w.storedRefresh, "rt-withheld")
     }
 
     // MARK: LINK

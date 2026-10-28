@@ -20,16 +20,54 @@ final class RecordingSecureStore: SendoraSecureStore {
     private(set) var writes: [Write] = []
 
     func get(_ key: String) -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
+    // (step-2 review T17) The legacy `set` / `delete` honour `failWrites` too — a path still on the legacy surface
+    // must fail under the fault exactly as the real Keychain's would (it used to succeed here and only here).
     func set(_ key: String, _ value: String) {
         lock.lock(); defer { lock.unlock() }
+        if _failWrites?(key) ?? false { return }
         values[key] = value
         writes.append(Write(op: "set", key: key, value: value))
     }
     func delete(_ key: String) {
         lock.lock(); defer { lock.unlock() }
+        if _failWrites?(key) ?? false { return }
         values.removeValue(forKey: key)
         writes.append(Write(op: "delete", key: key, value: nil))
     }
+    // ── rev 3 (ADR-033 §3.8) fault switches. Off by default: then this is the perfect map it always was.
+    /// Keys whose READ errors (`.unavailable(-25308)`, a locked Keychain) — the value stays on disk.
+    var readErrors: Set<String> {
+        get { lock.lock(); defer { lock.unlock() }; return _readErrors }
+        set { lock.lock(); _readErrors = newValue; lock.unlock() }
+    }
+    private var _readErrors: Set<String> = []
+    /// Keys whose WRITES / removes fail (the real store's update-in-place: the OLD value stays). Not recorded.
+    var failWrites: ((String) -> Bool)? {
+        get { lock.lock(); defer { lock.unlock() }; return _failWrites }
+        set { lock.lock(); _failWrites = newValue; lock.unlock() }
+    }
+    private var _failWrites: ((String) -> Bool)?
+
+    func read(_ key: String) -> SendoraSecureRead {
+        lock.lock(); defer { lock.unlock() }
+        if _readErrors.contains(key) { return .unavailable(-25308) }
+        return values[key].map { .value($0) } ?? .absent
+    }
+    func write(_ key: String, _ value: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if _failWrites?(key) ?? false { return false }
+        values[key] = value
+        writes.append(Write(op: "set", key: key, value: value))
+        return true
+    }
+    func remove(_ key: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if _failWrites?(key) ?? false { return false }
+        values.removeValue(forKey: key)
+        writes.append(Write(op: "delete", key: key, value: nil))
+        return true
+    }
+
     /// Seed without recording (the disk BEFORE boot).
     func seed(_ key: String, _ value: String) { lock.lock(); values[key] = value; lock.unlock() }
     func snapshot() -> [String: String] { lock.lock(); defer { lock.unlock() }; return values }
@@ -45,7 +83,13 @@ final class RecordingPlainStore: SendoraPlainStore {
     private(set) var writes: [String] = []
 
     func string(forKey key: String) -> String? { lock.lock(); defer { lock.unlock() }; return strings[key] }
-    func setString(_ value: String, forKey key: String) { lock.lock(); strings[key] = value; writes.append("set \(key)"); lock.unlock() }
+    /// rev 3: string writes do not land (a full / unwritable defaults domain) — the INV-16 marker cannot confirm.
+    var failWrites = false
+    func setString(_ value: String, forKey key: String) {
+        lock.lock(); defer { lock.unlock() }
+        if failWrites { return }
+        strings[key] = value; writes.append("set \(key)")
+    }
     func data(forKey key: String) -> Data? { lock.lock(); defer { lock.unlock() }; return datas[key] }
     func setData(_ value: Data, forKey key: String) { lock.lock(); datas[key] = value; writes.append("set \(key)"); lock.unlock() }
     func bool(forKey key: String) -> Bool { lock.lock(); defer { lock.unlock() }; return bools[key] ?? false }
@@ -94,6 +138,8 @@ final class StubTransport: SendoraHTTPTransport {
         let path: String
         let body: [String: Any]?
         let headers: [String: String]
+        /// The raw (percent-encoded) query string, nil when the URL has none.
+        var query: String? = nil
     }
 
     private let lock = NSLock()
@@ -108,7 +154,8 @@ final class StubTransport: SendoraHTTPTransport {
         let rawPath = request.url?.path ?? ""
         let path = rawPath.hasPrefix("/api/v1") ? String(rawPath.dropFirst("/api/v1".count)) : rawPath
         let body = request.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        let rec = Recorded(method: request.httpMethod ?? "GET", path: path, body: body, headers: request.allHTTPHeaderFields ?? [:])
+        let rec = Recorded(method: request.httpMethod ?? "GET", path: path, body: body, headers: request.allHTTPHeaderFields ?? [:],
+                           query: request.url?.query)
         lock.lock()
         requests.append(rec)
         let handler = handlers["\(rec.method) \(path)"]
@@ -244,6 +291,18 @@ final class AuthHarness {
     var autoRestoreHeldGuest = true
     /// A frozen clock (epoch ms) for the machine; `nil` = wall clock.
     var clock: (() -> Int64)?
+    /// rev 3: the grace-retry schedule's time scale (`nil` = no self-scheduled retries — the default here, so a
+    /// background timer never fires into a later scenario) and the INV-17 queue window.
+    var graceRetryScale: Double?
+    var storageUnavailableQueueMs: Int64 = 10_000
+    /// (s58.415, iOS #4) every background activity the machine began / ended, in order ("begin" / "end").
+    private(set) var activityLog: [String] = []
+    private let activityLock = NSLock()
+    var activityEvents: [String] { activityLock.lock(); defer { activityLock.unlock() }; return activityLog }
+    func noteActivity(_ e: String) { activityLock.lock(); activityLog.append(e); activityLock.unlock() }
+    /// (T2) "Is the device unlocked?" as the machine samples it. `false` by default: this harness's read errors are
+    /// −25308 (`errSecInteractionNotAllowed`) — the phone has not been unlocked since boot.
+    var deviceUnlocked: Bool? = false
 
     static let frozenAuthKeys = ["sendora_auth_access_token", "sendora_auth_access_expires", "sendora_auth_refresh_token", "sendora_auth_user"]
 
@@ -259,14 +318,18 @@ final class AuthHarness {
     // MARK: Seeding (BEFORE boot — the disk a previous process left)
 
     /// A 5.4.0 session: the four frozen keys + the `sendora_auth_session` record.
-    func seedSession(user: SendoraCloudAuthUser, access: String, refresh: String, expiresAt: Int64 = Int64(Date().timeIntervalSince1970 * 1000) + 900_000, withRecord: Bool = true) {
+    /// The configured API origin of every harness (`APIClient.apiOrigin` of the stub base URL).
+    static let origin = "https://stub.sendora.test"
+
+    func seedSession(user: SendoraCloudAuthUser, access: String, refresh: String, expiresAt: Int64 = Int64(Date().timeIntervalSince1970 * 1000) + 900_000, withRecord: Bool = true,
+                     origin: String? = nil) {
         secure.seed("sendora_auth_access_token", access)
         secure.seed("sendora_auth_refresh_token", refresh)
         secure.seed("sendora_auth_access_expires", String(expiresAt))
         secure.seed("sendora_auth_user", SendoraCloudAuth.encodeUser(user)!)
         if withRecord {
             let record = AuthSessionRecord(user: user, accessToken: access, refreshToken: refresh, accessExpiresAt: expiresAt,
-                                           sid: jwtStringClaim(access, "sid"), heldReportPending: [])
+                                           sid: jwtStringClaim(access, "sid"), heldReportPending: [], origin: origin)
             secure.seed(SendoraStorage.authSessionKey, SendoraCloudAuth.encodeSessionRecord(record)!)
             plain.seedString("sendora_schema_version", "2")
         } else {
@@ -295,6 +358,19 @@ final class AuthHarness {
         secure.seed(SendoraStorage.heldSlotKeys[index], json)
     }
 
+    /// rev 3: a quarantine slot on disk before boot.
+    func seedQuarantine(_ index: Int, userId: String, refresh: String, at: Int64 = 5, project: String? = TestJWT.projectA,
+                        access: String? = nil, origin: String? = nil) {
+        let rec = QuarantineSlotRecord(userId: userId, sid: "sid-q", refreshToken: refresh, quarantinedAt: at, project: project,
+                                       accessToken: access, origin: origin)
+        secure.seed(SendoraStorage.quarantineSlotKeys[index], rec.encodeJson()!)
+    }
+
+    /// rev 3 INV-16: a refresh-in-flight marker left by the previous process (Keychain tier since T15).
+    func seedRefreshMarker() {
+        secure.seed(SendoraStorage.refreshInflightKey, #"{"sid":"sid-anon","startedAt":1,"v":1}"#)
+    }
+
     // MARK: Boot
 
     func boot() {
@@ -306,7 +382,13 @@ final class AuthHarness {
         client = APIClient(baseUrl: "https://stub.sendora.test", apiKey: "pk_test_000000000000000000", transport: transport)
         let config = SendoraCloudAuth.MachineConfig(expectedProjectId: expectedProjectId, configProjectId: configProjectId,
                                                     autoRestoreHeldGuest: autoRestoreHeldGuest, schedulesTimers: false,
-                                                    clock: clock)
+                                                    clock: clock, graceRetryScale: graceRetryScale,
+                                                    storageUnavailableQueueMs: storageUnavailableQueueMs,
+                                                    deviceUnlocked: { [weak self] in self?.deviceUnlocked },
+                                                    backgroundActivity: { [weak self] _ in
+                                                        self?.noteActivity("begin")
+                                                        return { [weak self] in self?.noteActivity("end") }
+                                                    })
         auth = SendoraCloudAuth(
             client: client,
             storage: storage,
@@ -364,6 +446,17 @@ final class AuthHarness {
         }
     }
 
+    /// Poll (≤ `timeout`) until `condition` holds — for the background refresh / grace-retry paths.
+    @discardableResult
+    func eventually(timeout: TimeInterval = 3, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            usleep(10_000)
+        }
+        return condition()
+    }
+
     func mint(forceNew: Bool = false) -> Result<SendoraCloudAuthUser, SendoraCloudAuthError> {
         return wait { done in auth.signInAnonymously(forceNew: forceNew, completion: done) }
     }
@@ -384,6 +477,8 @@ final class AuthHarness {
     var storedRefresh: String? { secure.get("sendora_auth_refresh_token") }
     var storedAccess: String? { secure.get("sendora_auth_access_token") }
     var storedUserJson: String? { secure.get("sendora_auth_user") }
+    func quarantineSlot(_ i: Int) -> QuarantineSlotRecord? { secure.get(SendoraStorage.quarantineSlotKeys[i]).flatMap { QuarantineSlotRecord.decode($0) } }
+    var refreshMarker: String? { secure.get(SendoraStorage.refreshInflightKey) }
     var storedSessionRecord: AuthSessionRecord? { secure.get(SendoraStorage.authSessionKey).flatMap { SendoraCloudAuth.decodeSessionRecord($0) } }
 
     /// Every Keychain key written since `mark` is one the SDK declares (the
@@ -403,7 +498,9 @@ final class AuthHarness {
         return SendoraCloudAuthUser(id: id, email: email, emailVerified: true, name: "Priya", isAnonymous: false, signupMethod: "password", lastLoginMethod: "password", project: TestJWT.projectA)
     }
 
-    static func slot(userId: String, refresh: String, heldAt: Int64, project: String? = TestJWT.projectA, autoRestore: Bool = true, sid: String = "sid-held") -> HeldSlotRecord {
-        return HeldSlotRecord(userId: userId, sid: sid, refreshToken: refresh, tokenAtHold: refresh, heldAt: heldAt, project: project, autoRestore: autoRestore)
+    static func slot(userId: String, refresh: String, heldAt: Int64, project: String? = TestJWT.projectA, autoRestore: Bool = true, sid: String = "sid-held",
+                     access: String? = nil, origin: String? = nil) -> HeldSlotRecord {
+        return HeldSlotRecord(userId: userId, sid: sid, refreshToken: refresh, tokenAtHold: refresh, heldAt: heldAt, project: project, autoRestore: autoRestore,
+                              accessToken: access, origin: origin)
     }
 }

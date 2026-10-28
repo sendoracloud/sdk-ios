@@ -31,6 +31,9 @@ extension SendoraCloudAuth {
     /// it rejects `SESSION_WITHHELD`. `forceNew: true` HOLDS the current guest
     /// (or replaces an identified session) and mints — refused with
     /// `.heldGuestLimit` when all 5 slots are in use.
+    /// ⚠ (s58.415, C3) A minted guest is returned only once its session is in the Keychain: if it cannot be written the
+    /// guest is never handed to the app and this fails `STORAGE_UNAVAILABLE` (retryable) — the retry replays the SAME
+    /// guest (the mint key is kept, Keychain).
     public func signInAnonymously(
         name: String? = nil,
         metadata: [String: Any]? = nil,
@@ -469,8 +472,10 @@ extension SendoraCloudAuth {
 
     /// Every held guest, newest first. Best-effort: a guest may be dead
     /// server-side until its token is presented. Never exposes tokens.
+    /// (s58.415) Excludes a slot whose occupant IS the current user (acting on it would erase / replace the live
+    /// session) and a slot issued by another API origin (reserved: never presented, never released).
     public func heldGuests() -> [SendoraCloudHeldGuest] {
-        return heldSlotsNewestFirst().map {
+        return visibleHeldSlotsNewestFirst().map {
             SendoraCloudHeldGuest(userId: $0.slot.userId, heldAt: $0.slot.heldAt, autoRestore: $0.slot.autoRestore, project: $0.slot.project)
         }
     }
@@ -629,14 +634,23 @@ extension SendoraCloudAuth {
         return withheldState?.info
     }
 
-    /// Resolve `withheld`: clear exactly the current-session keys, fire-and-forget
-    /// `/token/revoke` (like `signOut()`), KEEP held slots, the event queue and the
-    /// analytics id. LOCAL ONLY — never a server delete. `false` when not withheld.
+    /// Resolve `withheld`, LOCAL ONLY — never a server delete. KEEPS held slots, the event queue and the analytics id.
+    ///  - an IDENTIFIED withheld session: clear the current-session keys + fire-and-forget `/token/revoke` (like
+    ///    `signOut()`);
+    ///  - ⚠ (s58.415) an ANONYMOUS one — another project's / backend's guest — is MOVED to a held slot
+    ///    (`autoRestore: false`) and never revoked: its token may be that guest's only handle. With every held slot in
+    ///    use it STAYS withheld and this completes `false` (`signOut(discardGuest:completion:)` reports the
+    ///    `HELD_GUEST_LIMIT` refusal).
+    /// `false` when not withheld or nothing changed.
     public func discardWithheld(completion: @escaping (Bool) -> Void) {
         opsQueue.async {
-            guard let refresh = self.commitDiscardWithheld() else { completion(false); return }
-            self.fireAndForgetRevoke(refresh)
-            completion(true)
+            switch self.commitDiscardWithheld() {
+            case .cleared(let revoke):
+                if let refresh = revoke { self.fireAndForgetRevoke(refresh) }
+                completion(true)
+            case .notWithheld, .heldLimit, .writeFailed:
+                completion(false)
+            }
         }
     }
 
@@ -645,44 +659,154 @@ extension SendoraCloudAuth {
     /// Local-first (the one deliberate exception to proposal-then-CAS): the user
     /// is signed out on device even if the revoke request hangs. KEEPS held
     /// guests. In `withheld` this is `discardWithheld()`.
+    ///
+    /// ⚠ ADR-033 rev 3 (operator decision C, 2026-10-26): **a GUEST signs out exactly like an account** — its token
+    /// is dropped from this device (local clear + fire-and-forget revoke) and the server account is left alone; there
+    /// is no way back in to it from this device (the industry standard: Firebase, Supabase). Offer a link
+    /// (`signUp` / `link*()`) before you let a guest sign out. Emits only `.signedOut(reason: .user)` — never
+    /// `.guestHeld`. (A guest REPLACED by a sign-in is still held: that is the accidental path.)
+    ///
+    /// While the device's storage cannot be read (`status() == .unknown`, `storageUnavailable == true`) nothing is
+    /// deleted and the completion still runs: the sign-out is DEFERRED and executed once the store reads again (T9).
+    /// This overload never reports a failure (its signature is frozen, ADR-023); use
+    /// `signOut(discardGuest:completion:)` for a `Result`.
     public func signOut(completion: @escaping () -> Void) {
         opsQueue.async {
-            if let refresh = self.commitDiscardWithheld() {
-                self.fireAndForgetRevoke(refresh)
-                completion()
-                return
-            }
-            let refresh = self.getRefreshToken()
-            guard self.commitClear(reason: .user), let token = refresh else {
-                completion()
-                return
-            }
+            let (_, revoke) = self.performSignOut(discardGuest: false)
+            guard let token = revoke else { completion(); return }
             self.client.post(path: "/auth-service/token/revoke", body: ["refreshToken": token]) { _ in completion() }
         }
     }
 
-    /// The machine's RESET row (`reset.keeps_held`): the SIGN_OUT row, plus —
-    /// ONLY with `includeHeldGuests` — every slot released locally
-    /// (`.guestReleased(.reset)`), with NO server delete. Replayed by the
+    /// `signOut()` with the explicit option to ERASE the current guest (rev 3, INV-8 names it like
+    /// `alsoDiscardHeldGuests`): with `discardGuest: true` and an anonymous session, `POST /guest/discard` with
+    /// its token, then the local clear. A refused discard still clears locally (and revokes) and then reports the
+    /// failure. On an identified / withheld / signed-out session the flag changes nothing. A separate overload
+    /// (the label is required), so `signOut { … }` and unapplied references to the 5.3.0 declaration still compile.
+    /// A plain sign-out (`discardGuest: false`) always succeeds — deferred while the store is unreadable.
+    public func signOut(discardGuest: Bool, completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        opsQueue.async {
+            let (result, revoke) = self.performSignOut(discardGuest: discardGuest)
+            guard let token = revoke else { completion(result); return }
+            self.client.post(path: "/auth-service/token/revoke", body: ["refreshToken": token]) { _ in completion(result) }
+        }
+    }
+
+    /// SIGN_OUT rows on `opsQueue`: `withheld.discard`, `sign_out.deferred_unreadable`, `sign_out.discard_guest`,
+    /// `sign_out.local_first` (a guest AND an account — decision C — and LIMBO_A). Returns the outcome and the
+    /// refresh token the caller must revoke (`nil` = nothing to revoke).
+    internal func performSignOut(discardGuest: Bool) -> (Result<Void, SendoraCloudAuthError>, revoke: String?) {
+        // withheld.discard (s58.415, G4): an anonymous withheld session is moved to a held slot, never revoked; no free
+        // slot → stays withheld (HELD_GUEST_LIMIT). `discardGuest` never reaches another project's / origin's guest.
+        switch commitDiscardWithheld() {
+        case .cleared(let revoke):
+            if let refresh = revoke { fireAndForgetRevoke(refresh) }
+            return (.success(()), nil)
+        case .heldLimit:
+            return (.failure(.heldGuestLimit(held: heldCount(), limit: Self.heldGuestSlots)), nil)
+        case .writeFailed:
+            return (.failure(Self.storageUnavailableError()), nil)
+        case .notWithheld:
+            break
+        }
+        // sign_out.deferred_unreadable (T9): a session read is failing — re-read once; still unreadable → DELETE
+        // NOTHING, report success, and run the sign-out when the store reads again (recovery / T2 / next verb).
+        // It used to "succeed" doing nothing, and the recovery then announced the session as signed in again.
+        // An ERASE (`discardGuest: true`) is never downgraded to a plain (deferred) sign-out: it fails
+        // STORAGE_UNAVAILABLE (retryable) and nothing is deferred — lockstep with RN / web / Android.
+        recoverStorageIfNeeded()
+        lock.lock()
+        let unreadable = storageUnavailableState
+        if unreadable && !discardGuest { deferredSignOut = true }
+        lock.unlock()
+        if unreadable { return discardGuest ? (.failure(Self.storageUnavailableError()), nil) : (.success(()), nil) }
+
+        let (previous, _) = snapshotForAttempt()
+        if let prev = previous, prev.user.isAnonymous, discardGuest {
+            // sign_out.discard_guest: explicit destruction, then the clear.
+            let rich = requestSync(method: "POST", path: "/auth-service/guest/discard", body: ["refreshToken": prev.refreshToken])
+            let erased = (200..<300).contains(rich.statusCode) || rich.statusCode == 404
+            commitClear(reason: .user, expectRefresh: prev.refreshToken)
+            if erased { return (.success(()), nil) }
+            return (.failure(parseError(rich) ?? .unknown("Discard failed")), prev.refreshToken)
+        }
+        // sign_out.local_first — decision C: a guest's token is dropped like an account's (never held). LIMBO_A
+        // (a readable token, no readable user) clears + revokes the same way.
+        let refresh = getRefreshToken()
+        if commitClear(reason: .user), let token = refresh { return (.success(()), token) }
+        return (.success(()), nil)
+    }
+
+    /// The machine's RESET row (`reset.keeps_held`): the SIGN_OUT row (decision C: a guest's token is dropped
+    /// like an account's, revoked), plus — ONLY with `includeHeldGuests` — every held AND quarantine slot released
+    /// locally (`.guestReleased(.reset)`), with NO server delete. Replayed by the
     /// conformance suite. ⚠ It has NO public entry on iOS: `SendoraCloud.reset()`
     /// never touched the auth session (5.3.0 and earlier), and the lockstep
     /// ruling keeps it that way in a MINOR — see `SendoraCloud.reset()`.
     internal func resetFromParent(includeHeldGuests: Bool, completion: @escaping () -> Void) {
         opsQueue.async {
-            if let refresh = self.commitDiscardWithheld() {
-                self.fireAndForgetRevoke(refresh)
-            } else {
-                let refresh = self.getRefreshToken()
-                if self.commitClear(reason: .user), let token = refresh { self.fireAndForgetRevoke(token) }
-            }
+            let (_, revoke) = self.performSignOut(discardGuest: false)
+            if let token = revoke { self.fireAndForgetRevoke(token) }
             if includeHeldGuests {
                 for i in 0..<Self.heldGuestSlots {
-                    if let released = self.commitRelease(index: i) {
+                    // (G3) another origin's slot is never released.
+                    guard let occupant = self.slotAt(i), !self.isForeignOrigin(occupant.origin) else { continue }
+                    if let released = self.commitRelease(index: i, userId: occupant.userId, heldAt: occupant.heldAt) {
+                        self.emitAuthState(.guestReleased(userId: released.userId, reason: .reset, endReason: nil))
+                    }
+                }
+                for i in 0..<Self.quarantineSlots {
+                    guard let occupant = self.quarantineAt(i), !self.isForeignOrigin(occupant.origin) else { continue }
+                    if let released = self.commitQuarantineRelease(index: i, userId: occupant.userId, quarantinedAt: occupant.quarantinedAt) {
                         self.emitAuthState(.guestReleased(userId: released.userId, reason: .reset, endReason: nil))
                     }
                 }
             }
             completion()
+        }
+    }
+
+    // MARK: - Quarantine (ADR-033 rev 3 §3.8)
+
+    /// Guests whose token the server refused with anything but a confirmed `deleted` (s58.415 — was `reuse` only):
+    /// the CURRENT guest's, or a held guest's whose verdict did not prove it gone; newest first. Never exposes tokens. Never auto-restored, never refreshed in the
+    /// background, not counted toward the held-guest cap.
+    /// (s58.415) Excludes a slot whose occupant IS the current user and a slot issued by another API origin. A guest
+    /// whose owner could not be determined is listed as `unknown:<16 hex>` (recovering it names it).
+    public func getQuarantinedGuests() -> [SendoraCloudQuarantinedGuest] {
+        lock.lock(); defer { lock.unlock() }
+        let me = current?.user.id
+        return quarantine.compactMap { $0 }
+            .filter { $0.userId != me && !isForeignOrigin($0.origin) }
+            .sorted { $0.quarantinedAt > $1.quarantinedAt }
+            .map { SendoraCloudQuarantinedGuest(userId: $0.userId, quarantinedAt: $0.quarantinedAt, project: $0.project) }
+    }
+
+    /// Try to sign back in AS a quarantined guest: its token is presented to `/token/refresh`.
+    ///  - OK → installed like `restoreHeldGuest(id:)` (from a guest the current one is HELD first; from an
+    ///    identified session it is revoked): `.signedIn` (`lastSignedInCause() == .restore`) then
+    ///    `.guestReleased(.restored)`; the slot is released AFTER the install.
+    ///  - `deleted` → the slot is released (`.guestReleased(.dead)`) and this fails `HELD_GUEST_GONE`.
+    ///  - any other verdict (s58.415: `revoked` / `expired` too) → the slot is KEPT and this fails
+    ///    `QUARANTINE_UNRECOVERABLE` (kind `server`, retryable — ADR-036 recovers a guest whose successor was never
+    ///    presented). A slot of another API origin is never presented (same refusal, kept).
+    ///  - the CURRENT user's own slot → `SLOT_IS_CURRENT` (kind `config`), nothing sent.
+    /// Rejects `SESSION_WITHHELD` in `withheld`; queued like a restore in `unknown`.
+    public func recoverQuarantinedGuest(_ userId: String, completion: @escaping (Result<SendoraCloudAuthUser, SendoraCloudAuthError>) -> Void) {
+        opsQueue.async {
+            if let refusal = self.withheldRefusal() { completion(.failure(refusal)); return }
+            if let unsettled = self.settleUnknownIfNeeded() { completion(.failure(unsettled)); return }
+            if let refusal = self.withheldRefusal() { completion(.failure(refusal)); return }
+            completion(self.performRecoverQuarantined(userId: userId))
+        }
+    }
+
+    /// Erase a quarantined guest server-side (`POST /guest/discard` with its token). 2xx or 404 (a dead token)
+    /// releases the slot (`.guestReleased(.discarded)`); anything else keeps it and reports the failure.
+    public func discardQuarantinedGuest(_ userId: String, completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void) {
+        opsQueue.async {
+            if let refusal = self.withheldRefusal() { completion(.failure(refusal)); return }
+            completion(self.performDiscardQuarantined(userId: userId))
         }
     }
 

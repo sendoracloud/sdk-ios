@@ -99,12 +99,15 @@ extension AuthMachineConformanceTests {
         XCTAssertEqual(h.heldSlot(0)?.tokenAtHold, "rt-held", "tokenAtHold is kept for the merge() alias")
         XCTAssertEqual(h.storedRefresh, "rt-ident", "the CURRENT session is untouched by a held-slot rotation")
         // a stale per-slot CAS drops
-        XCTAssertFalse(h.auth.commitSlotRotation(index: 0, expectRefresh: "rt-held", newRefresh: "x"))
+        XCTAssertEqual(h.auth.commitSlotRotation(index: 0, expectRefresh: "rt-held", newRefresh: "x"), .casMismatch)
         XCTAssertEqual(h.heldSlot(0)?.refreshToken, "rt-held-2")
     }
 
     func scenario_refresh_ok_unrouted_drop() {
-        let h = anonymousHarness()
+        // An IDENTIFIED account (rev 3 narrowed this to identified while J.1 held a signed-out guest; since decision C
+        // a guest's sign-out drops its token too, so a late guest rotation is dropped the same way — the identified
+        // drive is kept as the pin).
+        let h = identifiedHarness()
         h.seedSlot(0, AuthHarness.slot(userId: "g", refresh: "rt-g", heldAt: 1))
         h.boot()
         let before = h.secure.snapshot()
@@ -112,14 +115,32 @@ extension AuthMachineConformanceTests {
         XCTAssertNil(h.auth.commitRefreshOk(sent: "rt-that-nothing-holds", tokens: tokens, user: Self.anon))
         XCTAssertEqual(h.secure.snapshot(), before, "DROP — a rotation whose sent token matches nothing installs nothing (P16)")
         XCTAssertEqual(h.transitionEventNames, [])
+        // The real interleaving: signOut() lands while the refresh is in flight → the late answer is DROPPED.
+        let late = identifiedHarness()
+        let gate = late.transport.gate("/auth-service/token/refresh")
+        late.transport.stub("POST", "/auth-service/token/refresh", Stub.session(user: Stub.user(from: Self.ident), tokens: Stub.tokens(access: Self.identToken(), refresh: "rt-late")))
+        let sem = DispatchSemaphore(value: 0)
+        late.auth.getAccessToken(forceRefresh: true) { _ in sem.signal() }
+        XCTAssertTrue(late.eventually { late.transport.requests(to: "/auth-service/token/refresh").count == 1 })
+        late.waitVoid { done in late.auth.signOut(completion: done) }
+        gate.signal()
+        XCTAssertEqual(sem.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(late.auth.status(), .signedOut, "the late rotation installs nothing")
+        XCTAssertNil(late.storedRefresh)
+        XCTAssertNil(late.refreshMarker, "the marker of a session that is gone is not left behind")
+        XCTAssertEqual(late.transitionEventNames, ["signed_out"])
     }
 
     func scenario_refresh_dead_current() {
         // 5.4.1: `reason` is sessionExpired for EVERY dead verdict (5.3.0's value — a listener
         // matching it must still see "deleted elsewhere" / "revoked"); the server's detail is
         // `lastSignedOutEndReason()`, set before delivery, nil iff the server sent none.
-        for (endReason, expected): (String?, SendoraCloudAuthSignedOutReason) in [("revoked", .sessionExpired), ("deleted", .sessionExpired), ("evicted", .sessionExpired), ("expired", .sessionExpired), ("reuse", .sessionExpired), ("unknown", .sessionExpired), (nil, .sessionExpired)] {
-            let h = anonymousHarness()
+        // ⚠ Pin converted (s58.415, G1 — zero guest-account loss): a GUEST is cleared here ONLY on a server-confirmed
+        // `deleted`; every other verdict (revoked / evicted / expired / reuse / unknown / absent) is
+        // refresh_dead.current_guest_quarantine. So the non-`deleted` cases drive an IDENTIFIED account (cleared as before)
+        // and `deleted` drives BOTH. (rev 3 converted only `reuse` this way.)
+        for (endReason, expected, guest): (String?, SendoraCloudAuthSignedOutReason, Bool) in [("revoked", .sessionExpired, false), ("deleted", .sessionExpired, true), ("deleted", .sessionExpired, false), ("evicted", .sessionExpired, false), ("expired", .sessionExpired, false), ("reuse", .sessionExpired, false), ("unknown", .sessionExpired, false), (nil, .sessionExpired, false)] {
+            let h = guest ? anonymousHarness() : identifiedHarness()
             h.seedSlot(0, AuthHarness.slot(userId: "g", refresh: "rt-g", heldAt: 1))
             h.boot()
             var seenInListener: SendoraCloudRefreshEndReason?? = .none
@@ -139,9 +160,10 @@ extension AuthMachineConformanceTests {
             XCTAssertEqual(seenInListener, .some(endReason.flatMap(SendoraCloudRefreshEndReason.init(rawValue:))), "endReason readable INSIDE the listener: \(endReason ?? "absent")")
             XCTAssertEqual(h.clearEffects.last?.rotateDeviceId, false, "no anon-id rotation on an involuntary death")
         }
-        // from unknown (the gap-fill refresh died) → signed_out, never a mint
+        // from unknown (the gap-fill refresh died) → signed_out, never a mint. (s58.415: a limbo whose owner is
+        // undeterminable is a guest → quarantined unless `deleted`; an access token saying "account" is cleared.)
         let limbo = AuthHarness()
-        limbo.seedLimbo(refresh: "rt-limbo")
+        limbo.seedLimbo(refresh: "rt-limbo", access: Self.identToken())
         limbo.boot()
         limbo.transport.stub("POST", "/auth-service/token/refresh", Stub.refreshDead(endReason: "revoked"))
         XCTAssertNil(limbo.getAccessToken())
@@ -164,25 +186,60 @@ extension AuthMachineConformanceTests {
     }
 
     func scenario_refresh_dead_held_slot() {
-        for (endReason, released) in [("deleted", true), ("revoked", true), ("expired", true), ("reuse", false), (nil, false), ("unknown", false)] as [(String?, Bool)] {
+        // ⚠ Pin converted (s58.415, G1): released ONLY on `deleted` (was deleted|revoked|expired). Every other verdict
+        // MOVES the token to a free quarantine slot (confirmed) and then releases the held slot by occupant
+        // (`guest_released{dead}`) — was "kept in place". The refresh carries the slot's access token as the hint (G2).
+        for (endReason, released) in [("deleted", true), ("revoked", false), ("expired", false), ("reuse", false), (nil, false), ("unknown", false)] as [(String?, Bool)] {
             let h = signedOutHarness()
-            h.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1))
+            h.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1, access: "at-held", origin: AuthHarness.origin))
             h.boot()
             h.transport.stub("POST", "/auth-service/token/refresh", Stub.refreshDead(endReason: endReason))
             let result: Result<SendoraCloudAuthUser, SendoraCloudAuthError> = h.wait { done in h.auth.restoreHeldGuest(id: "g-held", completion: done) }
             let label = endReason ?? "absent"
+            XCTAssertEqual(h.transport.lastRequest(to: "/auth-service/token/refresh")?.body?["accessTokenHint"] as? String, "at-held", "\(label): the slot's access token is the hint")
+            XCTAssertNil(h.heldSlot(0), "\(label): the held slot is emptied")
+            // (s58.415, C5) `dead` = a confirmed `deleted` only; a move to quarantine is guest_released{quarantined}
+            // THEN guest_quarantined{userId, endReason}.
+            XCTAssertEqual(h.transitionEventNames, released ? ["guest_released"] : ["guest_released", "guest_quarantined"], label)
+            if case .guestReleased(let id, let reason, let end)? = h.event(at: 1) {
+                XCTAssertEqual(id, "g-held"); XCTAssertEqual(reason, released ? .dead : .quarantined, label); XCTAssertEqual(end?.rawValue, endReason)
+            } else { XCTFail("\(label): guest_released first") }
+            if !released, case .guestQuarantined(let id, let end)? = h.event(at: 2) {
+                XCTAssertEqual(id, "g-held"); XCTAssertEqual(end, endReason.flatMap(SendoraCloudRefreshEndReason.init(rawValue:)) ?? .unknown, label)
+            } else if !released { XCTFail("\(label): guest_quarantined second") }
             if released {
-                XCTAssertNil(h.heldSlot(0), "\(label): release the slot")
                 XCTAssertEqual(result.failureError?.code, "HELD_GUEST_GONE", label)
-                XCTAssertEqual(h.transitionEventNames, ["guest_released"], label)
-                if case .guestReleased(_, let reason, let end)? = h.events.last { XCTAssertEqual(reason, .dead); XCTAssertEqual(end?.rawValue, endReason) }
+                XCTAssertNil(h.quarantineSlot(0), "\(label): a confirmed deletion keeps nothing")
             } else {
-                XCTAssertNotNil(h.heldSlot(0), "\(label): KEEP the slot — not proof the guest is gone")
+                let q = h.quarantineSlot(0)
+                XCTAssertEqual(q?.userId, "g-held", "\(label): moved to quarantine — never thrown away")
+                XCTAssertEqual(q?.refreshToken, "rt-held"); XCTAssertEqual(q?.accessToken, "at-held"); XCTAssertEqual(q?.origin, AuthHarness.origin)
                 XCTAssertEqual(result.failureError?.code, "RESTORE_FAILED", label)
                 XCTAssertEqual(result.failureError?.retryable, true, label)
-                XCTAssertEqual(h.transitionEventNames, [], "\(label): no guest_released")
+                XCTAssertEqual(h.auth.getQuarantinedGuests().map { $0.userId }, ["g-held"], label)
             }
         }
+        // Quarantine FULL → the held slot is KEPT with autoRestore:false (confirmed); ensureSession() then never presents
+        // it again and never fails RESTORE_FAILED for it — it mints.
+        let full = signedOutHarness()
+        full.seedSlot(0, AuthHarness.slot(userId: "g-held", refresh: "rt-held", heldAt: 1))
+        for i in 0..<3 { full.seedQuarantine(i, userId: "q\(i)", refresh: "rq\(i)", at: Int64(i + 1)) }
+        full.boot()
+        full.transport.stub("POST", "/auth-service/token/refresh", Stub.refreshDead(endReason: "revoked"))
+        full.transport.stub("POST", "/auth-service/anonymous", Stub.session(user: Stub.user(id: "fresh", isAnonymous: true), tokens: Stub.tokens(access: TestJWT.make(sub: "fresh"), refresh: "rt-fresh"), status: 201))
+        guard case .success(let minted) = full.mint() else { return XCTFail("ensureSession mints past a parked slot") }
+        XCTAssertEqual(minted.id, "fresh")
+        XCTAssertEqual(full.heldSlot(0)?.userId, "g-held", "kept"); XCTAssertEqual(full.heldSlot(0)?.autoRestore, false, "parked")
+        XCTAssertEqual(full.heldSlot(0)?.refreshToken, "rt-held")
+        for i in 0..<3 { XCTAssertEqual(full.quarantineSlot(i)?.userId, "q\(i)", "a full quarantine is never overwritten") }
+        XCTAssertEqual(full.transport.requests(to: "/auth-service/token/refresh").count, 1)
+        full.waitVoid { done in full.auth.signOut(completion: done) }
+        guard case .success = full.mint() else { return XCTFail("mint again") }
+        XCTAssertEqual(full.transport.requests(to: "/auth-service/token/refresh").count, 1, "the parked slot is never presented again by auto-restore")
+        // …while an explicit restore of it still surfaces RESTORE_FAILED (retryable).
+        let explicit: Result<SendoraCloudAuthUser, SendoraCloudAuthError> = full.wait { done in full.auth.restoreHeldGuest(id: "g-held", completion: done) }
+        XCTAssertEqual(explicit.failureError?.code, "RESTORE_FAILED")
+        XCTAssertEqual(full.heldSlot(0)?.userId, "g-held")
     }
 
     func scenario_refresh_transient_backoff() {
@@ -192,12 +249,19 @@ extension AuthMachineConformanceTests {
             let before = h.secure.snapshot()
             XCTAssertNil(h.getAccessToken(forceRefresh: true))
             XCTAssertEqual(h.auth.status(), .anonymous, "status \(response.status): NO identity change")
-            XCTAssertEqual(h.secure.snapshot(), before)
+            // (T15) The INV-16 marker is a Keychain item now and an unanswered / refused refresh KEEPS it (outcome
+            // unknown); every other key is byte-identical.
+            var after = h.secure.snapshot()
+            XCTAssertNotNil(after.removeValue(forKey: SendoraStorage.refreshInflightKey), "status \(response.status): the marker stays")
+            XCTAssertEqual(after, before)
             XCTAssertEqual(h.transitionEventNames, [])
         }
     }
 
     func scenario_sign_out_local_first() {
+        // ⚠ Pin converted back (decision C, 2026-10-26 — replaces J.1): a GUEST signs out exactly like an account —
+        // token dropped + revoked, `signed_out` ONLY, nothing new held. The first rev-3 cut narrowed this row to
+        // identified and HELD the guest instead; that bricked ensureSession() on the 5th sign-out (H1).
         for h in [anonymousHarness(), identifiedHarness()] {
             h.seedSlot(0, AuthHarness.slot(userId: "g", refresh: "rt-g", heldAt: 1))
             h.boot()
@@ -207,8 +271,10 @@ extension AuthMachineConformanceTests {
             XCTAssertNil(h.storedRefresh); XCTAssertNil(h.storedSessionRecord)
             XCTAssertNotNil(h.heldSlot(0), "KEEP held slots")
             XCTAssertEqual(h.transport.lastRequest(to: "/auth-service/token/revoke")?.body?["refreshToken"] as? String, refresh)
-            XCTAssertEqual(h.transitionEventNames, ["signed_out"])
+            XCTAssertEqual(h.transitionEventNames, ["signed_out"], "signed_out ONLY — never guest_held")
             if case .signedOut(let reason)? = h.events.last { XCTAssertEqual(reason, .user) }
+            XCTAssertEqual(h.auth.heldGuests().map { $0.userId }, ["g"], "nothing new is held (the pre-existing slot only)")
+            XCTAssertEqual(h.auth.getQuarantinedGuests().count, 0)
             XCTAssertEqual(h.clearEffects.last?.rotateDeviceId, true, "rotate the analytics anon id")
             XCTAssertEqual(h.clearEffects.last?.clearQueue, false, "keep the event queue")
             XCTAssertFalse(h.auth.cronArmed)
@@ -398,19 +464,38 @@ extension AuthMachineConformanceTests {
     }
 
     func scenario_reset_keeps_held() {
-        let h = anonymousHarness()
+        // An identified account first; a guest below (decision C: the SIGN_OUT half drops a guest's token like an
+        // account's — the first rev-3 cut held it).
+        let h = identifiedHarness()
         h.seedSlot(0, AuthHarness.slot(userId: "g0", refresh: "rt0", heldAt: 1)); h.seedSlot(1, AuthHarness.slot(userId: "g1", refresh: "rt1", heldAt: 2))
         h.boot()
         h.waitVoid { done in h.auth.resetFromParent(includeHeldGuests: false, completion: done) }
         XCTAssertEqual(h.auth.status(), .signedOut)
         XCTAssertNotNil(h.heldSlot(0)); XCTAssertNotNil(h.heldSlot(1), "reset() KEEPS held slots by default")
         XCTAssertEqual(h.transitionEventNames, ["signed_out"])
-        XCTAssertEqual(h.transport.lastRequest(to: "/auth-service/token/revoke")?.body?["refreshToken"] as? String, "rt-anon")
+        XCTAssertEqual(h.transport.lastRequest(to: "/auth-service/token/revoke")?.body?["refreshToken"] as? String, "rt-ident")
         h.waitVoid { done in h.auth.resetFromParent(includeHeldGuests: true, completion: done) }
         XCTAssertNil(h.heldSlot(0)); XCTAssertNil(h.heldSlot(1))
         XCTAssertEqual(h.transitionEventNames, ["signed_out", "guest_released", "guest_released"])
         XCTAssertEqual(h.transport.requests(to: "/auth-service/guest/discard").count, 0, "NO server delete")
         if case .guestReleased(_, let reason, _)? = h.events.last { XCTAssertEqual(reason, .reset) }
+        // ⚠ Pin converted (decision C): RESET on a GUEST signs it out like an account (token dropped + revoked, no
+        // hold — it used to HOLD it with no revoke); with includeHeldGuests every held AND quarantine slot then goes
+        // (local release, no server delete).
+        let g = anonymousHarness()
+        g.seedSlot(0, AuthHarness.slot(userId: "g0", refresh: "rt0", heldAt: 1))
+        g.seedQuarantine(0, userId: "g-q", refresh: "rt-q")
+        g.boot()
+        g.waitVoid { done in g.auth.resetFromParent(includeHeldGuests: false, completion: done) }
+        XCTAssertEqual(g.auth.status(), .signedOut); XCTAssertNil(g.storedRefresh)
+        XCTAssertEqual(g.heldSlot(0)?.userId, "g0", "the pre-existing held slot is kept"); XCTAssertNil(g.heldSlot(1), "the guest is NOT held")
+        XCTAssertTrue(g.eventually { g.transport.lastRequest(to: "/auth-service/token/revoke")?.body?["refreshToken"] as? String == "rt-anon" }, "the guest's token is revoked like an account's")
+        XCTAssertEqual(g.transitionEventNames, ["signed_out"])
+        XCTAssertNotNil(g.quarantineSlot(0), "reset() keeps the quarantine slots by default")
+        g.waitVoid { done in g.auth.resetFromParent(includeHeldGuests: true, completion: done) }
+        XCTAssertNil(g.heldSlot(0)); XCTAssertNil(g.quarantineSlot(0))
+        XCTAssertEqual(g.transitionEventNames, ["signed_out", "guest_released", "guest_released"])
+        XCTAssertEqual(g.transport.requests(to: "/auth-service/guest/discard").count, 0)
         // in withheld: RESET = DISCARD_WITHHELD (+ the parent's queue clear); held survives
         let w = withheldHarness()
         w.seedSlot(0, AuthHarness.slot(userId: "g0", refresh: "rt0", heldAt: 1))

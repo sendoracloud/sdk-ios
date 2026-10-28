@@ -6,7 +6,290 @@ Published at `github.com/sendoracloud/sdk-ios`. Swift 5.9+, **iOS 15+** (`Packag
 
 
 
-## 5.9.0 (s58.405-k) — built, not published — keep a held guest's support tickets on discard
+## Unreleased — token durability, ADR-033 rev 3 §3.8 (s58.415) — version 5.10.0, NOT yet published
+
+Law: ADR-033 "Revision 3" + §3.8 (INV-16, INV-17, quarantine, sign-out (decision C), release by occupant); shared rows in
+`packages/shared/src/auth-machine/transitions.ts` (golden = 45 rows). Audit: `docs/audit/sdk-auth-s58.415/ios.md`
+H1/H2/H3 (+ M3); spec FS1–FS6: `docs/audit/sdk-auth-s58.415/faulty-storage-scenarios.md`. Lockstep with RN `d4009948`.
+
+- **`Storage.swift` / `KeychainSecureStore`** — `read` (INV-17: `.absent` ONLY for `errSecItemNotFound`; −25308 / −34018 /
+  undecodable = `.unavailable`), `write` (`SecItemUpdate` IN PLACE, `SecItemAdd` only on NotFound, a racing add →
+  update; every OSStatus checked → `Bool`), `remove`. `set`/`get`/`delete` delegate (the 5.9.0 delete-then-add is gone —
+  a failed add or a kill between the two left the frozen refresh key GONE, and the next hydrate cleared the record
+  holding R2 as a stale blob). Security calls behind `KeychainAPI` (seam; `.system` in production).
+  **Accessibility: every SDK item was already `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (no `WhenUnlocked` in
+  the history); every write now also passes it to `SecItemUpdate`, so an item of any other class migrates on its next
+  write. Reads never filter on it.** New keys: `sendora_auth_quarantine_0…2` (Keychain, in `secureKeys`) and
+  `sendora_auth_refresh_inflight` (Keychain since step-2 T15 — the first cut's UserDefaults read-back proved nothing
+  about the disk).
+- **INV-16** — `performRefresh` writes + confirms the marker `{v:1,sid,startedAt}` BEFORE `/token/refresh` (a marker
+  that cannot be written ABORTS the refresh). The rotated pair's dual-write is CONFIRMED (`writeCurrentRecord` → `Bool`;
+  if the frozen refresh key fails the record is not written either); confirmed → marker removed; unconfirmed →
+  `pendingCommit` (R2 lives in memory, the marker stays), re-written by `retryPendingCommitIfNeeded()` on the next
+  `getAccessToken`, refresh, cron tick and identity verb — never re-rotated. A hydrate that finds the marker refreshes
+  AT ONCE (`hydrate.refresh_inflight`; a write-forward does not clear it). Status 0 / an unreadable 2xx = outcome
+  unknown: marker kept, grace retries of the SAME token at 2/5/15/35 s from the first attempt (deadline 50 s), also
+  first for a transient refusal. `/token/refresh` passes `bypassBreaker: true` (audit C) and captures `self` strongly
+  (audit M3).
+- **INV-17** — any of the five session keys `.unavailable` at hydrate → `unknown`, `auth.storageUnavailable == true`,
+  NOTHING written / removed, no cron; slots and quarantine slots that error or fail to parse are RESERVED (in T, never
+  free, never released). `settleUnknownIfNeeded` (every MINT / SIGN_IN / LINK / RESTORE / RECOVER / DELETE) re-reads
+  every second for `storageUnavailableQueueMs` (10 s) then fails `STORAGE_UNAVAILABLE` (`.rejected`, kind `.network`,
+  retryable) — never a mint. Re-hydrate on `UIApplication.protectedDataDidBecomeAvailableNotification` (the same NAME
+  is observed off UIKit so `swift test` drives it) and at the top of every refresh; a recovered session emits `.signedIn`.
+- **Quarantine (decision D)** — `reuse` on the CURRENT guest (or a limbo whose access token says `is_anonymous`) →
+  slot written + CONFIRMED (free, else oldest; reserved never touched) → clear → `.guestQuarantined(userId:endReason:)`
+  → `.signedOut(.sessionExpired)` with `lastSignedOutEndReason() == .reuse`. Unconfirmed slot write → session NOT
+  cleared. Not in T, never auto-restored, never refreshed in the background. `getQuarantinedGuests()`,
+  `recoverQuarantinedGuest(_:)` (OK → restore rows; deleted|revoked|expired → released + `HELD_GUEST_GONE`; reuse →
+  kept + `QUARANTINE_UNRECOVERABLE`, kind `.server`, retryable), `discardQuarantinedGuest(_:)` (2xx/404 release).
+- **Guest `signOut()` — ⚠ SUPERSEDED by decision C (see "Step-2 review fixes" below).** The first cut (J.1) HELD the
+  guest (`autoRestore:false`, no revoke) with a quarantine fallback; it is GONE. New overload
+  `signOut(discardGuest:completion: (Result<Void, …>))` — `true` → `POST /guest/discard` then clear (a refused discard
+  clears + revokes + fails). `signOut(completion:)` unchanged signature. RESET row: the SIGN_OUT half (a guest's token
+  dropped + revoked like an account's); `includeHeldGuests` also releases the quarantine slots.
+- **Release by occupant (N4)** — `commitRelease(index:userId:)` / `commitQuarantineRelease(index:userId:)`; a slot that
+  now holds anyone else is left alone. `commitHold` returns `HoldOutcome` (`.held` / `.noFreeSlot` / `.writeFailed`).
+- **iOS readings (differ from RN, on purpose):** `storageUnavailable` is a property read inside the `.initial` arm, not
+  a 4th payload (the case is frozen — same move as `lastSignedInCause()`); the two codes ride `.rejected(code:)` +
+  `classifyKind` (no new error case); `.guestQuarantined` is a new state-change case (additive, consumers already
+  default-branch). The hold write is confirmed BEFORE the install (T4; RN now confirms too). `MachineConfig.graceRetryScale` (`nil` in `AuthHarness` = no background retries; `FaultyHarness` 0.01)
+  and `storageUnavailableQueueMs` are test seams; production = 1 / 10 000.
+- **Guards.** `FaultyStorageTests.swift` FS1–FS6 ALL PLAIN (18; FS1 ×2 faults × {process keeps running, relaunch
+  inside the grace}; FS2 rewritten to the corrected spec: inside the grace → recovered, past it → quarantined; the
+  double now models the rev-3 store — failed write keeps the OLD value, a kill = the write never landed).
+  `AuthMachineRowScenarios3.swift` drives the 9 rev-3 rows + N4; `test_tableIsTotalOverStatesTimesEvents` (90 pairs,
+  covered XOR unspecified) + `test_durabilityVocabulariesEqualTheFixture`; `KeychainStoreSemanticsTests.swift` (6, the
+  real store over a fake Security.framework). Pins converted (in-file notes): `sign_out.local_first`,
+  `reset.keeps_held`, `refresh_ok.unrouted_drop`, `refresh_dead.current`(reuse) → IDENTIFIED;
+  `test_anExternalSignInThatLandsAfterSignOutIsDroppedAndRevoked` (the signed-out guest is now held).
+  `swift test --skip Live` 157 (1 skipped). ⚠ No test name may contain "Live" — `--skip Live` is a regex.
+- Mutations (`scratchpad/ios-durability-mut.py`, backups `ios-dur-bak__<path>`, restore in `finally` + `cmp` vs backup
+  AND the pristine snapshot, subprocess timeout = red), assertion failures / 157 — ALL 17 RED: D1 no marker before
+  refresh 32 · D2 marker removed before the write confirmed 29 · D3 re-rotate to repair a failed write 4 · D4
+  delete-then-add back in the Keychain write 6 · D5a Keychain non-NotFound status read as absent 5 · D5b hydrate reads a
+  session read error as absent 21 · D6 reuse on a guest clears (no quarantine) 21 · D7 quarantined guest auto-restored 1
+  · D8 release without the occupant check 9 · D9a guest signOut revokes 1 · D9b guest held with autoRestore:true 4 ·
+  D10 no grace retry 12 · D11 unreadable held slot read as free 3 · D12 refresh held by the breaker 6 · D13 quarantine
+  counted in T 2 · D14 verbs skip the STORAGE_UNAVAILABLE wait 4 · D15 a failed session write reported as landed 40.
+  ⚠ D4/D5a are caught ONLY by `KeychainStoreSemanticsTests` (every other suite runs on doubles).
+  ⚠ Not test-covered: the real `protectedDataDidBecomeAvailableNotification` delivery on a device (the name is pinned,
+  the delivery is UIKit's); a real-Keychain run before first unlock needs a device — the operator's pre-mirror smoke.
+
+### Step-2 review fixes (s58.415, `docs/audit/sdk-auth-s58.415/TRIAGE-step2.md`) — same Unreleased batch, lockstep RN `cebf4bf4`
+
+⚠ **Decision C (operator, 2026-10-26) replaces J.1:** a guest's plain `signOut()` drops its token like an account's
+(local clear + fire-and-forget revoke, `.signedOut(.user)` ONLY — never `.guestHeld`, never held, never quarantined).
+The hold bricked `ensureSession()` after 5 sign-outs (review H1) and its `.guestHeld` made the README's "keep →
+restore" handler undo the sign-out. `commitQuarantineOnSignOut` deleted; `signOut(discardGuest:)` unchanged; RESET =
+the same SIGN_OUT half. Fixes (iOS file:line findings: `review-internal-ios.md` H2/H3/M1–M4, L3/L5/L7; Codex F2/F3/F7/F9):
+- **T1** `beginGraceWindow(newAttempt:)` — every non-grace attempt starts a NEW 2/5/15/35 s schedule (`gen` stamps it;
+  a superseded timer fires nothing); grace timers call `refreshAccessToken(force:graceRetry: true)`.
+- **T2** `awaitStorageReadable` samples `deviceUnlockedSample()` (UIKit: `ProtectedDataMonitor` — `isProtectedDataAvailable`
+  via the `sharedApplication` selector on MAIN, kept current by protected-data / didBecomeActive notifications; no
+  `UIApplication.shared`, so extension-safe; off UIKit always `true`; seam `MachineConfig.deviceUnlocked`). Failing the
+  whole window with ≥1 "unlocked" and no "locked" sample → `acceptPermanentReadFailure()`: `SendoraStorage` marks the
+  failing session keys accepted-unreadable (read as `.absent`, NEVER removed by `clearAuthTokens` / `write(nil)`, a
+  successful write un-marks), re-hydrates (no stale-blob clear over an accepted refresh key), runs a deferred sign-out.
+  A memory-only session (`sessionIsMemoryOnly`) refreshes without the marker / T12 block (−34018: nothing on disk to protect).
+- **T4** the hold is already confirmed before the install on iOS (`commitHold` → `.writeFailed` → `STORAGE_UNAVAILABLE`,
+  B revoked, the guest's token never revoked) — now pinned. **T5** `settleUncertainRefreshBeforeHold()` (sign-in /
+  `forceNew` / restore / recover): an open grace schedule for the current guest's token → ONE forced refresh first;
+  `casAfterSettle` keeps the identity CAS across a same-user rotation (its `sid` may change).
+- **T6** `reuse` with no readable quarantine slot or an unconfirmed slot write → session KEPT, `reuseBackoff` 30 s on
+  that token (no storm). **T7 (iOS H3)** restore / recover / claim release their slot only when `installConfirmed()`;
+  else `PendingRelease` runs (with its `guestReleased`) when `retryPendingCommitIfNeeded` lands THAT session; a clear
+  drops pending releases (slot kept); hydrate drops a quarantine slot that is an exact duplicate (same token) of the
+  current session. **T8** `commitSlotRotation` / `commitQuarantineRotation` → `SlotWrite` (`confirmed | casMismatch |
+  writeFailed`); the successor stays in memory, the slot is dirty and re-written by `retryPendingCommitIfNeeded`;
+  `refreshHeld` → `RESTORE_FAILED` (retryable), recover → `STORAGE_UNAVAILABLE`.
+- **T9** `performSignOut` re-reads once; still unreadable → `deferredSignOut`, deletes nothing, reports success; recovery
+  (signal / didBecomeActive / verb / T2) runs it (clear + revoke + ONE `.signedOut(.user)`, no `.signedIn` first). `signOut(discardGuest: true)` while unreadable fails `STORAGE_UNAVAILABLE` (retryable) and defers nothing (an erase is never downgraded; lockstep RN / web / Android). A verb
+  that recovers the store runs the sign-out BEFORE itself (RN queues it after — iOS is stricter). **T10** limbo quarantine:
+  access-token claims first, else `LimboRecord.diskUser` (kept only with no access token). **T12** a pending commit whose
+  disk refresh ≠ memory blocks the next rotation. **T14** `commitRelease(…heldAt:)` / `commitQuarantineRelease(…quarantinedAt:)`
+  everywhere (the dead-slot branch reads token + occupant in one lock, L3). **T15** marker = Keychain item (in
+  `secureKeys`; present when its read fails); storage recovery also observes `appDidBecomeActiveNotification`.
+  **T17** `heldEventCount()` (reserved slots included) for every `.guestHeld`; `RecordingSecureStore` `set`/`delete` honour `failWrites`.
+- **iOS H2** hydrate rebuilds from the frozen keys ONLY when the user blob is the access token's `sub` (else LIMBO_A →
+  gap-fill names the user; no slot dropped); `writeCurrentRecord` writes access FIRST and stops if it fails, so "refresh
+  landed" ⇒ its access token landed.
+- Not applicable: T3 / T11 / T13 (RN), T16 (Android). Deferred list untouched (`beginBackgroundTask`, multi-instance…).
+- **Guards.** `DurabilityReviewTests.swift` (22). Pins converted (in-file notes): `sign_out.local_first` (guest AND
+  account), `reset.keeps_held` (guest dropped + revoked), `test_anExternalSignInThatLandsAfterSignOut…` (nothing held),
+  `refresh_transient.backoff` (marker kept in the Keychain), the marker-tier assertion, FS1 `.locked` (lock starts after
+  the request — the marker is written before it), `refresh_ok.write_failed`. `sign_out.guest_holds` → `sign_out.deferred_unreadable`;
+  unspecified 9 → 8. `swift test --skip Live` **179 (1 skipped), 0 failures**; iOS Simulator `xcodebuild` green.
+  ⚠ The first draft of the T5 test was named `…LiveSuccessor` and was SILENTLY SKIPPED by `--skip Live` — it hid a real
+  bug (the settle refresh was short-circuited by a still-valid access token; it is `force: true` now). Never put "Live" in a test name.
+- Mutations (`scratchpad/ios-review-mut.py`, backups `ios-rev-bak__<id>__<path>`, restore in `finally`, `cmp` vs backup AND
+  pristine, timeout = red), failures / 179 — ALL 32 RED: C1 guest signOut skips the revoke 11 · C2 guest signOut holds 5 ·
+  T1 2 · T2a never accepted 1 · T2b stale-blob clear over accepted key 1 · T2c clear deletes accepted keys 1 · T2d a
+  "locked" sample ignored 1 · T4 hold write unconfirmed 7 · T5 2 · T6a clears 6 · T6b no back-off 1 · T7a restore 2 · T7b
+  recover 2 · T7c claim 1 · T7d deferred releases never run 6 · T7e duplicate quarantine kept 1 · T8a 6 · T8b 4 · T8c dirty
+  never re-written 1 · T8d/T8e successor dropped from memory 2/1 · T9a not deferred 8 · T9b signedIn announced first 2 ·
+  T10 2 · T12 3 · T14a/b 3/3 · T15a no didBecomeActive re-check 2 · T15b UserDefaults read-back 41 · T17 1 · H2a no sub
+  check 5 · H2b refresh written after a failed access write 6.
+  ⚠ Not test-covered: `ProtectedDataMonitor` itself (UIKit-only, compiled by the simulator build; the seam drives the rule).
+
+### Zero guest-loss batch (s58.415)
+
+Spec `docs/audit/sdk-auth-s58.415/SPEC-guest-loss-sdk.md` (G1–G8 + iOS D2 / #4 / #8 / #9 / #10 / #11); findings
+`guest-loss/audit-ios.md`; shared rows regenerated in `transitions.ts` (`RELEASE_HELD_ON_END_REASONS = ["deleted"]`).
+Server half already on the branch (`accessTokenHint`, ADR-036 amended). Same Unreleased batch, version NOT bumped.
+- **G1** a guest's token is thrown away ONLY on a server-confirmed `deleted`. CURRENT guest — or a limbo whose owner
+  cannot be determined (no readable `is_anonymous`, no user blob → occupant `unknown:<first 16 hex of sha256(token)>`)
+  — on ANY other verdict → `commitQuarantineCurrent` (free slot, confirmed) → clear; `guestQuarantined.endReason` = the
+  verdict (`.unknown` when absent — the payload is non-optional); no free slot / unconfirmed → kept + 30 s back-off (T6).
+  ⚠ A full quarantine is NEVER overwritten (`quarantineSlotIndexLocked` = free only). HELD slot, non-`deleted`:
+  `commitHeldSlotNotDropped` → free quarantine slot (confirmed) then release by occupant (`guestReleased{dead}`), else
+  PARK it `autoRestore:false` (confirmed, dirty-retried). Restore / claim surface `RESTORE_FAILED`; ensureSession()'s
+  auto-restore moves on (`.keptRetryable: continue`, cap re-checked) — never RESTORE_FAILED for a slot it will not
+  present again. Recover: `deleted` releases, anything else kept + `QUARANTINE_UNRECOVERABLE`; an `unknown:` occupant
+  skips the identity tripwire (the answer names it).
+- **G2** `accessTokenHint` on every refresh: current (stashed access), held (`HeldSlotRecord.accessToken`, set at HOLD
+  and on every `commitSlotRotation(newAccess:)`), quarantine (`QuarantineSlotRecord.accessToken`). None known → none sent.
+- **G3** `origin` (`APIClient.apiOrigin`: scheme://host[:port], lower-case) on `AuthSessionRecord` (stamped by every
+  non-hydrate install), held + quarantine slots. Hydrate: record origin ≠ configured → `withheld{reason:"origin_mismatch"}`
+  (`commitHydrateOriginMismatch`, no network, no writes, even with a marker). Foreign slots: not listed, not eligible,
+  never presented / discarded / released (reset included), counted in T. Absent = matching.
+  `SendoraCloudWithheldInfo.reason` is now a stored `let` (internal init, default `project_mismatch`) — read-only for apps.
+- **G4** `commitDiscardWithheld` → `DiscardWithheldOutcome`: an ANONYMOUS withheld session is HELD first
+  (`autoRestore:false`, project, origin, accessToken), never revoked; no free slot → stays withheld
+  (`discardWithheld` → false, `signOut(discardGuest:)` → `HELD_GUEST_LIMIT`; unconfirmed → `STORAGE_UNAVAILABLE`).
+  Identified → clear + revoke as before. (iOS `SendoraCloud.reset()` never touched auth — nothing to inherit.)
+- **G5** hydrate drops a held / quarantine slot ONLY when its refresh token equals the current one
+  (`dropSlotsDuplicatingCurrentLocked`, also after every confirmed non-restore install, comparing against the NEW
+  token). `heldGuests()` / `getQuarantinedGuests()` exclude the current user; discard / claim / restore / recover /
+  discardQuarantined refuse it with `.rejected(code: "SLOT_IS_CURRENT")` (kind `.config`, classifyKind), nothing sent.
+  ⚠⚠ A duplicate drop on every pending-commit LANDING (`retryPendingCommitIfNeeded`, callable from any thread via
+  `getAccessToken`) was written and REMOVED: between a HOLD and its install the held slot legitimately holds the CURRENT
+  token, and the drop + install left the guest with zero handles. The G8 test found it (mutation G5e pins it).
+- **G6** mint key written and CONFIRMED (read back, `writePendingMintKey`) before `/anonymous` (fails →
+  `STORAGE_UNAVAILABLE`, no request); cleared only when the minted session is durable (`commitMintKeyAfterInstall`,
+  else `mintKeyClearPending` → cleared when the pending commit lands, or by a clear of that session). ⚠ Stays
+  UserDefaults like RN / web / Android: the read-back proves process-visible state only (T15's caveat).
+- **G7** every install already went through `commitInstall` → confirmed or pending (T12). Hydrate never deletes a
+  record whose refresh token the frozen keys lack / contradict without `commitRescueLeftoverRecord` first: a GUEST's
+  record not held elsewhere and not an older generation of the live user → free quarantine slot (confirmed); no slot →
+  record left as it is (no clear, no write-forward over it). Accounts: cleared as before (credentials recover them).
+- **G8** restore / recover: `awaitRefreshAndSyncHeldPrevious` before `commitInstall` — awaits the in-flight refresh
+  and, if it rotated the guest just held, moves the held slot onto the successor (sid is the family id: the CAS would
+  NOT catch a same-user rotation, so the held slot kept the spent token).
+- **D2** `KeychainSecureStore.accessibility(forKey:)`: `SendoraStorage.travellingAuthKeys` (four frozen keys, record,
+  5 held, 3 quarantine, marker) → `kSecAttrAccessibleAfterFirstUnlock`; everything else (device id via `addIfAbsent`,
+  user id, known devices, link revoke tokens) stays `…ThisDeviceOnly`. `SecItemUpdate` carries the class, so existing
+  items migrate on their next write (pinned on the fake Security.framework). The mint key is UserDefaults (no class).
+- **#4** `beginRefreshActivity` before the marker write → `endRefreshActivityIfIdle` after the commit (held while a grace
+  retry is scheduled; a superseded timer ends it). UIKit: `ExpiringActivity` (`ProcessInfo.performExpiringActivity`,
+  block waits ≤ 170 s on a semaphore; extension-safe); off UIKit a no-op; seam `MachineConfig.backgroundActivity`.
+- **#8** an unconfirmed rotation-only write (limbo gap-fill without a user, withhold-on-refresh) → `pendingRotation`,
+  retried by `retryPendingCommitIfNeeded`, blocks the next rotation (T12). **#9** limbo hydrate + marker → refresh at
+  once. **#10** `SendoraStorage.write` re-reads an accepted-unreadable key; a value → refuse + `acceptedKeyFoundValue` →
+  `rehydrateAfterAcceptedKeyRecovered` (on `opsQueue`: HOLD the memory-only guest — revoke an account — then
+  un-accept, hydrate, `.signedIn`). **#11** frozen refresh absent + frozen access == record.accessToken → rebuilt from
+  the record + write-forward (5.9.0 delete-then-add leftover), not cleared.
+- **Guards.** `GuestLossTests.swift` (18). Pins converted (in-file notes): `refresh_dead.current` (non-`deleted` →
+  identified; `deleted` both), `refresh_dead.held_slot` (only `deleted` releases; others → quarantine; full → parked),
+  `refresh_dead.current_guest_quarantine` (full quarantine kept, not overwritten; every verdict; `unknown:` occupant),
+  `recover_quarantined.as_restore` (revoked/expired/unknown kept), `withheld.discard` (clear+revoke = identified only;
+  guest moved), `hydrate.project_mismatch` (+ origin mismatch), `test_aRecordWhoseFrozenKeysAreGone…` (guest rescued),
+  KeychainStoreSemantics ThisDeviceOnly → AfterFirstUnlock (+ D2 test). `swift test --skip Live` **198 (1 skipped), 0
+  failures** (×4); iOS Simulator `xcodebuild` green; `check-sdk-request-bodies` green (all three refresh bodies read
+  `{refreshToken, accessTokenHint}`); `check-sdk-snippets` green (README prose/comment edits only).
+- Mutations (`scratchpad/ios-gl-mut.py`, backups `ios-gl-bak__<id>__<path>`, restore in `finally` + `cmp` vs backup AND
+  pristine, timeout = red), failures / 198 — ALL 38 RED: D2a auth keys ThisDeviceOnly 21 · D2b device id travels 3 ·
+  G1a guest dropped on non-reuse 26 · G1b undeterminable limbo cleared 6 · G1c release on revoked|expired 47 · G1d full
+  quarantine overwrites oldest 11 · G1e held slot neither moved nor parked 44 · G1f parked keeps autoRestore 3 · G1g
+  auto-restore aborts 3 · G1h occupant without hash 1 · G2a no hint (current) 7 · G2b no hint (slot) 9 · G2c hold
+  without access 2 · G2d rotation keeps old access 1 · G3a hydrate ignores origin 12 · G3b foreign held listed 2 · G3c
+  foreign quarantine presented 2 · G3d reset releases foreign 4 · G4a withheld guest revoked 2 · G4b not held 21 · G4c
+  no slot → cleared 4 · G5a drop by userId 8 · G5b current listed 2 · G5c no SLOT_IS_CURRENT 13 · G5d current
+  quarantine listed 1 · G5e landing drop (the hold race) 1 · G6a unconfirmed mint key 4 · G6b key cleared early 3 · G7a
+  no rescue 5 · G7b unconfirmed install not pending 36 · G8a no await 1 · G8b held not synced 1 · I4a no activity 4 ·
+  I4b ended during grace 2 · I8 rotation-only not pending 1 · I9 no limbo refresh 3 · I10 no re-read 4 · I11 5.9.0
+  leftover cleared 4. (G1h's first form did not compile — `SHA256Digest.count` — re-run in a compiling form.)
+  ⚠ Not test-covered: `ExpiringActivity` itself (UIKit-only; compiled by the simulator build — the seam drives the
+  rule); a real backup → restore of `AfterFirstUnlock` items onto a second iPhone (device-only — operator smoke).
+
+### Zero guest-loss batch C (s58.415, Codex review `review-codex-guest-loss.md`) — on top of batch A `e928129f`
+
+Spec: `SPEC-guest-loss-sdk.md` "## Batch C". Shared rows (golden regenerated): `GuestReleasedReason` + `quarantined`;
+`refresh_dead.held_slot` emits `guest_released{quarantined}` then `guest_quarantined`; `withheld.discard` emits
+`guest_held` before `signed_out`. C4 is RN-only.
+- **C1 (Codex #1)** `commitConfirmHeldSlotDurable` / `commitConfirmQuarantineSlotDurable`: before ANY held / quarantine
+  `/token/refresh` (`refreshHeld` — restore, claim, auto-restore — and recover) a T8-dirty slot is re-written and
+  CONFIRMED; still not durable → `STORAGE_UNAVAILABLE` (retryable), NO network. (Re-rotating an undurable R2 → R3
+  stranded R1: ADR-036 recovers only a direct successor never presented.) Auto-restore under the fault aborts the mint.
+- **C2 (Codex #3; iOS #10 verified + closed)** `SendoraStorage.write` over a key T2 accepted as unreadable re-reads it:
+  value → refused + `acceptedKeyFoundValue`; ⚠ STILL unreadable → refused too (#10 only refused on a value — the gap
+  Codex named); absent → written. `commitInstall` (every reason but hydrate / refresh) re-reads the given-up keys first:
+  a value → `.storeRecovered` (nothing installed, re-hydrate scheduled; mint revokes its pair + forgets its key; other
+  verbs drop + revoke through their default branch). `mintFresh` re-checks BEFORE `/anonymous` (healed → re-hydrate,
+  `STORAGE_UNAVAILABLE`, no second guest). The re-hydrate holds a memory-only guest only if no slot holds it already.
+  ⚠ Consequence (by design): with the keys STILL unreadable, T2's "proceed as absent" no longer yields a session from a
+  mint (C3 drops it) — a sign-in still works in memory (G7 pending). A device whose Keychain is broken for good (−34018,
+  no entitlement) gets no guest until it reads; the mint key replays one guest, so nothing piles up server-side.
+- **C3 (Codex #4 + #7)** `commitInstall(.mint)` writes FIRST and installs only when the write confirmed (and nothing is
+  written while a given-up key still fails to read); otherwise `.notDurable`: no `current`, no event, no identity hook,
+  the previous session (forceNew) put back best-effort, the mint key KEPT → `STORAGE_UNAVAILABLE`; `performMint` rolls
+  back a forceNew hold. A retry replays the same guest (B10); past 24 h the server releases the expired key (server
+  fix in `e928129f`). ⚠ The mint key moved to the KEYCHAIN (`SendoraStorage.mintKeyKey`, same literal as the UserDefaults
+  key; in `secureKeys` + `travellingAuthKeys`; legacy UserDefaults value read as a fallback and removed on the next
+  write); an unreadable mint key → `STORAGE_UNAVAILABLE`, never a new key. G6's `mintKeyClearPending` is now dead for
+  mints (kept for no other path) — batch-A mutant G6b is EQUIVALENT under C3 (an install is always durable).
+- **C5** `SendoraCloudGuestReleasedReason.quarantined` (additive; doc says default-branch, like `.guestQuarantined`);
+  `emitMovedToQuarantine` = `guestReleased(.quarantined, endReason)` → `guestQuarantined(userId, endReason ?? .unknown)`;
+  `.dead` only on `deleted`. `commitDiscardWithheld` emits `guestHeld` before `signedOut(.user)` for a moved guest.
+- **Guards.** `GuestLossTests` (21): + `test_C1_…` (one /token/refresh under a repeated slot fault; R2 written before it
+  is presented; quarantine too), `test_C2_storageHealsDuringTheMint…` (Codex's probe + healed-between-mints),
+  `test_10_C2_aStillUnreadableKey…`, `test_C3_…` (never exposed, key kept, same key on the retry, forceNew rollback),
+  `test_C5_guestReleasedReasonsEqualTheSharedUnion` (reads `shared/…/types.ts`), G6 converted to the Keychain key.
+  Pins converted (in-file notes): DurabilityReview T2 (mint after the window fails STORAGE_UNAVAILABLE, bytes untouched),
+  `mint.fresh` mint-key tier, `mint.auto_restore` (+ guest_quarantined), `refresh_dead.held_slot` (quarantined, then
+  guest_quarantined), `withheld.discard` (guest_held first), fresh-mint verdict case (mint key excluded from "no auth
+  key"), D2 test (+ mint key). `swift test --skip Live` **201 (1 skipped), 0 failures** (×4); iOS Simulator `xcodebuild`
+  green; `check-sdk-request-bodies` + `check-sdk-snippets` green.
+- Mutations (`scratchpad/ios-glc-mut.py`, backups `ios-glc-bak__<id>__<path>`, restore in `finally` + `cmp`), failures /
+  201 — ALL 17 RED: C1a held slot not confirmed 5 · C1b quarantine not confirmed 1 · C1c confirmation never writes 5 ·
+  C2a still-unreadable key written over 4 · C2b recovered key written over 3 · C2c no install pre-check 1 · C2d no mint
+  pre-check 1 (survived the first run — the healed-between-mints case was added) · C2e mint writes beside an unreadable
+  key 1 · C3a non-durable mint installed 13 · C3b mint key forgotten 3 · C3c mint key back in UserDefaults 7 · C3d
+  unreadable mint key read as none 2 · C5a moved = dead 6 · C5b no guestQuarantined 11 · C5c no guestHeld 4 · C5d
+  guestHeld after signedOut 4 · G3c2 (batch-A G3c, anchor moved by C1) 2.
+  Batch-A set re-run against this code (`ios-glA2`): 35 red; G6b equivalent (above); I10 superseded by C2a/C2b (anchor
+  rewritten); G3c re-anchored → G3c2 red.
+
+## Unreleased — TicketHistory asks (s58.406) — version 5.10.0, NOT yet published
+
+`SendoraCloudSupport.swift`: (1) `listMyTickets(widgetId:statuses:activeOnly:limit:)` — NEW overload (all three
+defaulted); `listMyTickets(widgetId:)` kept verbatim and forwards (an unapplied reference still compiles; Swift picks
+the default-free one for a bare call — checked). `myTicketsQuery` (internal static) validates BEFORE the token lookup:
+limit 1…50, non-empty known statuses, not both with `activeOnly` → `SendoraSupportError` `INVALID_ARGUMENT` (status 0),
+no request; query order `statuses=a,b` (deduped, raw commas) `&activeOnly=true&limit=N`; no options → no `?`.
+(1b) CURSOR PAGING (backend moved to `{data, pagination:{limit, nextCursor}}`, never more than `limit` rows; the old
+"newest N plus active/unread extras" is gone): `listMyTicketsPage(widgetId:cursor:limit:statuses:activeOnly:) ->
+SendoraMyTicketPage { tickets; nextCursor }`; the filtered `listMyTickets` overload = `listMyTicketsPage(cursor: nil)
+.tickets` (first page). `myTicketsQuery(…, cursor:)` refuses an empty cursor (`INVALID_ARGUMENT`, before the token
+lookup) and appends `&cursor=` LAST, encoded with an unreserved-only set (`+ / = &` all escaped). `nextCursor` is read
+from the envelope (`call` returns the whole dict; `data()` only unwraps `data`) at `pagination.nextCursor`; absent /
+null / "" → nil (an older server = one page).
+(2) `SendoraSupportError.activeTicketId: String?` + a 4-arg init; the 3-arg init kept (forwards nil); `data()` reads
+`error.details.ticketId` only for code `ACTIVE_TICKET_EXISTS`. (3) `presentTicketHistory` (its `limit` = page size of the hosted list, which pages with "Load more") gained defaulted
+`ticketId:readOnlyFinished:statuses:activeOnly:limit:` before `completion:` (same move as 5.5.0's `accent:`; none is
+a closure, so trailing-closure calls stay unambiguous). URL built by the pure `ticketHistoryURL(...)` (outside the
+UIKit block → `swift test` covers it): lenient — UUID-shaped `ticketId` only, unknown statuses dropped, `activeOnly`
+wins over `statuses`, `limit` only 1…50, flags as `=1`; token still `#access=` (`.urlFragmentAllowed`); with no
+options byte-identical to the 5.5.0 URL (pinned). Harness: `StubTransport.Recorded.query` (new, defaulted).
+Guard `SupportTicketFiltersTests.swift` (12: +4 paging). `swift test` 133 (3 skipped); `xcodebuild … iOS Simulator` green.
+Mutations (`scratchpad/mutate406.py`, backups `s406_ios_M<n>_bak_*`, restored byte-identical), red assertions / 129:
+limit unchecked 6 · statuses+activeOnly let through 2 · 409 ticketId dropped 1 · hosted ticketId not UUID-checked 3 ·
+list query not sent 8 · unknown status accepted 4. Paging (`scratchpad/mutate406p.py`, backups
+`s406p_ios_M<n>_bak_*`, restored byte-identical), red / 133: cursor sent unencoded 2 · empty cursor let through 5
+assertions (1 test) · `pagination.nextCursor` not read 2 (1 test).
+⚠ Not test-covered: the UIKit `presentTicketHistory` wiring itself (compile only) — the URL builder is.
+
+## 5.9.0 (s58.405-k) — published — keep a held guest's support tickets on discard
 
 New overload `discardHeldGuest(id:keepSupportTickets:completion:)` (no default on the flag, so existing calls stay unambiguous; the old verb forwards with false →
 byte-identical request). On: withheld gate → not identified → `KEEP_TICKETS_REQUIRES_IDENTIFIED` (config, nothing sent) →

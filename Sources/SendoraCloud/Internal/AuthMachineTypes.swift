@@ -55,14 +55,23 @@ public enum SendoraCloudAuthUserUpdatedCause: String {
 }
 
 /// `guestReleased.reason` — every exit from a held slot names one (§3.7 P4).
-/// ⚠ `dead` = the server said "unavailable" when the held token was presented.
-/// It is NOT an erasure signal; UIs say "unavailable", never "progress lost".
+/// ⚠ `dead` = the server CONFIRMED the account is gone (`deleted` — s58.415: only
+/// that). UIs say "unavailable", never "progress lost".
+///
+/// ADDITIVE (ADR-023): `quarantined` was added in s58.415 — consumers MUST
+/// default-branch (`switch reason { case .restored: … default: … }`), exactly as
+/// for `SendoraCloudAuthStateChange`; any later value is additive the same way.
 public enum SendoraCloudGuestReleasedReason: String {
     case claimed
     case restored
     case discarded
     case dead
     case reset
+    /// [s58.415, additive] The held guest's token was refused with a verdict that
+    /// does not prove it gone: it left the held list for a quarantine slot and is
+    /// KEPT (`getQuarantinedGuests()` / `recoverQuarantinedGuest(_:)`). Followed by
+    /// `.guestQuarantined(userId:endReason:)`.
+    case quarantined
 }
 
 /// `error.details.endReason` on an `INVALID_REFRESH_TOKEN` rejection (B11).
@@ -85,15 +94,39 @@ public struct SendoraCloudHeldGuest {
     public let project: String?
 }
 
+/// `getQuarantinedGuests()` — a quarantine slot MINUS its token (ADR-033 rev 3
+/// §3.8). A guest lands here when the server refused its token with anything but
+/// a confirmed `deleted` (s58.415; was `reuse` only) — the CURRENT guest's, or a
+/// held guest's on restore / claim / auto-restore. `userId` is `unknown:<16 hex>`
+/// when the owner could not be determined. Never auto-restored, never refreshed in the background, not counted
+/// toward the held-guest cap. `quarantinedAt` is ms since the epoch; the list
+/// is newest first. `recoverQuarantinedGuest(_:)` / `discardQuarantinedGuest(_:)`.
+public struct SendoraCloudQuarantinedGuest {
+    public let userId: String
+    public let quarantinedAt: Int64
+    public let project: String?
+}
+
 /// What `withheld()` returns while `status() == .withheld`. Never exposes
 /// tokens. `userId` lets a `sub`-keyed backend record oldSub → newSub BEFORE
 /// the app calls `discardWithheld()`.
 public struct SendoraCloudWithheldInfo {
-    public let reason: String = "project_mismatch"
+    /// `"project_mismatch"` (the JWT `project` claim disagrees with `expectedProjectId`) or — s58.415, additive —
+    /// `"origin_mismatch"`: the stored session was issued by another API origin than the configured one (a staging
+    /// build over a prod install, an environment switch). Nothing is sent to the configured host, nothing is written.
+    public let reason: String
     public let expectedProjectId: String
     public let actualProjectId: String?
     public let userId: String
     public let isAnonymous: Bool
+
+    internal init(reason: String = "project_mismatch", expectedProjectId: String, actualProjectId: String?, userId: String, isAnonymous: Bool) {
+        self.reason = reason
+        self.expectedProjectId = expectedProjectId
+        self.actualProjectId = actualProjectId
+        self.userId = userId
+        self.isAnonymous = isAnonymous
+    }
 }
 
 /// What a SWITCH replaced. `held == true` ⇔ the previous slot was anonymous and
@@ -320,11 +353,15 @@ internal struct AuthSessionRecord: Codable {
     /// The server session family id off the access JWT — the identity CAS key.
     var sid: String?
     var heldReportPending: [String] = []
+    /// [s58.415, G3] scheme + host[:port] (lower-case) of the API base URL this session was issued by. A hydrate whose
+    /// configured origin differs WITHHOLDS the record (`origin_mismatch`) — no network, no write. Absent on a record
+    /// written before s58.415 = matching.
+    var origin: String? = nil
 }
 
 /// ONE held slot as persisted at `sendora_auth_held_<i>` (§3.2 `held_guests`,
-/// shared `HeldGuest`). ~300 B of JSON. NO access token and NO user blob:
-/// restore/claim always refresh first.
+/// shared `HeldGuest`). ~300 B of JSON (s58.415: + the last access token, used ONLY
+/// as the refresh hint). NO user blob: restore/claim always refresh first.
 ///
 ///  - `v` — record version; `1` is the wave-1 shape. A reader that sees a `v` it
 ///    does not know KEEPS the slot and ignores it (never clears — P11, INV-9).
@@ -347,6 +384,13 @@ internal struct HeldSlotRecord {
     var heldAt: Int64
     var project: String?
     var autoRestore: Bool
+    /// [s58.415, G2] the session's last ACCESS token — sent as `accessTokenHint` when the slot is refreshed, so the
+    /// server can answer a truthful `deleted`. Written at hold time and on every slot rotation. Optional (absent on
+    /// slots written before s58.415 → no hint).
+    var accessToken: String? = nil
+    /// [s58.415, G3] the API origin that issued the token. A slot of another origin is never presented, never
+    /// released, counted as reserved. Absent = written before s58.415 → matching.
+    var origin: String? = nil
 
     func encodeJson() -> String? {
         var dict: [String: Any] = [
@@ -361,6 +405,8 @@ internal struct HeldSlotRecord {
             "autoRestore": autoRestore,
         ]
         if let sid = sid { dict["sid"] = sid }
+        if let a = accessToken, !a.isEmpty { dict["accessToken"] = a }
+        if let o = origin, !o.isEmpty { dict["origin"] = o }
         guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -382,7 +428,61 @@ internal struct HeldSlotRecord {
             tokenAtHold: (obj["tokenAtHold"] as? String) ?? refreshToken,
             heldAt: heldAt,
             project: obj["project"] as? String,
-            autoRestore: (obj["autoRestore"] as? Bool) ?? true
+            autoRestore: (obj["autoRestore"] as? Bool) ?? true,
+            accessToken: (obj["accessToken"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            origin: (obj["origin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        )
+    }
+}
+
+/// ONE quarantine slot as persisted at `sendora_auth_quarantine_<i>` (ADR-033 rev 3
+/// §3.8, shared `QuarantinedGuest`). Same discipline as `HeldSlotRecord`: no user
+/// blob (s58.415: the last access token rides along as the refresh hint); a slot that does not decode is RESERVED (never overwritten,
+/// never released).
+internal struct QuarantineSlotRecord: Equatable {
+    static let currentVersion = 1
+
+    var v: Int = QuarantineSlotRecord.currentVersion
+    var userId: String
+    var sid: String
+    var refreshToken: String
+    var quarantinedAt: Int64
+    var project: String?
+    /// [s58.415, G2 / G3] as on `HeldSlotRecord`: the last access token (sent as `accessTokenHint`) and the issuing
+    /// API origin (another origin's slot is never presented).
+    var accessToken: String? = nil
+    var origin: String? = nil
+
+    func encodeJson() -> String? {
+        var dict: [String: Any] = [
+            "v": v,
+            "userId": userId,
+            "sid": sid,
+            "refreshToken": refreshToken,
+            "quarantinedAt": quarantinedAt,
+            "project": project.map { $0 as Any } ?? NSNull(),
+        ]
+        if let a = accessToken, !a.isEmpty { dict["accessToken"] = a }
+        if let o = origin, !o.isEmpty { dict["origin"] = o }
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func decode(_ json: String) -> QuarantineSlotRecord? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let v = obj["v"] as? Int, v == currentVersion,
+              let userId = obj["userId"] as? String, !userId.isEmpty,
+              let refreshToken = obj["refreshToken"] as? String, !refreshToken.isEmpty else { return nil }
+        return QuarantineSlotRecord(
+            v: v,
+            userId: userId,
+            sid: (obj["sid"] as? String) ?? "",
+            refreshToken: refreshToken,
+            quarantinedAt: (obj["quarantinedAt"] as? NSNumber)?.int64Value ?? 0,
+            project: obj["project"] as? String,
+            accessToken: (obj["accessToken"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            origin: (obj["origin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 }

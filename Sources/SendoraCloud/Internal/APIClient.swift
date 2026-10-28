@@ -55,6 +55,18 @@ final class APIClient: NSObject, URLSessionDelegate {
         }
     }
 
+    /// (s58.415, G3) The API ORIGIN this client talks to: scheme + host[:port], lower-case — what a stored session /
+    /// held / quarantine slot is bound to (a token is never presented to another origin). `nil` for an unparseable
+    /// base URL (then nothing is judged foreign).
+    var apiOrigin: String? { Self.origin(of: baseUrl) }
+
+    static func origin(of urlString: String) -> String? {
+        guard let comps = URLComponents(string: urlString), let scheme = comps.scheme?.lowercased(),
+              let host = comps.host?.lowercased(), !host.isEmpty else { return nil }
+        if let port = comps.port { return "\(scheme)://\(host):\(port)" }
+        return "\(scheme)://\(host)"
+    }
+
     /// The default transport's session configuration (a seam so the cookie posture is testable).
     internal static func makeSessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
@@ -333,14 +345,20 @@ final class APIClient: NSObject, URLSessionDelegate {
     /// `headers` (5.4.0): the Bearer-authenticated link / claim paths of the
     /// auth machine need the typed envelope too (a 409 `CREDENTIAL_IN_USE` carries
     /// `details.collision`; a 403 `RECENT_AUTH_REQUIRED` must classify by code).
+    ///
+    /// `bypassBreaker` (ADR-033 rev 3 §3.8, audit C): the current session's `/token/refresh` is NEVER held by the
+    /// client-wide breaker. A Cloudflare challenge on `/events`, a 503 `Retry-After` or a 429 elsewhere used to
+    /// hold it ≥ 60 s — past the server's 60 s rotation grace, so a lost rotation response could never be
+    /// recovered. Its own outcome still feeds the breaker (other callers back off from a dead network).
     func requestWithDetails(
         method: String,
         path: String,
         body: [String: Any]?,
         headers: [String: String]? = nil,
+        bypassBreaker: Bool = false,
         completion: @escaping (RichResponse) -> Void
     ) {
-        if shouldSkip() {
+        if !bypassBreaker && shouldSkip() {
             completion(RichResponse(statusCode: 0, body: nil, errorCode: "NETWORK", errorMessage: "Circuit breaker open — too many recent failures"))
             return
         }

@@ -28,6 +28,12 @@ struct ConformanceFixture: Decodable {
     let releaseHeldOnEndReasons: [String]
     let rejectedInWithheld: [String]
     let acceptedInWithheld: [String]
+    /// rev 3 §3.8 — the durability vocabularies every port must equal.
+    let quarantineSlotKeys: [String]
+    let refreshInflightKey: String
+    let refreshRetryOffsetsMs: [Int64]
+    let refreshRetryDeadlineMs: Int64
+    let storageUnavailableQueueMs: Int64
     let projectClaim: String
     let transitions: [Transition]
     let unspecifiedByAdr: [Unspecified]
@@ -117,9 +123,11 @@ final class AuthMachineConformanceTests: XCTestCase {
     // MARK: Negative controls — the fixture is what the shared package says it is
 
     func test_fixtureLoadsFromPackagesShared() {
-        XCTAssertEqual(fixture.transitions.count, 36, "the ADR has 33 §3.3 rows + 3 §3.5-sourced rows")
+        XCTAssertEqual(fixture.transitions.count, 45, "the ADR has 33 §3.3 rows + 3 §3.5-sourced rows + 9 rev-3 §3.8 durability rows")
+        XCTAssertEqual(fixture.events.count, 18, "15 events + REFRESH_OUTCOME_UNKNOWN / RECOVER_QUARANTINED / DISCARD_QUARANTINED (rev 3)")
         XCTAssertEqual(fixture.projectVerdictCases.count, 19)
-        XCTAssertEqual(fixture.unspecifiedByAdr.count, 9)
+        // 9 → 8 (decision C, s58.415 step 2): `unknown × SIGN_OUT` is now the row `sign_out.deferred_unreadable`.
+        XCTAssertEqual(fixture.unspecifiedByAdr.count, 8)
         XCTAssertEqual(fixture.projectClaim, projectClaimName)
     }
 
@@ -148,6 +156,53 @@ final class AuthMachineConformanceTests: XCTestCase {
         XCTAssertEqual(fixture.acceptedInWithheld, ["HYDRATE", "DISCARD_WITHHELD", "SIGN_OUT"])
         for reason in fixture.releaseHeldOnEndReasons {
             XCTAssertNotNil(SendoraCloudRefreshEndReason(rawValue: reason), reason)
+        }
+    }
+
+    /// rev 3 §3.8: quarantine slot keys, the refresh marker, the grace schedule and the INV-17 window EQUAL the fixture's.
+    func test_durabilityVocabulariesEqualTheFixture() {
+        XCTAssertEqual(SendoraCloudAuth.quarantineSlots, fixture.quarantineSlotKeys.count)
+        XCTAssertEqual(SendoraStorage.quarantineSlotKeys, fixture.quarantineSlotKeys.map { "sendora_" + $0 })
+        let quarantineInSecureSet = SendoraStorage.secureKeys.filter { $0.hasPrefix("sendora_auth_quarantine_") }
+        XCTAssertEqual(quarantineInSecureSet, fixture.quarantineSlotKeys.map { "sendora_" + $0 }, "the quarantine slots are Keychain-tier, literal, no extras")
+        XCTAssertEqual(SendoraStorage.refreshInflightKey, "sendora_" + fixture.refreshInflightKey)
+        // ⚠ Pin converted (step-2 review T15, Codex F9): the marker used to be UserDefaults ("no token in it"), confirmed
+        // by a same-process read-back — which proves nothing about the disk. It is a Keychain item now: a write that
+        // returned errSecSuccess is durable.
+        XCTAssertTrue(SendoraStorage.secureKeys.contains(SendoraStorage.refreshInflightKey), "the marker is a confirmed-durable Keychain write")
+        XCTAssertEqual(SendoraCloudAuth.refreshRetryOffsetsMs, fixture.refreshRetryOffsetsMs)
+        XCTAssertEqual(SendoraCloudAuth.refreshRetryDeadlineMs, fixture.refreshRetryDeadlineMs)
+        XCTAssertEqual(SendoraCloudAuth.storageUnavailableQueueMs, fixture.storageUnavailableQueueMs)
+        XCTAssertEqual(SendoraCloudAuth.MachineConfig().storageUnavailableQueueMs, fixture.storageUnavailableQueueMs, "production default")
+        XCTAssertEqual(SendoraCloudAuth.MachineConfig().graceRetryScale, 1, "production runs the schedule in real time")
+    }
+
+    /// Totality both ways: every (state, event) of the fixture's vocabularies resolves to a row XOR is declared
+    /// unspecified — and the scenario map (below) equals the row ids. A row the fixture adds without a Swift
+    /// scenario, or a pair no row covers, fails here.
+    func test_tableIsTotalOverStatesTimesEvents() {
+        let unspecified = Set(fixture.unspecifiedByAdr.map { "\($0.from)|\($0.event)" })
+        var unresolved: [String] = []
+        var masked: [String] = []
+        for state in fixture.states {
+            for event in fixture.events {
+                let covered = fixture.transitions.contains { row in
+                    let from = row.from.values
+                    return (from.contains("any") || from.contains(state)) && row.event.values.contains(event)
+                }
+                let listed = unspecified.contains("\(state)|\(event)")
+                if !covered && !listed { unresolved.append("\(state) × \(event)") }
+                if covered && listed { masked.append("\(state) × \(event)") }
+            }
+        }
+        XCTAssertEqual(fixture.states.count * fixture.events.count, 90)
+        XCTAssertEqual(unresolved, [], "pairs with no row and not declared unspecified")
+        XCTAssertEqual(masked, [], "pairs both covered and declared unspecified")
+        for id in ["hydrate.read_error", "hydrate.refresh_inflight", "refresh_ok.write_failed", "refresh_outcome_unknown.retry",
+                   "refresh_dead.current_guest_quarantine", "sign_out.deferred_unreadable", "sign_out.discard_guest",
+                   "recover_quarantined.as_restore", "discard_quarantined.slot"] {
+            XCTAssertTrue(fixture.transitions.contains { $0.id == id }, "rev-3 row \(id) is in the fixture")
+            XCTAssertNotNil(rowScenarios()[id], "rev-3 row \(id) has a Swift scenario")
         }
     }
 
@@ -213,9 +268,11 @@ final class AuthMachineConformanceTests: XCTestCase {
         XCTAssertEqual(error.code, c.errorCode, c.id)
         XCTAssertEqual(error.kind, .config)
         XCTAssertEqual(h.auth.status(), .signedOut, "\(c.id): nothing installed")
-        XCTAssertEqual(h.secure.writesSince(mark).filter { $0.key.hasPrefix("sendora_auth_") }, [], "\(c.id): no auth key written")
+        // (s58.415, C3) the mint key is a Keychain item now (written CONFIRMED before /anonymous, removed here) — it is a
+        // retry handle, not session state; no SESSION key is written.
+        XCTAssertEqual(h.secure.writesSince(mark).filter { $0.key.hasPrefix("sendora_auth_") && $0.key != SendoraStorage.mintKeyKey }, [], "\(c.id): no auth key written")
         XCTAssertEqual(h.transport.lastRequest(to: "/auth-service/token/revoke")?.body?["refreshToken"] as? String, "rt-minted", "\(c.id): the minted refresh is revoked")
-        XCTAssertNil(h.plain.string(forKey: "sendora_auth_mint_key"), "\(c.id): no relaunch lockout loop via a replayed mint key")
+        XCTAssertNil(h.storage.pendingMintKey, "\(c.id): no relaunch lockout loop via a replayed mint key")
     }
 
     private func replayRestoreVerdictCase(_ c: ConformanceFixture.VerdictCase) {
@@ -260,7 +317,9 @@ final class AuthMachineConformanceTests: XCTestCase {
         // CLAUDE.md), and this pins that the fixture still lists them, so the day
         // the ADR adds a row the scenario map above fails loudly.
         let pairs = Set(fixture.unspecifiedByAdr.map { "\($0.from)|\($0.event)" })
-        XCTAssertTrue(pairs.contains("unknown|SIGN_OUT"))
+        // Decision C / T9 (s58.415 step 2): `unknown × SIGN_OUT` is a ROW now (`sign_out.deferred_unreadable`).
+        XCTAssertFalse(pairs.contains("unknown|SIGN_OUT"))
+        XCTAssertTrue(fixture.transitions.contains { $0.id == "sign_out.deferred_unreadable" && $0.from.values == ["unknown"] })
         XCTAssertTrue(pairs.contains("signed_out|SIGN_OUT"))
         XCTAssertTrue(pairs.contains("unknown|DELETE"))
     }

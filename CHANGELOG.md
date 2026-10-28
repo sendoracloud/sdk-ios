@@ -1,5 +1,61 @@
 # Changelog
 
+## 5.10.0 — guest accounts survive storage and network failures (s58.415)
+
+- **A guest account is never lost to a storage or network failure (s58.415, ADR-033 rev 3 §3.8 + ADR-036).** A guest's
+  refresh token is its only credential, so the SDK now treats it that way:
+  - Every refresh writes a marker first and keeps the old token until the new pair is confirmed on disk; a lost answer is
+    retried with the same token (2 / 5 / 15 / 35 s) and the server recovers a spent guest token whose successor was never
+    used (no time limit).
+  - A storage READ that fails is never read as "signed out": `status()` stays `"unknown"` (`initial.storageUnavailable`),
+    nothing is written or minted, and session verbs reject `STORAGE_UNAVAILABLE` (kind `network`, retryable) after 10 s.
+    Nothing is ever written over a value the SDK could not read.
+  - `ensureSession()` / `signInAnonymously()` return a new guest only once its session is on disk — otherwise
+    `STORAGE_UNAVAILABLE` and a retry gets the SAME guest.
+  - A dead refresh on a guest throws its token away only when the server confirms the account was deleted (the SDK sends
+    its last access token as `accessTokenHint`). Every other verdict moves the guest to a **quarantine** slot:
+    `guest_quarantined` event, `getQuarantinedGuests()`, `recoverQuarantinedGuest(id)`, `discardQuarantinedGuest(id)`
+    (`QUARANTINE_UNRECOVERABLE` when the server cannot recover it yet). A held guest is released only on `deleted`; any
+    other dead verdict moves it to quarantine (`guest_released{reason: 'quarantined'}` — new additive reason).
+  - Sessions are bound to the API origin that issued them: a build pointed at another backend sees the stored session as
+    `withheld` (`reason: "origin_mismatch"`) and never sends its token there.
+  - `discardWithheld()` / `signOut()` while withheld: an anonymous session (another project's guest) is moved to a held
+    slot and never revoked (`guest_held`); no free slot → `HELD_GUEST_LIMIT`.
+  - Slot verbs refuse the CURRENT user's own slot (`SLOT_IS_CURRENT`); held / quarantined lists never show it.
+- **Guest `signOut()`** drops and revokes the guest's token like an account's (Firebase / Supabase behaviour);
+  `signOut({ discardGuest: true })` also erases the guest server-side. While storage is unreadable, `signOut()` defers
+  (deletes nothing) and runs when storage reads again.
+- **iOS: a stored session that could not be matched to a user now actually refreshes before a sign-in or `ensureSession()`.**
+  With a still-valid cached access token the settle step skipped the server, so every queued call failed until that
+  token expired.
+- **iOS:** auth keys are stored `kSecAttrAccessibleAfterFirstUnlock` (no longer ThisDeviceOnly), so a guest moves with an
+  encrypted backup / Quick Start to a new iPhone (existing items migrate on their next write; the device id stays on the
+  device). The mint key moved to the Keychain. A refresh in flight holds a background activity until its result is
+  saved. `SendoraCloudGuestReleasedReason.quarantined` is a new case — keep a `default:` branch.
+
+- **`resetPassword(token, newPassword)` works (s58.415, audit E11).** It sent `{ token, newPassword }` and the server's
+  schema reads `password`, so every in-app password reset answered 422 (only the hosted reset page worked). It now
+  sends `password`. The server accepts both names from s58.415 on, so already-installed versions work too. Signature
+  unchanged.
+
+- **`listMyTickets(widgetId:statuses:activeOnly:limit:)`** — a new overload returning the FIRST page
+  (`listMyTickets(widgetId:)` is unchanged and sends the same request). `statuses` (any of `open`, `pending`,
+  `resolved`, `closed`), `activeOnly` (open / pending only) and `limit` (page size, 1–50, server default 50) each go on
+  the query only when given. A bad option — `limit` outside 1–50, an empty or unknown status, `statuses` together with
+  `activeOnly` — throws `SendoraSupportError` code `INVALID_ARGUMENT` and nothing is sent.
+- **`listMyTicketsPage(widgetId:cursor:limit:statuses:activeOnly:) -> SendoraMyTicketPage`** — cursor paging:
+  `tickets` plus `nextCursor` (nil on the last page). Pass nil for the first page, then each `nextCursor` until nil;
+  the cursor is opaque and sent percent-encoded. An empty cursor throws `INVALID_ARGUMENT` (nothing sent). An older
+  server that does not page answers with no `nextCursor` — one page.
+- **`createTicket` → 409 `ACTIVE_TICKET_EXISTS`** when the player already has an active ticket: the thrown
+  `SendoraSupportError` carries the new `activeTicketId` (nil on every other error). The 5.5.0 initializer is kept.
+- **`presentTicketHistory(…, ticketId:readOnlyFinished:statuses:activeOnly:limit:completion:)`** — new defaulted
+  parameters before `completion:` (as 5.5.0 added `accent:`): open one ticket directly (`ticketId`, ignored unless a
+  UUID), show resolved / closed tickets read-only, and filter the list; `limit` is the page size of the hosted list,
+  which shows "Load more" for the rest. Lenient: an invalid option is left off the
+  page's URL so the screen always opens; `activeOnly` wins over `statuses`. With none set the URL is unchanged.
+- Needs the s58.406 backend + hosted pages (older servers ignore the query options).
+
 ## 5.9.0 — a held guest's support tickets can move to the account on discard
 
 - **`discardHeldGuest(id:keepSupportTickets:completion:)` keeps the player's support conversation.** The guest's support tickets — with their replies, rating and read

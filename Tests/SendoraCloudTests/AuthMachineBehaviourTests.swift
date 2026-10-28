@@ -158,7 +158,10 @@ final class AuthMachineBehaviourTests: XCTestCase {
         XCTAssertNotNil(result.failureError, "a result derived from a session that is gone is DROPPED")
         XCTAssertEqual(h.auth.status(), .signedOut)
         XCTAssertNil(h.storedRefresh)
-        XCTAssertEqual(h.auth.heldGuests().count, 0, "nothing held by a dropped result")
+        // ⚠ Pin converted TWICE: J.1 (first rev-3 cut) held the signed-out guest here; decision C (2026-10-26) put the
+        // pre-rev-3 behaviour back — a guest's signOut() drops its token like an account's. Nothing is held, and
+        // nothing by the dropped result.
+        XCTAssertEqual(h.auth.heldGuests().count, 0, "nothing held: neither the signed-out guest nor the dropped result")
         XCTAssertEqual(h.events.map { $0.eventName }, [])
         XCTAssertEqual(h.transport.lastRequest(to: "/auth-service/token/revoke")?.body?["refreshToken"] as? String, "rt-ext",
                        "server session B is not left live")
@@ -242,8 +245,26 @@ final class AuthMachineBehaviourTests: XCTestCase {
             usleep(50_000)
             XCTAssertEqual(h.transport.requestCount, 0, "no network")
             XCTAssertNotNil(h.heldSlot(0), "held guests are not the record's to clear")
-            XCTAssertFalse(h.secure.writesSince(mark).contains { $0.op == "set" }, "nothing is written, only the leftover deleted")
+            // ⚠ Pin converted (s58.415, G7): a hydrate never deletes a record holding a refresh token the frozen keys
+            // lack unless nothing in it can be a guest's last handle. A GUEST's leftover is RESCUED into a quarantine slot
+            // first (the one write; never auto-restored, never presented); an account's is just cleared.
+            let sets = h.secure.writesSince(mark).filter { $0.op == "set" }.map { $0.key }
+            if user.isAnonymous {
+                XCTAssertEqual(sets, [SendoraStorage.quarantineSlotKeys[0]], "the guest's leftover token is rescued, then the record cleared")
+                XCTAssertEqual(h.quarantineSlot(0)?.refreshToken, "rt-x")
+                XCTAssertEqual(h.auth.getQuarantinedGuests().map { $0.userId }, [user.id])
+            } else {
+                XCTAssertEqual(sets, [], "an account's leftover: nothing written, only the leftover deleted")
+            }
         }
+        // …and with the quarantine FULL the guest's leftover record is NOT deleted (signed out over the bytes).
+        let full = AuthHarness()
+        full.seedSession(user: Self.guestA, access: TestJWT.make(sub: Self.guestA.id, sid: "sid-x"), refresh: "rt-x")
+        for key in AuthHarness.frozenAuthKeys { full.secure.delete(key) }
+        for i in 0..<3 { full.seedQuarantine(i, userId: "q\(i)", refresh: "rq\(i)") }
+        full.boot()
+        XCTAssertEqual(full.auth.status(), .signedOut)
+        XCTAssertEqual(full.storedSessionRecord?.refreshToken, "rt-x", "kept — it may be the guest's only token")
     }
 
     /// 5.3.0 signed into ANOTHER account after the downgrade, and its user blob is

@@ -34,8 +34,9 @@ import UIKit
 /// can't race two mints or interleave signIn + signOut. Response payloads are
 /// validated non-empty before persisting.
 ///
-/// Tokens persist in Keychain with `kSecAttrAccessibleAfterFirstUnlock-
-/// ThisDeviceOnly` (no iCloud sync, sandboxed to this app's bundle id).
+/// Tokens persist in Keychain with `kSecAttrAccessibleAfterFirstUnlock` (s58.415, operator decision D2 — was
+/// `…ThisDeviceOnly`): no iCloud Keychain sync, sandboxed to this app's bundle id, and carried by an encrypted
+/// backup / Quick Start to a new iPhone so a guest is not stranded on the old one.
 public struct SendoraCloudAuthUser: Codable {
     public let id: String
     public let email: String?
@@ -157,12 +158,13 @@ public enum SendoraCloudAuthError: Error {
     /// `id` omitted while more than one guest is held. Code `AMBIGUOUS_HELD_GUEST`.
     case ambiguousHeldGuest(held: Int)
     /// The held guest's token was presented and the server reported it gone
-    /// (`endReason` ∈ deleted|revoked|expired) or no such guest is held. The
+    /// (`endReason == deleted` — s58.415: deleted ONLY) or no such guest is held. The
     /// slot is released. Code `HELD_GUEST_GONE`. Say "unavailable", never "lost".
     case heldGuestGone(userId: String, endReason: SendoraCloudRefreshEndReason?)
-    /// The held token was refused with `reuse` or no `endReason` — that does not
-    /// prove the guest is gone, so the slot is KEPT; retry later. Code
-    /// `RESTORE_FAILED` (retryable).
+    /// The held token was refused with anything but `deleted` — that does not
+    /// prove the guest is gone. s58.415: the token was moved to a quarantine slot
+    /// (`getQuarantinedGuests()`), or — quarantine full — the held slot was KEPT
+    /// with `autoRestore: false`. Retry later. Code `RESTORE_FAILED` (retryable).
     case restoreFailed(userId: String, endReason: SendoraCloudRefreshEndReason?)
     /// `switchAccount()` re-read the device identity and it differs from the
     /// credential the player confirmed (INV-14). Nothing mutated. Code `CREDENTIAL_CHANGED`.
@@ -308,6 +310,10 @@ public extension SendoraCloudAuthError {
         // the closed `AuthErrorKind` is NOT widened.
         case "SESSION_WITHHELD", "PROJECT_MISMATCH", "HELD_GUEST_LIMIT", "HELD_GUEST_PROJECT_MISMATCH", "AMBIGUOUS_HELD_GUEST":
             return .config
+        // s58.415 (G5): a held / quarantined slot whose occupant IS the current user — acting on it would erase or
+        // replace the live session. Client-side, nothing sent.
+        case "SLOT_IS_CURRENT":
+            return .config
         // 5.9.0: `discardHeldGuest(keepSupportTickets: true)` outside an
         // identified session — the app must sign in first (client-side, no network).
         case "KEEP_TICKETS_REQUIRES_IDENTIFIED":
@@ -315,6 +321,13 @@ public extension SendoraCloudAuthError {
         case "HELD_GUEST_GONE", "CREDENTIAL_CHANGED":
             return .invalidCredential
         case "RESTORE_FAILED":
+            return .server
+        // ADR-033 rev 3 §3.8 (`AUTH_DURABILITY_CODES`) — both RETRYABLE. STORAGE_UNAVAILABLE: a storage READ is
+        // failing (locked before first unlock); the session is kept, never minted over. QUARANTINE_UNRECOVERABLE:
+        // the server still answers `reuse` for a quarantined guest's token; the slot is kept.
+        case "STORAGE_UNAVAILABLE":
+            return .network
+        case "QUARANTINE_UNRECOVERABLE":
             return .server
         case "UNAUTHORIZED", "INVALID_CREDENTIALS", "INVALID_REFRESH_TOKEN",
              "EMAIL_OTP_INVALID", "MAGIC_LINK_INVALID", "PASSKEY_RP_MISMATCH", "NOT_SIGNED_IN":
@@ -389,13 +402,22 @@ public enum SendoraCloudAuthStateChange {
     /// A guest was moved into a held slot (sign-in from a guest, `forceNew`
     /// mint, restore over a guest). `count` = guests held afterwards.
     case guestHeld(userId: String, count: Int)
-    /// A held slot was emptied. `dead` = the server said "unavailable" when the
-    /// token was presented — NOT an erasure signal.
+    /// A held slot was emptied. `dead` = the server CONFIRMED the account gone
+    /// (`deleted`); `quarantined` (s58.415, additive — default-branch) = it moved to a
+    /// quarantine slot and is KEPT (a `.guestQuarantined` follows).
     case guestReleased(userId: String, reason: SendoraCloudGuestReleasedReason, endReason: SendoraCloudRefreshEndReason?)
     /// An in-process transition INTO `withheld` (a refresh answered with a
     /// mismatching `project` claim). Never replayed — a hydrate that lands in
     /// `withheld` emits `.initial(status: .withheld, …)` instead.
     case sessionWithheld(expectedProjectId: String, actualProjectId: String?, userId: String)
+    /// ADR-033 rev 3 §3.8 (additive — a NEW situation). The CURRENT guest's refresh
+    /// was refused with anything but a server-confirmed `deleted` (s58.415 — was
+    /// `reuse` only): its token was moved to a quarantine slot — never auto-restored —
+    /// BEFORE the session cleared. `endReason` is the server's verdict (`.unknown`
+    /// when it named none). Followed by `.signedOut(reason: .sessionExpired)` with
+    /// `lastSignedOutEndReason()` = the verdict. `getQuarantinedGuests()`,
+    /// `recoverQuarantinedGuest(_:)`, `discardQuarantinedGuest(_:)`.
+    case guestQuarantined(userId: String, endReason: SendoraCloudRefreshEndReason)
 
     /// The shared snake_case wire name of this event (`AuthStateEvent`), the same
     /// token on all four SDKs.
@@ -410,6 +432,7 @@ public enum SendoraCloudAuthStateChange {
         case .guestHeld: return "guest_held"
         case .guestReleased: return "guest_released"
         case .sessionWithheld: return "session_withheld"
+        case .guestQuarantined: return "guest_quarantined"
         }
     }
 }
@@ -481,6 +504,21 @@ public final class SendoraCloudAuth {
         var schedulesTimers: Bool = true
         /// Test seam: a fixed clock (epoch ms). `nil` = the wall clock.
         var clock: (() -> Int64)? = nil
+        /// rev 3 INV-16 (C) test seam: the grace-retry schedule (`refreshRetryOffsetsMs`, deadline) runs at
+        /// `scale ×` real time; `nil` disables the self-scheduled retries (the conformance harness default — a
+        /// background timer firing into a later test is noise). Production: 1.
+        var graceRetryScale: Double? = 1
+        /// rev 3 INV-17: how long a session-installing verb waits on an unreadable store before
+        /// `STORAGE_UNAVAILABLE` (the shared `STORAGE_UNAVAILABLE_QUEUE_MS`; a test seam shortens it).
+        var storageUnavailableQueueMs: Int64 = SendoraCloudAuth.storageUnavailableQueueMs
+        /// (step-2 review T2) Test seam: "is the device known to be unlocked right now?" — `true` / `false` / `nil`
+        /// (no signal yet). `nil` closure = the platform: on UIKit `UIApplication.isProtectedDataAvailable` (sampled on
+        /// the main thread, kept current by the protected-data / didBecomeActive notifications); off UIKit there is no
+        /// device lock, so always `true`.
+        var deviceUnlocked: (() -> Bool?)? = nil
+        /// (s58.415, iOS #4) Test seam: begin a background activity, return its END. `nil` = the platform: on UIKit
+        /// `ProcessInfo.performExpiringActivity` (extension-safe — no `UIApplication.shared`); elsewhere a no-op.
+        var backgroundActivity: ((String) -> () -> Void)? = nil
     }
 
     /// What the parent SDK does when the current identity is cleared (the
@@ -499,11 +537,23 @@ public final class SendoraCloudAuth {
     public static let heldGuestSlots = 5
     /// The ONLY server codes that mean "this refresh token is dead" (INV-6).
     internal static let deadCodes: [String] = ["INVALID_REFRESH_TOKEN"]
-    /// A held slot is released on a dead verdict ONLY for these end reasons
-    /// (rev 2 2b); `reuse` / absent keeps the slot (`restoreFailed`, retryable).
-    internal static let releaseHeldOnEndReasons: [SendoraCloudRefreshEndReason] = [.deleted, .revoked, .expired]
+    /// A held / quarantine slot is released — and a guest's CURRENT token dropped — on a dead verdict ONLY for these
+    /// end reasons. ⚠⚠ s58.415 (zero guest-account loss): `deleted` ONLY — the server answers it only when the
+    /// `accessTokenHint` proves this workspace signed the token and its account is gone. Every other verdict
+    /// (`revoked` / `expired` / `reuse` / `unknown` / absent) moves the token to quarantine. Was deleted|revoked|expired;
+    /// `deleted` was then also the answer for a token sent to ANOTHER backend (an env switch released every guest).
+    internal static let releaseHeldOnEndReasons: [SendoraCloudRefreshEndReason] = [.deleted]
     /// The events `withheld` rejects by name (§3.2); mirrored from the fixture.
-    internal static let rejectedInWithheld: [String] = ["MINT", "SIGN_IN", "LINK", "CLAIM", "RESTORE", "DISCARD", "DELETE", "SESSION_VERB"]
+    internal static let rejectedInWithheld: [String] = ["MINT", "SIGN_IN", "LINK", "CLAIM", "RESTORE", "DISCARD", "DELETE", "SESSION_VERB",
+                                                        "RECOVER_QUARANTINED", "DISCARD_QUARANTINED"]
+    /// ADR-033 rev 3 §3.8 — the quarantine capacity Q (fixed slots, NOT counted in T). s58.415: a full quarantine is
+    /// NEVER overwritten (the oldest may still be recoverable, ADR-036) — "no free slot" keeps the session (T6).
+    public static let quarantineSlots = 3
+    /// INV-16 (C): grace retries of a current-session refresh, measured from the FIRST attempt, same token.
+    internal static let refreshRetryOffsetsMs: [Int64] = [2_000, 5_000, 15_000, 35_000]
+    internal static let refreshRetryDeadlineMs: Int64 = 50_000
+    /// INV-17: how long a queued verb waits on an unreadable store before `STORAGE_UNAVAILABLE`.
+    internal static let storageUnavailableQueueMs: Int64 = 10_000
 
     internal let client: APIClient
     internal let storage: SendoraStorage
@@ -524,7 +574,56 @@ public final class SendoraCloudAuth {
     /// K held slots; `nil` = empty. `unreadableSlots` are occupied by JSON this
     /// build cannot decode — kept, ignored, never cleared (INV-9).
     internal var slots: [HeldSlotRecord?] = Array(repeating: nil, count: SendoraCloudAuth.heldGuestSlots)
+    /// Held slots this build cannot use: unparseable JSON OR (rev 3, INV-17) a slot whose READ errored. RESERVED:
+    /// they count toward T, are never handed to a new hold and are never released (FS4).
     internal var unreadableSlots: Set<Int> = []
+    /// rev 3 §3.8 — the Q quarantine slots' mirror, and the ones that could not be read / parsed (reserved).
+    internal var quarantine: [QuarantineSlotRecord?] = Array(repeating: nil, count: SendoraCloudAuth.quarantineSlots)
+    internal var reservedQuarantine: Set<Int> = []
+    /// rev 3 INV-17: a session key's READ is failing (Keychain −25308 before first unlock). `status()` is
+    /// `unknown`; nothing is written or removed; session-installing verbs wait, then `STORAGE_UNAVAILABLE`.
+    internal var storageUnavailableState = false
+    /// rev 3 INV-16: the installed session's write did not confirm — it lives in memory only (a PENDING COMMIT)
+    /// and the refresh marker stays on disk. Retried on the next refresh / tick / verb; never re-rotated.
+    internal var pendingCommit = false
+    /// rev 3 INV-16 (C): the grace-retry schedule of the current refresh ATTEMPT (T1: a new schedule per attempt that
+    /// is not itself a grace retry; `gen` identifies it so a timer of a superseded schedule fires nothing).
+    internal var graceRetry: (sent: String, firstAt: Date, scheduled: Bool, gen: Int)?
+    internal var graceGeneration = 0
+    /// (T9) `signOut()` was called while the store was unreadable: executed when the session can be read.
+    internal var deferredSignOut = false
+    /// (T6) `reuse` on the current guest with no quarantine handle: the session is KEPT and this token is not
+    /// presented again before `until` (epoch ms) — no refresh storm against the server's reuse alarm.
+    internal var reuseBackoff: (token: String, until: Int64)?
+    /// (T8) Slots whose rotated token lives in memory because its write did not confirm — re-written by
+    /// `retryPendingCommitIfNeeded()`.
+    internal var dirtyHeldSlots: Set<Int> = []
+    internal var dirtyQuarantineSlots: Set<Int> = []
+    /// (T7) Slot releases waiting for the installed session's write to confirm.
+    internal var pendingReleases: [PendingRelease] = []
+    /// (s58.415, iOS #8) A rotation the server performed while there was no installed record to write (limbo
+    /// gap-fill without a user, withhold-on-refresh) whose rotation-only write did not confirm: retried like a pending
+    /// commit, and — like one — it blocks the next rotation (T12).
+    internal var pendingRotation: (access: String, refresh: String, expiresAt: Int64)?
+    /// (s58.415, G6) The minted session is installed but not yet confirmed on disk: the mint key is kept until it is
+    /// (cleared by `retryPendingCommitIfNeeded` when the write lands, or by a clear of that session).
+    internal var mintKeyClearPending = false
+    /// (s58.415, iOS #4) END of the background activity held from a refresh's marker write to its confirmed commit
+    /// (and across its grace schedule). `nil` = none held.
+    internal var refreshActivityEnd: (() -> Void)?
+
+    internal struct PendingRelease {
+        enum Kind { case held, quarantine }
+        let kind: Kind
+        let index: Int
+        let userId: String
+        /// `heldAt` / `quarantinedAt` of the occupant (T14).
+        let stamp: Int64
+        /// The refresh token the verb installed: the release runs only while it is still the current one.
+        let installedRefresh: String
+        let reason: SendoraCloudGuestReleasedReason
+    }
+    internal var storageRecoveryObservers: [NSObjectProtocol] = []
     /// Set once we have PROOF the device clock runs fast: a token the server
     /// minted SECONDS AGO already reads past its own `exp`. Releases the `exp`
     /// guard for this process. Never persisted (re-learned per process).
@@ -566,6 +665,8 @@ public final class SendoraCloudAuth {
         var refreshToken: String
         var accessToken: String?
         var accessExpiresAt: Int64
+        /// (T10) The disk user blob, kept ONLY when nothing contradicts it (no access token to compare its id with).
+        var diskUser: SendoraCloudAuthUser? = nil
     }
 
     internal struct WithheldState {
@@ -574,6 +675,18 @@ public final class SendoraCloudAuth {
         var accessToken: String
         var accessExpiresAt: Int64
         var user: SendoraCloudAuthUser?
+        /// (s58.415, G3/G4) the record's issuing origin (`nil` = the configured one / unknown).
+        var origin: String? = nil
+    }
+
+    /// (s58.415, G3) The configured API origin every stored session and slot is judged against.
+    internal var configuredOrigin: String? { client.apiOrigin }
+
+    /// (s58.415, G3) A record / slot bound to ANOTHER origin than the configured one. Absent = written before s58.415
+    /// = matching; an unparseable configured base URL judges nothing foreign.
+    internal func isForeignOrigin(_ origin: String?) -> Bool {
+        guard let o = origin, !o.isEmpty, let mine = configuredOrigin else { return false }
+        return o.lowercased() != mine
     }
 
     init(
@@ -605,6 +718,7 @@ public final class SendoraCloudAuth {
 
     internal func statusLocked() -> SendoraCloudAuthStatus {
         if !hydrated { return .unknown }
+        if storageUnavailableState { return .unknown }
         if withheldState != nil { return .withheld }
         if let c = current { return c.user.isAnonymous ? .anonymous : .identified }
         if limbo != nil { return .unknown }
@@ -618,6 +732,15 @@ public final class SendoraCloudAuth {
     /// immediately.
     public func authStateReady(completion: @escaping (SendoraCloudAuthStatus) -> Void) {
         completion(status())
+    }
+
+    /// ADR-033 rev 3 INV-17: `true` while `status() == .unknown` BECAUSE a storage READ is failing (the device
+    /// has not been unlocked since boot). The session is NOT gone — do not mint; it is re-read when the device
+    /// unlocks (`protectedDataDidBecomeAvailable`) and on every queued verb. Read it inside the `.initial`
+    /// listener arm (the case's payload is frozen, like `lastSignedInCause()`).
+    public var storageUnavailable: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return storageUnavailableState
     }
 
     public var currentUser: SendoraCloudAuthUser? {
@@ -670,33 +793,79 @@ public final class SendoraCloudAuth {
     /// present and equal to the record's → the record; present and different →
     /// rebuild from the four keys and write-forward. Then the ProjectGuard.
     private func hydrate() {
-        let legacyRefresh = storage.authRefreshToken
-        let legacyAccess = storage.authAccessToken
-        let legacyExp = storage.authAccessExpiresAt
-        let legacyUserJson = storage.authUserJson
+        // INV-17 (rev 3): every read carries its status. `.unavailable` (−25308 before first unlock, …) is NEVER
+        // read as "absent" — that is what let a background launch decide `signedOut`, mint over the account and
+        // overwrite it on the first write after unlock (audit H1 / FS3).
+        let rRefresh = storage.read(.refreshToken)
+        let rAccess = storage.read(.accessToken)
+        let rExp = storage.read(.accessExpires)
+        let rUser = storage.read(.user)
+        let rRecord = storage.read(.session)
+        let sessionUnavailable = [rRefresh, rAccess, rExp, rUser, rRecord].contains { $0.isUnavailable }
+        let inflightMarker = storage.refreshInflightMarkerPresent
+
+        let legacyRefresh = rRefresh.valueOrNil
+        let legacyAccess = rAccess.valueOrNil
+        let legacyExp = rExp.valueOrNil.flatMap { Int64($0) } ?? 0
+        let legacyUserJson = rUser.valueOrNil
         let legacyUser = legacyUserJson.flatMap { Self.decodeUser($0) }
-        var record = storage.authSessionJson.flatMap { Self.decodeSessionRecord($0) }
+        var record = rRecord.valueOrNil.flatMap { Self.decodeSessionRecord($0) }
         var pending = record?.heldReportPending ?? []
 
-        // Slots first (they never depend on the current session).
+        // Slots first (they never depend on the current session). A slot whose READ errors or whose bytes do
+        // not decode is RESERVED — it may hold a guest's only credential (FS4).
         var readSlots: [HeldSlotRecord?] = Array(repeating: nil, count: Self.heldGuestSlots)
         var unreadable: Set<Int> = []
         for i in 0..<Self.heldGuestSlots {
-            guard let json = storage.heldSlotJson(i) else { continue }
-            if let slot = HeldSlotRecord.decode(json) { readSlots[i] = slot } else { unreadable.insert(i) }
+            switch storage.readHeldSlot(i) {
+            case .absent: continue
+            case .unavailable: unreadable.insert(i)
+            case .value(let json):
+                if let slot = HeldSlotRecord.decode(json) { readSlots[i] = slot } else { unreadable.insert(i) }
+            }
+        }
+        var readQuarantine: [QuarantineSlotRecord?] = Array(repeating: nil, count: Self.quarantineSlots)
+        var reservedQ: Set<Int> = []
+        for i in 0..<Self.quarantineSlots {
+            switch storage.readQuarantineSlot(i) {
+            case .absent: continue
+            case .unavailable: reservedQ.insert(i)
+            case .value(let json):
+                if let q = QuarantineSlotRecord.decode(json) { readQuarantine[i] = q } else { reservedQ.insert(i) }
+            }
+        }
+        commitHydrateQuarantine(readQuarantine, reserved: reservedQ)
+
+        if sessionUnavailable {
+            // hydrate.read_error: stay `unknown{storageUnavailable}` — write NOTHING, remove NOTHING, no cron, no
+            // network; re-read on the platform signal and on every queued verb.
+            commitHydrateStorageUnavailable(slots: readSlots, unreadable: unreadable)
+            armStorageRecovery()
+            return
         }
 
         var outcome: HydrateOutcome = .signedOut
         if let refresh = legacyRefresh {
             if let r = record, r.refreshToken == refresh {
-                outcome = .record(r, writeForward: false)
-            } else if let user = legacyUser, !user.id.isEmpty, let access = legacyAccess, !access.isEmpty {
+                // (s58.415, G3) A record issued by ANOTHER API origin is withheld: nothing sent, nothing written.
+                outcome = isForeignOrigin(r.origin) ? .originMismatch(r) : .record(r, writeForward: false)
+            } else if let user = legacyUser, !user.id.isEmpty, let access = legacyAccess, !access.isEmpty,
+                      jwtStringClaim(access, "sub") == user.id {
+                // (step-2 review, iOS H2) Rebuilt ONLY when the user blob is the access token's own `sub`. A sign-in
+                // whose new tokens landed but whose user / record writes did not (failed, or the process died) leaves
+                // the PREVIOUS user's blob beside the NEW account's tokens: rebuilding would graft guest G's identity
+                // onto account A's tokens and the coherence step would drop G's held slot (its only token). Such a
+                // disk is identity-UNCERTAIN → LIMBO_A below: the gap-fill refresh names the user, no slot is dropped.
                 let rebuilt = AuthSessionRecord(
                     user: user, accessToken: access, refreshToken: refresh, accessExpiresAt: legacyExp,
                     sid: jwtStringClaim(access, "sid"), heldReportPending: pending
                 )
+                // (s58.415, G7) A record whose refresh token the frozen keys CONTRADICT is never deleted by hydrate:
+                // another guest's token in it is rescued into quarantine first; if it cannot be, the record is left
+                // as it is (no write-forward over it).
+                let rescued = record.map { commitRescueLeftoverRecord($0, liveUserId: user.id, slots: readSlots) } ?? true
                 record = rebuilt
-                outcome = .record(rebuilt, writeForward: true)
+                outcome = .record(rebuilt, writeForward: rescued)
             } else {
                 // LIMBO_A: a refresh token (independently valid, the only thing
                 // that can recover this account) with no readable user. `unknown`,
@@ -705,9 +874,22 @@ public final class SendoraCloudAuth {
                 // LEFTOVER of another session (a 5.4→5.3→sign-out/switch→5.4
                 // cycle: a 5.3.0 clears only the four frozen keys) — cleared
                 // silently by the commit, never trusted.
-                outcome = .limbo(LimboRecord(refreshToken: refresh, accessToken: legacyAccess, accessExpiresAt: legacyExp),
-                                 clearLeftoverRecord: record != nil)
+                // (T10) With no access token to contradict it, the disk user blob may say whether this is a guest.
+                let diskUser = (legacyAccess?.isEmpty ?? true) ? legacyUser : nil
+                // (s58.415, G7) The leftover record is dropped only once nothing in it can be the last handle on a
+                // guest (rescued into quarantine, an older generation of this session, held elsewhere, an account).
+                let liveSub = legacyAccess.flatMap { jwtStringClaim($0, "sub") }
+                let rescued = record.map { commitRescueLeftoverRecord($0, liveUserId: liveSub, slots: readSlots) } ?? false
+                outcome = .limbo(LimboRecord(refreshToken: refresh, accessToken: legacyAccess, accessExpiresAt: legacyExp, diskUser: diskUser),
+                                 clearLeftoverRecord: record != nil && rescued)
             }
+        } else if let r = record, !storage.isAcceptedUnreadable(SendoraStorage.AuthField.refreshToken.key),
+                  let access = legacyAccess, !access.isEmpty, access == r.accessToken {
+            // (s58.415, iOS #11) The 5.9.0 delete-then-add leftover: the frozen REFRESH key is gone but the frozen ACCESS
+            // key still holds the record's own access token — the record is the session (a 5.3.0 sign-out removes all
+            // four frozen keys, so this cannot be a signed-out leftover). Rebuilt from the record; the write-forward
+            // restores the frozen refresh key. It used to be cleared as a stale blob — with the only copy of R2 in it.
+            outcome = isForeignOrigin(r.origin) ? .originMismatch(r) : .record(r, writeForward: true)
         } else if legacyUserJson != nil || record != nil {
             // LIMBO_B: a user blob with no refresh token — a stale blob, or a
             // 5.4.0 record with NO frozen counterpart (a downgraded 5.3.0's
@@ -717,12 +899,25 @@ public final class SendoraCloudAuth {
             // one: here there is none, so it is a leftover — cleared silently
             // (no event beyond the boot `initial`, no network) and the state
             // is signed out (§3.3 row 4). NEVER reinstalled.
-            outcome = .staleBlob
+            // (rev 3: reached only when the refresh read SUCCEEDED as absent — a read error is handled above.)
+            // (T2) …or when the refresh key was given up as PERMANENTLY unreadable: then its bytes may still be a
+            // token, so nothing is cleared (signed out, the next session is written over it).
+            // (s58.415, G7) A leftover record that may hold a guest's only token is rescued into quarantine before the
+            // clear; if it cannot be (quarantine full / write failed), NOTHING is cleared (signed out over the bytes).
+            if storage.isAcceptedUnreadable(SendoraStorage.AuthField.refreshToken.key) {
+                outcome = .signedOut
+            } else if let r = record, !commitRescueLeftoverRecord(r, liveUserId: nil, slots: readSlots) {
+                outcome = .signedOut
+            } else {
+                outcome = .staleBlob
+            }
         }
 
         switch outcome {
         case .record(let r, let writeForward):
             commitHydrate(record: r, writeForward: writeForward, slots: readSlots, unreadable: unreadable)
+        case .originMismatch(let r):
+            commitHydrateOriginMismatch(record: r, slots: readSlots, unreadable: unreadable)
         case .limbo(let l, let clearLeftover):
             commitHydrateLimbo(l, clearLeftoverRecord: clearLeftover, slots: readSlots, unreadable: unreadable)
         case .staleBlob:
@@ -733,11 +928,175 @@ public final class SendoraCloudAuth {
         pending = pending.filter { id in readSlots.contains { $0?.userId == id } }
         // `withheld` makes NO network call of any kind (§3.2) — the report
         // waits for a hydrate that is not withheld.
-        if status() != .withheld { retryPendingHeldReports(pending) }
+        let settled = status()
+        if settled != .withheld { retryPendingHeldReports(pending) }
+
+        // hydrate.refresh_inflight (rev 3, INV-16): a refresh was sent and its rotated pair never confirmed on
+        // disk (the response was lost, the write failed, or the process died first). Refresh NOW with the token
+        // on disk — inside the server's 60 s grace it replays the pair; past it the reuse rows apply (a guest is
+        // QUARANTINED, never dropped). A marker with no session left behind is stale → removed.
+        if inflightMarker {
+            // (s58.415, iOS #9) LIMBO_A too: the cron skips a still-valid access token there, so the rotation in flight
+            // could outlive the server's 60 s grace.
+            let limboNow: Bool = { lock.lock(); defer { lock.unlock() }; return limbo != nil && !storageUnavailableState }()
+            if legacyRefresh != nil, settled == .anonymous || settled == .identified || (settled == .unknown && limboNow) {
+                refreshAccessToken(force: true) { _ in }
+            } else if legacyRefresh == nil {
+                commitRefreshMarker(sid: nil, set: false)
+            }
+        }
+    }
+
+    // MARK: - INV-17 re-hydrate (rev 3)
+
+    /// Re-read a store whose reads were failing. On success the normal hydrate runs (installing the session that
+    /// was there all along) and a recovered session is announced with `.signedIn`. Returns `true` when the store
+    /// is readable now. Cheap when it never failed. Call ON `opsQueue` (or from `init`).
+    @discardableResult
+    internal func recoverStorageIfNeeded() -> Bool {
+        lock.lock()
+        let unavailable = storageUnavailableState
+        lock.unlock()
+        guard unavailable else { return true }
+        guard storage.sessionKeysReadable() else { return false }
+        commitStorageReadable()
+        hydrate()
+        lock.lock()
+        let stillUnavailable = storageUnavailableState
+        let recovered = current?.user
+        lock.unlock()
+        if stillUnavailable { return false }
+        disarmStorageRecovery()
+        // (T9) A sign-out requested while unreadable runs now — and the recovered session is not announced first.
+        if takeDeferredSignOut() {
+            runSignOutNow()
+        } else if let user = recovered {
+            emitAuthState(.signedIn(user: user))
+        }
+        return true
+    }
+
+    /// (T9) Consume the deferred sign-out flag.
+    internal func takeDeferredSignOut() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let d = deferredSignOut
+        deferredSignOut = false
+        return d
+    }
+
+    /// (T9) The plain sign-out, executed (on `opsQueue`): clear + fire-and-forget revoke + `signedOut(.user)`.
+    internal func runSignOutNow() {
+        let (_, revoke) = performSignOut(discardGuest: false)
+        if let token = revoke { fireAndForgetRevoke(token) }
+    }
+
+    /// (step-2 review T2) The store kept failing for the whole queue window while the device was KNOWN to be unlocked:
+    /// the failure is permanent (−34018 with no keychain entitlement, `errSecDecode` bytes) — waiting longer would lock
+    /// the player out for good. Proceed as if those keys were absent; their bytes are NEVER deleted (only a new
+    /// session's write may replace them). Call on `opsQueue`.
+    internal func acceptPermanentReadFailure() {
+        let gone = storage.acceptUnreadableSessionKeys()
+        SendoraCloudLogger.shared.error("Keychain reads failed for good; continuing without them: \(gone)")
+        commitStorageReadable()
+        hydrate()
+        disarmStorageRecovery()
+        if takeDeferredSignOut() { runSignOutNow() }
+    }
+
+    /// (s58.415, iOS #10) A write found a VALUE under a key given up as unreadable (T2): the read failure was
+    /// transient, and those bytes may be a guest's only token. Nothing has been written over it (the write refused).
+    /// Re-hydrate from disk; the session that lived in memory meanwhile is HELD first when it is a guest (revoked when
+    /// it is an account), so neither is lost.
+    internal func scheduleRehydrateAfterAcceptedKeyRecovered() {
+        opsQueue.async { self.rehydrateAfterAcceptedKeyRecovered() }
+    }
+
+    internal func rehydrateAfterAcceptedKeyRecovered() {
+        awaitRefreshInflight()
+        lock.lock()
+        let memory = current
+        lock.unlock()
+        var heldId: String?
+        let alreadyHeld: Bool = { lock.lock(); defer { lock.unlock() }; return memory.map { m in slots.contains { $0?.refreshToken == m.refreshToken } } ?? false }()
+        if let m = memory, m.user.isAnonymous, !alreadyHeld {
+            let slot = HeldSlotRecord(userId: m.user.id, sid: m.sid, refreshToken: m.refreshToken, tokenAtHold: m.refreshToken,
+                                      heldAt: nowMs(), project: jwtProjectClaimForSlot(m.accessToken), autoRestore: true,
+                                      accessToken: m.accessToken, origin: m.origin ?? configuredOrigin)
+            // Cannot hold it → change nothing (the write over the recovered key stays refused; retried later).
+            guard case .held = commitHold(slot) else { return }
+            heldId = m.user.id
+        } else if let m = memory {
+            fireAndForgetRevoke(m.refreshToken)
+        }
+        commitDropMemoryOnlySession()
+        storage.clearAcceptedUnreadable()
+        hydrate()
+        if let id = heldId { emitAuthState(.guestHeld(userId: id, count: heldEventCount())) }
+        if let user = currentUser {
+            setLastSignedInCause(.restore)
+            emitAuthState(.signedIn(user: user))
+        }
+    }
+
+    /// (T2) One sample of "the device is unlocked": `true` / `false` / `nil` (no signal).
+    internal func deviceUnlockedSample() -> Bool? {
+        if let probe = machineConfig.deviceUnlocked { return probe() }
+        #if canImport(UIKit) && !os(watchOS)
+        return ProtectedDataMonitor.shared.sample()
+        #else
+        return true
+        #endif
+    }
+
+    /// The platform signal: `UIApplication.protectedDataDidBecomeAvailableNotification` (the first unlock after
+    /// a reboot). On a non-UIKit platform the same notification NAME is observed (it never fires there; the
+    /// per-verb re-read is the recovery path) so the behaviour stays testable under `swift test`.
+    internal static var protectedDataAvailableNotification: Notification.Name {
+        #if canImport(UIKit) && !os(watchOS)
+        return UIApplication.protectedDataDidBecomeAvailableNotification
+        #else
+        return Notification.Name("UIApplicationProtectedDataDidBecomeAvailable")
+        #endif
+    }
+
+    /// (T15, iOS M4) The app came to the foreground. `protectedDataDidBecomeAvailable` is NOT replayed to an app
+    /// that was suspended when the user unlocked, so a resume re-checks the store too.
+    internal static var appDidBecomeActiveNotification: Notification.Name {
+        #if canImport(UIKit) && !os(watchOS)
+        return UIApplication.didBecomeActiveNotification
+        #else
+        return Notification.Name("UIApplicationDidBecomeActiveNotification")
+        #endif
+    }
+
+    private func armStorageRecovery() {
+        lock.lock()
+        let armed = !storageRecoveryObservers.isEmpty
+        lock.unlock()
+        guard !armed else { return }
+        let observers = [Self.protectedDataAvailableNotification, Self.appDidBecomeActiveNotification].map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                guard let self = self else { return }
+                self.opsQueue.async { self.recoverStorageIfNeeded() }
+            }
+        }
+        lock.lock()
+        storageRecoveryObservers = observers
+        lock.unlock()
+    }
+
+    private func disarmStorageRecovery() {
+        lock.lock()
+        let observers = storageRecoveryObservers
+        storageRecoveryObservers = []
+        lock.unlock()
+        for o in observers { NotificationCenter.default.removeObserver(o) }
     }
 
     private enum HydrateOutcome {
         case record(AuthSessionRecord, writeForward: Bool)
+        /// (s58.415, G3) the record names another API origin → `withheld{origin_mismatch}`.
+        case originMismatch(AuthSessionRecord)
         case limbo(LimboRecord, clearLeftoverRecord: Bool)
         case staleBlob
         case signedOut
@@ -748,8 +1107,9 @@ public final class SendoraCloudAuth {
     private func retryPendingHeldReports(_ userIds: [String]) {
         guard !userIds.isEmpty else { return }
         lock.lock()
+        // (G3) a slot of another origin is never presented to this one.
         let targets: [(String, String)] = userIds.compactMap { id in
-            slots.compactMap { $0 }.first { $0.userId == id }.map { (id, $0.refreshToken) }
+            slots.compactMap { $0 }.first { $0.userId == id && !isForeignOrigin($0.origin) }.map { (id, $0.refreshToken) }
         }
         lock.unlock()
         for (id, token) in targets { reportGuestHeld(userId: id, refreshToken: token) }
@@ -835,6 +1195,8 @@ public final class SendoraCloudAuth {
     /// the tracked deadline is wrong (it decoded `exp` itself, or ate a 401).
     /// It skips the cache but NOT the single-flight or the backoff cooldown.
     public func getAccessToken(forceRefresh: Bool = false, completion: @escaping (String?) -> Void) {
+        // rev 3 INV-16: a pending commit (an unconfirmed rotation write) is retried on every token request.
+        retryPendingCommitIfNeeded()
         let state = status()
         if state == .withheld { completion(nil); return }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -871,15 +1233,28 @@ public final class SendoraCloudAuth {
     /// `force` skips the stashed-token short-circuit (a caller with out-of-band
     /// evidence the tracked deadline is wrong); the cron and the sibling-join
     /// path leave it off.
-    internal func refreshAccessToken(force: Bool, completion: @escaping (String?) -> Void) {
-        opsQueue.async { self.performRefresh(force: force, completion) }
+    internal func refreshAccessToken(force: Bool, graceRetry: Bool = false, completion: @escaping (String?) -> Void) {
+        opsQueue.async { self.performRefresh(force: force, graceRetry: graceRetry, completion) }
     }
 
     /// The refresh body. Runs ON `opsQueue` (an identity attempt calls it
     /// directly while it holds the queue). Single-flight: a second caller joins
     /// the in-flight request. Re-reads the stored refresh token at firing time.
-    internal func performRefresh(force: Bool = false, _ completion: @escaping (String?) -> Void) {
+    internal func performRefresh(force: Bool = false, graceRetry isGraceRetry: Bool = false, _ completion: @escaping (String?) -> Void) {
+        // rev 3: an unreadable store is re-read first (INV-17), and an unconfirmed rotation write is retried
+        // BEFORE anything is sent (INV-16 — the write is repaired, never the rotation).
+        recoverStorageIfNeeded()
+        retryPendingCommitIfNeeded()
         lock.lock()
+        // (T12) A rotated pair still unconfirmed on disk blocks the next rotation: a second rotation would leave the
+        // disk TWO tokens behind (R1 on disk, R2 spent in memory, R3 new). Retried above; still pending → no request.
+        // (Not when the session is memory-only by T2 — there is no disk copy left to protect.)
+        if (pendingCommit || pendingRotation != nil) && !isRefreshing && !storage.sessionIsMemoryOnly,
+           let inMemory = current?.refreshToken ?? limbo?.refreshToken, storage.read(.refreshToken).valueOrNil != inMemory {
+            lock.unlock()
+            completion(nil)
+            return
+        }
         refreshInFlight.append(completion)
         if isRefreshing {
             lock.unlock()
@@ -888,11 +1263,14 @@ public final class SendoraCloudAuth {
         isRefreshing = true
         // `withheld` never refreshes (no cron, no gap-fill — §3.2).
         let sent: String? = withheldState == nil ? (current?.refreshToken ?? limbo?.refreshToken) : nil
+        let sentSid: String? = current?.sid ?? limbo.flatMap { jwtStringClaim($0.accessToken ?? "", "sid") }
         let stashedAccess = current?.accessToken ?? limbo?.accessToken
         let stashedExp = current?.accessExpiresAt ?? limbo?.accessExpiresAt ?? 0
+        // (T6) A guest kept after `reuse` with no quarantine handle: do not present the spent token again yet.
+        let backedOff = sent != nil && reuseBackoff?.token == sent && (reuseBackoff?.until ?? 0) > nowMs()
         lock.unlock()
 
-        guard let refresh = sent else {
+        guard let refresh = sent, !backedOff else {
             completeRefresh(token: nil)
             return
         }
@@ -907,9 +1285,27 @@ public final class SendoraCloudAuth {
             return
         }
 
+        // INV-16 (rev 3): the marker lands — CONFIRMED — BEFORE the request. If the response is lost or its pair
+        // never reaches disk, the next launch knows a rotation was in flight and refreshes at once (inside the
+        // grace). A marker we cannot write ABORTS the refresh: the token on disk is still good; never send without it.
+        // (T2) A memory-only session (its refresh key given up as permanently unreadable) has no disk copy to protect.
+        // (s58.415, iOS #4) A background activity covers the marker write → request → confirmed commit (and the
+        // grace schedule): a suspension mid-request used to tear the socket down after the server rotated.
+        beginRefreshActivity()
+        guard commitRefreshMarker(sid: sentSid, set: true) || storage.sessionIsMemoryOnly else {
+            completeRefresh(token: nil)
+            return
+        }
+        beginGraceWindow(sent: refresh, newAttempt: !isGraceRetry)
+
+        // (s58.415, G2) The session's last access token rides along as `accessTokenHint`: with it the server can tell
+        // "account deleted" (`deleted`) from "a token it never issued / an old row" (`unknown`).
+        var refreshBody: [String: Any] = ["refreshToken": refresh]
+        if let hint = stashedAccess, !hint.isEmpty { refreshBody["accessTokenHint"] = hint }
+        // ⚠ `self` is captured STRONGLY (audit M3): a rotation the server performed must always be committed —
+        // dropping the response through `[weak self]` left the device holding a spent token.
         client.requestWithDetails(method: "POST", path: "/auth-service/token/refresh",
-                                  body: ["refreshToken": refresh]) { [weak self] rich in
-            guard let self = self else { return }
+                                  body: refreshBody, bypassBreaker: true) { rich in
             // The rotated trio lives under `data.tokens` (alongside `data.user`),
             // matching every other auth response. It was FLAT before s58.76, and
             // reading the wrong level does not fail loudly — it just never
@@ -929,14 +1325,24 @@ public final class SendoraCloudAuth {
     /// session it was about; anything else (429, 5xx, generic 401, network) is
     /// transient and changes no identity (INV-6). Returns the access token to hand
     /// to the waiting callers, or `nil`.
+    ///
+    /// rev 3: a transport failure / timeout / dropped body is OUTCOME UNKNOWN (the server may have rotated) — the
+    /// marker is KEPT and the SAME token is retried on the grace schedule (`refresh_outcome_unknown.retry`); a
+    /// transient refusal follows the same schedule first (`refresh_transient.backoff`).
     private func routeRefreshResult(sent: String, rich: APIClient.RichResponse, tokenFields: [String: Any]?) -> String? {
         let errorEnvelope = rich.body?["error"] as? [String: Any]
-        if rich.statusCode == 0 { return nil } // transport failure — backoff, no identity change
+        if rich.statusCode == 0 {
+            scheduleGraceRetry(sent: sent, serverWaitSeconds: rich.cfMitigated ? nil : rich.retryAfterSeconds)
+            return nil
+        }
         if !(200..<300).contains(rich.statusCode) {
             let code = rich.errorCode ?? (errorEnvelope?["code"] as? String) ?? ""
             if Self.isDeadRefreshError(code) {
+                endGraceWindow()
                 let endReason = Self.readEndReason(errorEnvelope)
                 _ = commitRefreshDead(sent: sent, endReason: endReason)
+            } else {
+                scheduleGraceRetry(sent: sent, serverWaitSeconds: rich.retryAfterSeconds)
             }
             return nil
         }
@@ -944,14 +1350,64 @@ public final class SendoraCloudAuth {
               let accessToken = fields["accessToken"] as? String, !accessToken.isEmpty,
               let refreshToken = fields["refreshToken"] as? String, !refreshToken.isEmpty,
               let expiresIn = fields["expiresIn"] as? Int else {
+            // A 2xx we cannot read: the server DID rotate — outcome unknown, same as a lost response.
+            scheduleGraceRetry(sent: sent, serverWaitSeconds: nil)
             return nil
         }
+        endGraceWindow()
         let tokens = SendoraCloudAuthTokens(
             accessToken: accessToken, refreshToken: refreshToken, expiresIn: expiresIn,
             tokenType: fields["tokenType"] as? String ?? "Bearer"
         )
         let user = parseSuccess(rich.body)
         return commitRefreshOk(sent: sent, tokens: tokens, user: user)
+    }
+
+    // MARK: - INV-16 (C) grace retries (rev 3)
+
+    /// (T1) Every attempt that is not itself a grace retry starts a NEW schedule (2/5/15/35 s from THIS attempt):
+    /// keying it to the token's first-ever attempt left a later lost answer with no retry at all once an earlier
+    /// outage had used the schedule up (reviews: iOS M2, web H1, Android H2). A grace retry keeps its schedule.
+    private func beginGraceWindow(sent: String, newAttempt: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if newAttempt || graceRetry?.sent != sent {
+            graceGeneration += 1
+            graceRetry = (sent, Date(), false, graceGeneration)
+        }
+    }
+
+    private func endGraceWindow() {
+        lock.lock(); defer { lock.unlock() }
+        graceRetry = nil
+    }
+
+    /// The next offset (2 / 5 / 15 / 35 s from the FIRST attempt, one attempt each, inside 50 s), never earlier
+    /// than the server's own wait. Past the deadline the cron / foreground takes over. Exempt from the breaker.
+    private func scheduleGraceRetry(sent: String, serverWaitSeconds: Int?) {
+        guard let scale = machineConfig.graceRetryScale, scale > 0 else { return }
+        lock.lock()
+        guard var g = graceRetry, g.sent == sent, !g.scheduled,
+              (current?.refreshToken ?? limbo?.refreshToken) == sent else { lock.unlock(); return }
+        let elapsedMs = Date().timeIntervalSince(g.firstAt) * 1000 / scale
+        guard let offset = Self.refreshRetryOffsetsMs.first(where: { Double($0) > elapsedMs }) else { lock.unlock(); return }
+        var atMs = Double(offset)
+        if let wait = serverWaitSeconds, wait > 0 { atMs = max(atMs, elapsedMs + Double(wait) * 1000) }
+        guard atMs <= Double(Self.refreshRetryDeadlineMs) else { lock.unlock(); return }
+        g.scheduled = true
+        graceRetry = g
+        let gen = g.gen
+        lock.unlock()
+        let delay = max(0, (atMs - elapsedMs) * scale / 1000)
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            // A schedule superseded by a newer attempt (T1) fires nothing.
+            let ours = self.graceRetry?.sent == sent && self.graceRetry?.gen == gen
+            if ours { self.graceRetry?.scheduled = false }
+            let still = ours && self.withheldState == nil && (self.current?.refreshToken ?? self.limbo?.refreshToken) == sent
+            self.lock.unlock()
+            if still { self.refreshAccessToken(force: true, graceRetry: true) { _ in } } else { self.endRefreshActivityIfIdle() }
+        }
     }
 
     internal static func readEndReason(_ error: [String: Any]?) -> SendoraCloudRefreshEndReason? {
@@ -974,10 +1430,10 @@ public final class SendoraCloudAuth {
     }
 
     /// Refresh synchronously from within an op that holds `opsQueue`.
-    internal func performRefreshSync() -> String? {
+    internal func performRefreshSync(force: Bool = false, graceRetry: Bool = false) -> String? {
         let sem = DispatchSemaphore(value: 0)
         var out: String?
-        performRefresh { token in out = token; sem.signal() }
+        performRefresh(force: force, graceRetry: graceRetry) { token in out = token; sem.signal() }
         sem.wait()
         return out
     }
@@ -1005,6 +1461,7 @@ public final class SendoraCloudAuth {
         guard !alreadyArmed, machineConfig.schedulesTimers else { return }
         let tick: () -> Void = { [weak self] in
             guard let self = self else { return }
+            self.retryPendingCommitIfNeeded() // rev 3 INV-16: the next tick repairs an unconfirmed write
             let snapshot = self.currentTokenSnapshot()
             guard let token = snapshot.token else { return }
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1057,7 +1514,41 @@ public final class SendoraCloudAuth {
             isRefreshing = false
             return cs
         }()
+        // (iOS #4) The commit ran (or nothing was sent): release the background activity unless a grace retry of this
+        // outcome-unknown refresh is still scheduled.
+        endRefreshActivityIfIdle()
         for cb in callbacks { cb(token) }
+    }
+
+    // MARK: - (s58.415, iOS #4) background activity around a refresh
+
+    internal func beginRefreshActivity() {
+        lock.lock()
+        let held = refreshActivityEnd != nil
+        lock.unlock()
+        guard !held else { return }
+        let end = startBackgroundActivity("Sendora session refresh")
+        lock.lock()
+        if refreshActivityEnd == nil { refreshActivityEnd = end; lock.unlock() } else { lock.unlock(); end() }
+    }
+
+    /// End the activity unless a refresh is running or a grace retry is still scheduled.
+    internal func endRefreshActivityIfIdle() {
+        lock.lock()
+        let busy = isRefreshing || (graceRetry?.scheduled ?? false)
+        let end = busy ? nil : refreshActivityEnd
+        if !busy { refreshActivityEnd = nil }
+        lock.unlock()
+        end?()
+    }
+
+    private func startBackgroundActivity(_ reason: String) -> () -> Void {
+        if let seam = machineConfig.backgroundActivity { return seam(reason) }
+        #if canImport(UIKit) && !os(watchOS)
+        return ExpiringActivity.begin(reason)
+        #else
+        return {}
+        #endif
     }
 
     // MARK: - Listeners
@@ -1725,7 +2216,7 @@ extension SendoraCloudAuth {
         newPassword: String,
         completion: @escaping (Result<Void, SendoraCloudAuthError>) -> Void
     ) {
-        client.post(path: "/auth-service/password/reset", body: ["token": token, "newPassword": newPassword]) { response in
+        client.post(path: "/auth-service/password/reset", body: ["token": token, "password": newPassword]) { response in
             if let err = self.parseError(response) { completion(.failure(err)) } else { completion(.success(())) }
         }
     }
@@ -1764,3 +2255,69 @@ internal func decodeJwtExp(_ token: String) -> Double? {
           exp.isFinite else { return nil }
     return exp
 }
+
+#if canImport(UIKit) && !os(watchOS)
+/// (s58.415, iOS #4) A background activity WITHOUT `UIApplication.shared` (unavailable in app extensions):
+/// `ProcessInfo.performExpiringActivity` keeps the process running while its block runs, so the block waits until the
+/// SDK ends the activity — or the system says it is expiring (the block is then called again with `expired == true`,
+/// which releases the waiting one). The returned closure ends it; calling it twice is harmless.
+enum ExpiringActivity {
+    /// Never hold the process longer than this, whatever happens to the end call.
+    static let maxHoldSeconds: Double = 170
+
+    static func begin(_ reason: String) -> () -> Void {
+        let sem = DispatchSemaphore(value: 0)
+        ProcessInfo.processInfo.performExpiringActivity(withReason: reason) { expired in
+            if expired { sem.signal(); return }
+            _ = sem.wait(timeout: .now() + maxHoldSeconds)
+        }
+        let lock = NSLock()
+        var ended = false
+        return {
+            lock.lock(); defer { lock.unlock() }
+            guard !ended else { return }
+            ended = true
+            sem.signal()
+        }
+    }
+}
+
+/// (step-2 review T2) "Is the device known to be unlocked?" without `UIApplication.shared` (unavailable in app
+/// extensions): `isProtectedDataAvailable` is sampled on the MAIN thread through the `sharedApplication` selector,
+/// and kept current by `protectedDataWillBecomeUnavailable` (→ false), `protectedDataDidBecomeAvailable` and
+/// `didBecomeActive` (→ true: an app in the foreground runs on an unlocked device). `nil` = no signal yet.
+final class ProtectedDataMonitor {
+    static let shared = ProtectedDataMonitor()
+    private let lock = NSLock()
+    private var state: Bool?
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil, queue: nil) { [weak self] _ in self?.set(false) })
+        observers.append(center.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: nil) { [weak self] _ in self?.set(true) })
+        observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in self?.set(true) })
+        refresh()
+    }
+
+    private func set(_ value: Bool) { lock.lock(); state = value; lock.unlock() }
+
+    /// Re-read `isProtectedDataAvailable` on the main thread (async off it — never `main.sync`, which could
+    /// deadlock against a main thread waiting on the auth queue).
+    private func refresh() {
+        let read: () -> Void = { [weak self] in
+            let selector = NSSelectorFromString("sharedApplication")
+            guard UIApplication.responds(to: selector),
+                  let app = UIApplication.perform(selector)?.takeUnretainedValue() as? UIApplication else { return }
+            self?.set(app.isProtectedDataAvailable)
+        }
+        if Thread.isMainThread { read() } else { DispatchQueue.main.async(execute: read) }
+    }
+
+    func sample() -> Bool? {
+        refresh()
+        lock.lock(); defer { lock.unlock() }
+        return state
+    }
+}
+#endif

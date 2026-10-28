@@ -20,6 +20,10 @@
 //   - the contact widget takes `metadata`, `includeDeviceContext`, `attachSession`, `accent`; the token and the
 //     metadata ride the URL FRAGMENT (never logged by a server).
 // Support calls now use the CONFIGURED API base URL (they always went to production, even on a staging config).
+// Unreleased (s58.406): `listMyTickets(widgetId:statuses:activeOnly:limit:)` (first page; client-side
+// `INVALID_ARGUMENT`) + `listMyTicketsPage(widgetId:cursor:limit:statuses:activeOnly:)` (cursor paging),
+// `createTicket` 409 `ACTIVE_TICKET_EXISTS` → `SendoraSupportError.activeTicketId`, and `presentTicketHistory`
+// `ticketId:` / `readOnlyFinished:` / `statuses:` / `activeOnly:` / `limit:` (pure builder `ticketHistoryURL`).
 //
 
 import Foundation
@@ -48,16 +52,26 @@ public enum SendoraContactError: Error {
 }
 
 /// 5.5.0 — a refused support call. `code` is the server's (`PROJECT_MISMATCH`, `NOT_FOUND`, `UNAUTHORIZED`, …) or
-/// the SDK's own: `NOT_CONFIGURED`, `NOT_SIGNED_IN`, `NETWORK`, `BAD_RESPONSE`, `HTTP_<status>`.
+/// the SDK's own: `NOT_CONFIGURED`, `NOT_SIGNED_IN`, `NETWORK`, `BAD_RESPONSE`, `HTTP_<status>`, `INVALID_ARGUMENT`
+/// (an option the SDK refused before sending anything).
 public struct SendoraSupportError: Error, LocalizedError, Equatable {
     public let code: String
     public let status: Int
     public let message: String
+    /// Unreleased (s58.406) — with `code == "ACTIVE_TICKET_EXISTS"` (409 from `createTicket`): the id of the player's
+    /// ticket that is still open, so the app can open it instead (`getMyTicket` /
+    /// `presentTicketHistory(ticketId:)`). nil for every other error.
+    public let activeTicketId: String?
     public var errorDescription: String? { message }
     public init(code: String, status: Int, message: String) {
+        self.init(code: code, status: status, message: message, activeTicketId: nil)
+    }
+    /// Unreleased (s58.406).
+    public init(code: String, status: Int, message: String, activeTicketId: String?) {
         self.code = code
         self.status = status
         self.message = message
+        self.activeTicketId = activeTicketId
     }
 }
 
@@ -74,6 +88,13 @@ public struct SendoraMyTicketSummary: Equatable {
     public let resolvedAt: String?
     /// Activity the player has not opened yet (`getMyTicket` clears it).
     public let unread: Bool
+}
+
+/// Unreleased (s58.406) — one page of `listMyTicketsPage`. `nextCursor` is nil on the last page (and from an older
+/// server that does not page — its one answer is the whole list); otherwise pass it back as `cursor:` for the next.
+public struct SendoraMyTicketPage: Equatable {
+    public let tickets: [SendoraMyTicketSummary]
+    public let nextCursor: String?
 }
 
 /// 5.5.0 — a public reply on a ticket. `authorType`: `customer` (the player) or `agent` (your team).
@@ -271,11 +292,113 @@ public final class SendoraCloudSupport: @unchecked Sendable {
         }
         let error = json["error"] as? [String: Any]
         let status = error?["status"] as? Int ?? 0
+        let code = error?["code"] as? String ?? "HTTP_\(status)"
+        // 409 ACTIVE_TICKET_EXISTS names the player's open ticket in `error.details.ticketId`.
+        let activeTicketId = code == "ACTIVE_TICKET_EXISTS"
+            ? ((error?["details"] as? [String: Any])?["ticketId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            : nil
         throw SendoraSupportError(
-            code: error?["code"] as? String ?? "HTTP_\(status)",
+            code: code,
             status: status,
-            message: error?["message"] as? String ?? "support.\(verb)() failed (\(status))"
+            message: error?["message"] as? String ?? "support.\(verb)() failed (\(status))",
+            activeTicketId: activeTicketId
         )
+    }
+
+    // MARK: - Ticket filters (Unreleased, s58.406)
+
+    /// The ticket states the server knows, in its own order.
+    internal static let knownTicketStatuses: [String] = ["open", "pending", "resolved", "closed"]
+    internal static let maxTicketsLimit = 50
+
+    internal static func isUUID(_ s: String) -> Bool {
+        s.range(of: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                options: .regularExpression) != nil
+    }
+
+    private static func invalid(_ message: String) -> SendoraSupportError {
+        SendoraSupportError(code: "INVALID_ARGUMENT", status: 0, message: message)
+    }
+
+    /// A cursor is opaque: every byte outside the unreserved set is percent-encoded (`+`, `/`, `=`, `&` included).
+    private static let cursorAllowed: CharacterSet = {
+        var set = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        set.insert(charactersIn: "-._~")
+        return set
+    }()
+
+    /// The `/my-tickets` query for the given options, or "" with none. Refuses (nothing is sent) a `limit` outside
+    /// 1…50, an empty or unknown status, `statuses` together with `activeOnly` (the server answers that with 422),
+    /// and an empty `cursor`. Order: `statuses`, `activeOnly`, `limit`, `cursor` (percent-encoded).
+    internal static func myTicketsQuery(statuses: [String]?, activeOnly: Bool, limit: Int?,
+                                        cursor: String? = nil) throws -> String {
+        var items: [String] = []
+        if let statuses = statuses {
+            if activeOnly {
+                throw invalid("support.listMyTickets(): pass statuses OR activeOnly, not both.")
+            }
+            if statuses.isEmpty {
+                throw invalid("support.listMyTickets(): statuses must name at least one of open, pending, resolved, closed.")
+            }
+            var seen: [String] = []
+            for s in statuses {
+                guard knownTicketStatuses.contains(s) else {
+                    throw invalid("support.listMyTickets(): unknown status \"\(s)\" (open, pending, resolved, closed).")
+                }
+                if !seen.contains(s) { seen.append(s) }
+            }
+            items.append("statuses=" + seen.joined(separator: ","))
+        }
+        if activeOnly { items.append("activeOnly=true") }
+        if let limit = limit {
+            guard (1...maxTicketsLimit).contains(limit) else {
+                throw invalid("support.listMyTickets(): limit must be 1–\(maxTicketsLimit) (got \(limit)).")
+            }
+            items.append("limit=\(limit)")
+        }
+        if let cursor = cursor {
+            guard !cursor.isEmpty, let encoded = cursor.addingPercentEncoding(withAllowedCharacters: cursorAllowed) else {
+                throw invalid("support.listMyTicketsPage(): cursor must be a non-empty nextCursor from the previous page.")
+            }
+            items.append("cursor=" + encoded)
+        }
+        return items.isEmpty ? "" : "?" + items.joined(separator: "&")
+    }
+
+    /// The hosted ticket-history page's URL. The access token rides the FRAGMENT (no server sees or logs it). The
+    /// options are lenient — the screen must always open: `ticketId` only when it is a UUID, `statuses` keep only the
+    /// known values (omitted when none is left, and when `activeOnly` is on), `limit` only within 1…50, the flags only
+    /// when true. With no options the URL is the one 5.5.0 built.
+    internal static func ticketHistoryURL(host: URL, widgetId: String, theme: String, accent: String?,
+                                          accessToken: String?, ticketId: String?, readOnlyFinished: Bool,
+                                          statuses: [String]?, activeOnly: Bool, limit: Int?) -> URL? {
+        guard var components = URLComponents(url: host.appendingPathComponent("/embed/tickets"),
+                                             resolvingAgainstBaseURL: false) else { return nil }
+        var items = [
+            URLQueryItem(name: "widgetId", value: widgetId),
+            URLQueryItem(name: "theme", value: theme),
+        ]
+        if let a = accent, isHexColor(a) { items.append(URLQueryItem(name: "accent", value: a)) }
+        if let t = ticketId, isUUID(t) { items.append(URLQueryItem(name: "ticketId", value: t)) }
+        if readOnlyFinished { items.append(URLQueryItem(name: "readOnlyFinished", value: "1")) }
+        if activeOnly {
+            items.append(URLQueryItem(name: "activeOnly", value: "1"))
+        } else if let statuses = statuses {
+            var kept: [String] = []
+            for s in statuses where knownTicketStatuses.contains(s) && !kept.contains(s) { kept.append(s) }
+            if !kept.isEmpty { items.append(URLQueryItem(name: "statuses", value: kept.joined(separator: ","))) }
+        }
+        if let l = limit, (1...maxTicketsLimit).contains(l) { items.append(URLQueryItem(name: "limit", value: String(l))) }
+        components.queryItems = items
+        guard var url = components.url else { return nil }
+        // JWT goes in the fragment so it doesn't appear in server logs / referer headers. The embed HTML scrubs the
+        // hash via history.replaceState on load.
+        if let token = accessToken, !token.isEmpty,
+           let escaped = token.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed),
+           let withToken = URL(string: url.absoluteString + "#access=" + escaped) {
+            url = withToken
+        }
+        return url
     }
 
     private func call(_ method: String, _ path: String, body: [String: Any]?, headers: [String: String]?) async throws -> [String: Any]? {
@@ -301,6 +424,8 @@ public final class SendoraCloudSupport: @unchecked Sendable {
     /// Open a ticket from your own Contact-us screen. Signed in (guest or account), the player's token is sent, so
     /// the ticket carries their VERIFIED user id; without a session it is still created and a `userId` you pass is
     /// shown to agents as "reported by the app, not verified". `metadata`: see `sanitizeMetadata` / `deviceContext()`.
+    /// When the server refuses a new ticket because the player already has an active one, this throws code
+    /// `ACTIVE_TICKET_EXISTS` (409) with `activeTicketId` set — open that ticket instead.
     public func createTicket(
         subject: String,
         body: String,
@@ -325,15 +450,50 @@ public final class SendoraCloudSupport: @unchecked Sendable {
                                     priority: Self.string(d, "priority"), userIdVerified: d["userIdVerified"] as? Bool ?? false)
     }
 
-    /// The signed-in player's tickets (newest activity first, up to 50). `widgetId` = a contact widget of THIS app's
-    /// project. Throws `SendoraSupportError` (`NOT_SIGNED_IN`, `PROJECT_MISMATCH`, …).
+    /// The signed-in player's tickets (newest activity first, up to 50 — the server's first page; page through all of
+    /// them with `listMyTicketsPage`). `widgetId` = a contact widget of THIS app's project. Throws
+    /// `SendoraSupportError` (`NOT_SIGNED_IN`, `PROJECT_MISMATCH`, …).
     public func listMyTickets(widgetId: String) async throws -> [SendoraMyTicketSummary] {
+        try await listMyTickets(widgetId: widgetId, statuses: nil, activeOnly: false, limit: nil)
+    }
+
+    /// Unreleased (s58.406) — the FIRST page of `listMyTickets`, filtered (newest activity first). For the rest, use
+    /// `listMyTicketsPage` and its `nextCursor`. Each option goes on the query only when given.
+    /// - `statuses`: any of `open`, `pending`, `resolved`, `closed` (non-empty).
+    /// - `activeOnly`: only `open` / `pending` tickets. Not together with `statuses`.
+    /// - `limit`: page size, 1…50 (server default 50) — never more rows than that.
+    /// A bad option throws `SendoraSupportError` code `INVALID_ARGUMENT` and sends nothing.
+    public func listMyTickets(
+        widgetId: String,
+        statuses: [String]? = nil,
+        activeOnly: Bool = false,
+        limit: Int? = nil
+    ) async throws -> [SendoraMyTicketSummary] {
+        try await listMyTicketsPage(widgetId: widgetId, cursor: nil, limit: limit, statuses: statuses,
+                                    activeOnly: activeOnly).tickets
+    }
+
+    /// Unreleased (s58.406) — one page of the player's tickets (newest activity first). Pass nil `cursor` for the first
+    /// page, then each page's `nextCursor` until it is nil. Keep `limit` / `statuses` / `activeOnly` the same across a
+    /// walk. `cursor` must be a non-empty `nextCursor` — an empty one, like any other bad option (see
+    /// `listMyTickets(widgetId:statuses:activeOnly:limit:)`), throws `INVALID_ARGUMENT` and sends nothing.
+    /// From an older server that does not page, `nextCursor` is nil and the one page is the whole list.
+    public func listMyTicketsPage(
+        widgetId: String,
+        cursor: String? = nil,
+        limit: Int? = nil,
+        statuses: [String]? = nil,
+        activeOnly: Bool = false
+    ) async throws -> SendoraMyTicketPage {
+        let query = try Self.myTicketsQuery(statuses: statuses, activeOnly: activeOnly, limit: limit, cursor: cursor)
         let headers = try await bearer("listMyTickets")
-        let json = try await call("GET", Self.myTicketsPath(widgetId), body: nil, headers: headers)
+        let json = try await call("GET", Self.myTicketsPath(widgetId) + query, body: nil, headers: headers)
         guard let rows = try Self.data(json, "listMyTickets") as? [[String: Any]] else {
             throw SendoraSupportError(code: "BAD_RESPONSE", status: 0, message: "support.listMyTickets(): unexpected response")
         }
-        return rows.map(Self.summary)
+        // `pagination` sits beside `data` in the envelope; absent (an older server) → one page, no cursor.
+        let next = ((json?["pagination"] as? [String: Any])?["nextCursor"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return SendoraMyTicketPage(tickets: rows.map(Self.summary), nextCursor: next)
     }
 
     /// One ticket with its public replies. Marks it read (it drops out of the unread count).
@@ -408,13 +568,26 @@ extension SendoraCloudSupport {
     /// endpoints as the signed-in end user.
     ///
     /// Returns `.failure(.notSignedIn)` if there's no auth row.
-    /// - Parameter accent: 5.5.0 — `#rgb` / `#rrggbb`; default = the widget's dashboard accent.
+    /// - Parameters:
+    ///   - accent: 5.5.0 — `#rgb` / `#rrggbb`; default = the widget's dashboard accent.
+    ///   - ticketId: Unreleased (s58.406) — open this ticket directly (ignored unless it is a UUID).
+    ///   - readOnlyFinished: Unreleased — resolved / closed tickets are shown read-only (no reply box).
+    ///   - statuses: Unreleased — list only these (`open`, `pending`, `resolved`, `closed`; unknown values dropped).
+    ///   - activeOnly: Unreleased — list only open / pending tickets (wins over `statuses`).
+    ///   - limit: Unreleased — page size of the hosted list, 1…50 (ignored outside that range); the page shows
+    ///     "Load more" for the rest.
+    ///   Each goes on the page's URL only when set; the screen always opens.
     @MainActor
     public func presentTicketHistory(
         widgetId: String,
         from presenter: UIViewController,
         theme: String = "auto",
         accent: String? = nil,
+        ticketId: String? = nil,
+        readOnlyFinished: Bool = false,
+        statuses: [String]? = nil,
+        activeOnly: Bool = false,
+        limit: Int? = nil,
         completion: ((Result<SendoraContactResult, SendoraContactError>) -> Void)? = nil
     ) {
         guard !widgetId.isEmpty else {
@@ -434,23 +607,12 @@ extension SendoraCloudSupport {
                     return
                 }
 
-                var components = URLComponents(url: self.widgetEmbedHost.appendingPathComponent("/embed/tickets"),
-                                               resolvingAgainstBaseURL: false)!
-                var items = [
-                    URLQueryItem(name: "widgetId", value: widgetId),
-                    URLQueryItem(name: "theme", value: theme),
-                ]
-                if let a = accent, Self.isHexColor(a) { items.append(URLQueryItem(name: "accent", value: a)) }
-                components.queryItems = items
-                guard var url = components.url else {
+                guard let url = Self.ticketHistoryURL(host: self.widgetEmbedHost, widgetId: widgetId, theme: theme,
+                                                      accent: accent, accessToken: token, ticketId: ticketId,
+                                                      readOnlyFinished: readOnlyFinished, statuses: statuses,
+                                                      activeOnly: activeOnly, limit: limit) else {
                     completion?(.failure(.invalidWidgetId))
                     return
-                }
-                // JWT goes in the fragment so it doesn't appear in
-                // server logs / referer headers. Embed HTML scrubs
-                // the hash via history.replaceState on load.
-                if let escaped = token.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) {
-                    url = URL(string: url.absoluteString + "#access=" + escaped)!
                 }
 
                 let vc = SendoraContactWidgetViewController(url: url, completion: completion)

@@ -11,6 +11,15 @@ import CryptoKit
 // the Keychain + the `com.sendora.sdk` UserDefaults suite exactly as before.
 
 /// The sensitive tier (Keychain in production).
+///
+/// ⚠⚠ DURABILITY (ADR-033 rev 3 §3.8, s58.415 — INV-16 / INV-17). A refresh token is a guest's ONLY credential.
+/// `get` / `set` / `delete` are the pre-rev-3 surface and LOSE information: `get` reads every failure as "absent"
+/// and `set` / `delete` swallow their `OSStatus`. The auth machine uses the status-carrying trio instead:
+///  - `read` — `.absent` ONLY for `errSecItemNotFound`; every other status (−25308 `errSecInteractionNotAllowed`
+///    before first unlock, −34018, an undecodable value) is `.unavailable` and must never be read as "no session";
+///  - `write` — replaces IN PLACE (`SecItemUpdate`, add only when the item is absent): a write never passes
+///    through "no value", and its result is KNOWN (`false` = nothing changed on disk);
+///  - `remove` — `true` when the item is gone afterwards (deleted, or was never there).
 protocol SendoraSecureStore: AnyObject {
     func get(_ key: String) -> String?
     func set(_ key: String, _ value: String)
@@ -18,6 +27,31 @@ protocol SendoraSecureStore: AnyObject {
     /// 5.7.0 — write ONLY if the key is absent (never delete-then-add). `.duplicate` = someone else's value is
     /// already stored; the caller must re-read and adopt it (Keychain `errSecDuplicateItem`, -25299).
     func addIfAbsent(_ key: String, _ value: String) -> SendoraSecureAddResult
+    /// rev 3 (INV-17): a read that distinguishes "absent" from "could not read".
+    func read(_ key: String) -> SendoraSecureRead
+    /// rev 3 (INV-16): an atomic, CONFIRMED write. `false` = the old value (if any) is still what is stored.
+    func write(_ key: String, _ value: String) -> Bool
+    /// rev 3: a confirmed delete. `true` = the item is not on disk afterwards.
+    func remove(_ key: String) -> Bool
+}
+
+/// The outcome of one secure read (ADR-033 rev 3, INV-17).
+enum SendoraSecureRead: Equatable {
+    case value(String)
+    /// `errSecItemNotFound` — and ONLY that.
+    case absent
+    /// Any other status: the item may well exist. Never "signed out", never a mint.
+    case unavailable(OSStatus)
+
+    var valueOrNil: String? {
+        if case .value(let v) = self { return v }
+        return nil
+    }
+
+    var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
 }
 
 enum SendoraSecureAddResult: Equatable {
@@ -33,6 +67,23 @@ extension SendoraSecureStore {
         set(key, value)
         return .added
     }
+
+    /// Defaults for a PERFECT in-memory double (never fails a read or a write) — exactly what a plain map is.
+    /// A double that models faults (FaultyStorageTests) implements all three.
+    func read(_ key: String) -> SendoraSecureRead {
+        if let v = get(key) { return .value(v) }
+        return .absent
+    }
+
+    func write(_ key: String, _ value: String) -> Bool {
+        set(key, value)
+        return true
+    }
+
+    func remove(_ key: String) -> Bool {
+        delete(key)
+        return true
+    }
 }
 
 /// The non-sensitive tier (UserDefaults in production).
@@ -47,56 +98,127 @@ protocol SendoraPlainStore: AnyObject {
     func remove(forKey key: String)
 }
 
+/// The four Security.framework calls `KeychainSecureStore` makes, behind a seam (rev 3) so `swift test` can pin
+/// their ORDER and status handling without a keychain entitlement (a hostless test bundle gets −34018 on every
+/// call). Production is `.system` — the real `SecItem*` functions, unchanged.
+struct KeychainAPI {
+    var copyMatching: ([String: Any]) -> (OSStatus, AnyObject?)
+    var add: ([String: Any]) -> OSStatus
+    var update: (_ query: [String: Any], _ attributes: [String: Any]) -> OSStatus
+    var delete: ([String: Any]) -> OSStatus
+
+    static let system = KeychainAPI(
+        copyMatching: { query in
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            return (status, result)
+        },
+        add: { SecItemAdd($0 as CFDictionary, nil) },
+        update: { SecItemUpdate($0 as CFDictionary, $1 as CFDictionary) },
+        delete: { SecItemDelete($0 as CFDictionary) }
+    )
+}
+
 final class KeychainSecureStore: SendoraSecureStore {
     private let service: String
+    private let api: KeychainAPI
 
-    init(service: String) {
+    init(service: String, api: KeychainAPI = .system) {
         self.service = service
+        self.api = api
     }
 
-    func get(_ key: String) -> String? {
-        let query: [String: Any] = [
+    private func matchQuery(_ key: String) -> [String: Any] {
+        return [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
             kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 
-    func set(_ key: String, _ value: String) {
-        let data = value.data(using: .utf8)!
-        delete(key)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecAttrService as String: service,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ]
-        let status = SecItemAdd(query as CFDictionary, nil)
-        if status != errSecSuccess {
-            // Surface OSStatus failures so the developer can diagnose
-            // pre-first-unlock writes (errSecInteractionNotAllowed) or
-            // duplicate-item races (errSecDuplicateItem) — previously
-            // swallowed, leaving the user "logged out" with no log.
-            SendoraCloudLogger.shared.error(
-                "Keychain set failed for key=\(key) status=\(status)"
-            )
+    /// INV-17: `errSecItemNotFound` is the ONLY "absent". −25308 (`errSecInteractionNotAllowed`, before first
+    /// unlock), −34018 (no keychain entitlement), an I/O error or an undecodable value is `.unavailable`: the item
+    /// may exist, and reading it as "no session" is what let a background launch mint over the account (H1).
+    /// Reads never filter on accessibility, so an item written under any class stays readable.
+    func read(_ key: String) -> SendoraSecureRead {
+        var query = matchQuery(key)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let (status, result) = api.copyMatching(query)
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data, let s = String(data: data, encoding: .utf8) else {
+                SendoraCloudLogger.shared.error("Keychain read undecodable for key=\(key)")
+                return .unavailable(errSecDecode)
+            }
+            return .value(s)
+        case errSecItemNotFound:
+            return .absent
+        default:
+            SendoraCloudLogger.shared.error("Keychain read failed for key=\(key) status=\(status)")
+            return .unavailable(status)
         }
     }
 
-    func delete(_ key: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecAttrService as String: service,
+    func get(_ key: String) -> String? {
+        return read(key).valueOrNil
+    }
+
+    /// INV-16 atomic replace: `SecItemUpdate` IN PLACE, and `SecItemAdd` ONLY when the item is absent — never
+    /// delete-then-add (a failed add, or a kill between the two, used to leave the key GONE; the next hydrate then
+    /// cleared the record holding the rotated token as a stale blob — H2 / FS1 / FS2). The update also carries
+    /// `kSecAttrAccessible`, so an item created under another class migrates on its next write (background
+    /// refreshes run while the phone is locked → AfterFirstUnlock). Every OSStatus is checked: `false` = the
+    /// write did not land and the OLD value is still what is stored.
+    func write(_ key: String, _ value: String) -> Bool {
+        let match = matchQuery(key)
+        let attrs: [String: Any] = [
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccessible as String: Self.accessibility(forKey: key),
         ]
-        SecItemDelete(query as CFDictionary)
+        var status = api.update(match, attrs)
+        if status == errSecItemNotFound {
+            status = api.add(match.merging(attrs) { _, new in new })
+            if status == errSecDuplicateItem {
+                // A concurrent add landed between our update and our add: replace it in place.
+                status = api.update(match, attrs)
+            }
+        }
+        if status != errSecSuccess {
+            SendoraCloudLogger.shared.error("Keychain write failed for key=\(key) status=\(status)")
+            return false
+        }
+        return true
+    }
+
+    func set(_ key: String, _ value: String) {
+        _ = write(key, value)
+    }
+
+    /// ⚠⚠ (s58.415, operator decision D2 — zero guest-account loss) The AUTH keys — the four frozen keys, the session
+    /// record, the held + quarantine slots and the refresh marker — are `kSecAttrAccessibleAfterFirstUnlock`, NOT
+    /// `…ThisDeviceOnly`: an encrypted backup / iCloud backup / Quick Start carries them to a new iPhone, so a guest
+    /// moves with the player instead of being stranded on the old phone (a guest has no other way back in). A backup
+    /// restored onto a SECOND phone clones the token: one of the two later gets `reuse` → quarantine / ADR-036
+    /// recovery, never a destroyed account. Every write passes the class to `SecItemUpdate`, so an item created
+    /// `…ThisDeviceOnly` by an earlier build migrates on its next write.
+    /// Everything else — the analytics device id (`addIfAbsent`), `sendora_user_id`, the known-device tokens, the link
+    /// revoke tokens — stays `AfterFirstUnlockThisDeviceOnly` exactly as before (device-bound by design).
+    static func accessibility(forKey key: String) -> CFString {
+        return SendoraStorage.travellingAuthKeys.contains(key)
+            ? kSecAttrAccessibleAfterFirstUnlock
+            : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    }
+
+    func remove(_ key: String) -> Bool {
+        let status = api.delete(matchQuery(key))
+        if status == errSecSuccess || status == errSecItemNotFound { return true }
+        SendoraCloudLogger.shared.error("Keychain delete failed for key=\(key) status=\(status)")
+        return false
+    }
+
+    func delete(_ key: String) {
+        _ = remove(key)
     }
 
     func addIfAbsent(_ key: String, _ value: String) -> SendoraSecureAddResult {
@@ -107,7 +229,7 @@ final class KeychainSecureStore: SendoraSecureStore {
             kSecValueData as String: Data(value.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        let status = SecItemAdd(query as CFDictionary, nil)
+        let status = api.add(query)
         switch status {
         case errSecSuccess: return .added
         case errSecDuplicateItem: return .duplicate
@@ -139,7 +261,8 @@ final class UserDefaultsPlainStore: SendoraPlainStore {
 ///  - `isFirstLaunch` / `sessionId` live in UserDefaults (non-sensitive).
 ///  - `deviceId` and `cachedUserId` live in Keychain with
 ///    `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` — not backed up to
-///    iCloud, not readable from other apps.
+///    iCloud, not readable from other apps. (s58.415, D2: the AUTH keys are
+///    `AfterFirstUnlock` and DO travel — `travellingAuthKeys`.)
 ///  - Event queue is persisted as JSON stripped of PII (userId + traits removed
 ///    before writing; they'll be re-injected from `currentUserId` at send time).
 ///
@@ -166,6 +289,24 @@ final class SendoraStorage {
         "sendora_auth_held_3",
         "sendora_auth_held_4",
     ]
+
+    /// ADR-033 rev 3 §3.8 (s58.415) — the Q = 3 FIXED quarantine slots: the CURRENT guest whose refresh came back
+    /// `reuse` is moved here instead of being cleared (operator decision D). LITERAL names for the same reason as
+    /// the held slots. Keychain tier. Not counted in T, never auto-restored, never refreshed in the background.
+    static let quarantineSlotKeys: [String] = [
+        "sendora_auth_quarantine_0",
+        "sendora_auth_quarantine_1",
+        "sendora_auth_quarantine_2",
+    ]
+
+    /// ADR-033 rev 3 INV-16 — the refresh-in-flight marker `{v:1, sid, startedAt}`, written and CONFIRMED before
+    /// every `/token/refresh` of the current session, removed only once the rotated pair's write confirmed. A
+    /// hydrate that finds it refreshes at once.
+    /// ⚠ Keychain tier (step-2 review T15, Codex F9): no token in it, but its write must be CONFIRMED DURABLE before
+    /// the request goes out. A `UserDefaults.set` + same-process read-back proves only process-visible state — the
+    /// defaults daemon flushes later, so a kill after the server rotated could leave R1 on disk with NO marker. A
+    /// Keychain `SecItemUpdate` / `SecItemAdd` that returned `errSecSuccess` is on disk (AfterFirstUnlock).
+    static let refreshInflightKey = "sendora_auth_refresh_inflight"
 
     /// The four pre-5.4.0 auth keys a downgraded build reads (ADR-023 frozen).
     static let frozenAuthKeys: [String] = [
@@ -194,11 +335,24 @@ final class SendoraStorage {
     static let linkRevokeTokensMax = 200
     static let linkRevokeTokenMaxLength = 200
 
+    /// (s58.415, D2) The Keychain keys written `kSecAttrAccessibleAfterFirstUnlock` (they travel in an encrypted
+    /// backup / Quick Start): every key that is, or holds, a session credential. See `KeychainSecureStore.accessibility`.
+    static let travellingAuthKeys: Set<String> =
+        Set(frozenAuthKeys + [authSessionKey] + heldSlotKeys + quarantineSlotKeys + [refreshInflightKey, mintKeyKey])
+
     /// The CLOSED set of Keychain keys this SDK may write. The auth machine's
     /// recording double asserts every secure write lands on one of these.
     static let secureKeys: [String] =
         ["sendora_user_id", "sendora_device_id"] + frozenAuthKeys + [authSessionKey] + heldSlotKeys
-        + [knownDevicesKey, linkRevokeTokensKey]
+        + [knownDevicesKey, linkRevokeTokensKey] + quarantineSlotKeys + [refreshInflightKey, mintKeyKey]
+
+    /// (step-2 review T2) Session keys whose read kept failing for the whole INV-17 window while the device was
+    /// known to be unlocked: a PERMANENT failure (−34018 with no keychain entitlement, `errSecDecode` bytes). They
+    /// read as ABSENT from then on — the SDK proceeds (a new session may be written OVER them) — and their bytes are
+    /// NEVER deleted by the SDK (`clearAuthTokens` skips them). A successful write of a key takes it off the list.
+    private var acceptedUnreadable: Set<String> = []
+    private var acceptedFoundValue = false
+    private let acceptedLock = NSLock()
 
     init() {
         let defaults = UserDefaults(suiteName: "com.sendora.sdk") ?? .standard
@@ -247,16 +401,35 @@ final class SendoraStorage {
         }
     }
 
-    /// ADR-033 B10 — the per-ATTEMPT idempotent mint key, persisted in the
-    /// NON-secret tier until the mint commits (a retried mint with the same key
-    /// within 24 h returns the same guest instead of a second one). A one-shot
-    /// retry handle, never a device credential.
-    var pendingMintKey: String? {
-        get { plain.string(forKey: "sendora_auth_mint_key") }
-        set {
-            if let v = newValue { plain.setString(v, forKey: "sendora_auth_mint_key") }
-            else { plain.remove(forKey: "sendora_auth_mint_key") }
+    /// ADR-033 B10 — the per-ATTEMPT idempotent mint key, kept until the minted session is on disk (a retried mint
+    /// with the same key within 24 h returns the same guest instead of a second one).
+    /// ⚠ (s58.415, C3 / Codex #7) KEYCHAIN tier since s58.415 — same literal name as the UserDefaults key it replaces
+    /// (still READ as a legacy fallback, removed on the next write). While a minted session is not yet on disk this key
+    /// is the device's only way back to that guest, and a UserDefaults set + same-process read-back proves nothing about
+    /// the disk (the T15 lesson). A Keychain write that returned `errSecSuccess` is durable. `AfterFirstUnlock` (D2).
+    static let mintKeyKey = "sendora_auth_mint_key"
+
+    /// The stored mint key: `.value` / `.absent` / `.unavailable` (a Keychain read error — the caller does not mint).
+    func readPendingMintKey() -> SendoraSecureRead {
+        let r = secure.read(SendoraStorage.mintKeyKey)
+        if case .absent = r, let legacy = plain.string(forKey: SendoraStorage.mintKeyKey) { return .value(legacy) }
+        return r
+    }
+
+    var pendingMintKey: String? { readPendingMintKey().valueOrNil }
+
+    /// (s58.415, G6 / C3) Write the mint key and CONFIRM it (Keychain status) — `false` = not on disk, the caller does
+    /// not mint. `nil` removes it (and the legacy UserDefaults copy).
+    @discardableResult
+    func writePendingMintKey(_ key: String?) -> Bool {
+        if let k = key {
+            guard secure.write(SendoraStorage.mintKeyKey, k) else { return false }
+            if plain.hasValue(forKey: SendoraStorage.mintKeyKey) { plain.remove(forKey: SendoraStorage.mintKeyKey) }
+            return true
         }
+        let ok = secure.remove(SendoraStorage.mintKeyKey)
+        if plain.hasValue(forKey: SendoraStorage.mintKeyKey) { plain.remove(forKey: SendoraStorage.mintKeyKey) }
+        return ok
     }
 
     // MARK: - Keychain-backed (sensitive)
@@ -360,14 +533,160 @@ final class SendoraStorage {
     }
 
     /// Clear the current-session keys: the four frozen keys AND their 5.4.0
-    /// mirror `sendora_auth_session`. Never touches the held slots, the event
-    /// queue or `sendora_user_id` (ADR-033 §3.3 SIGN_OUT / DISCARD_WITHHELD rows).
-    func clearAuthTokens() {
-        secure.delete("sendora_auth_access_token")
-        secure.delete("sendora_auth_access_expires")
-        secure.delete("sendora_auth_refresh_token")
-        secure.delete("sendora_auth_user")
-        secure.delete(SendoraStorage.authSessionKey)
+    /// mirror `sendora_auth_session` (+ the rev-3 refresh marker, which only
+    /// ever describes the current session). Never touches the held or quarantine
+    /// slots, the event queue or `sendora_user_id` (ADR-033 §3.3 SIGN_OUT /
+    /// DISCARD_WITHHELD rows). `true` when every key is gone afterwards.
+    @discardableResult
+    func clearAuthTokens() -> Bool {
+        var ok = true
+        // (T2) A key given up as permanently unreadable is never removed by the SDK — its bytes may be a credential.
+        for key in SendoraStorage.frozenAuthKeys + [SendoraStorage.authSessionKey] where !isAcceptedUnreadable(key) && !secure.remove(key) { ok = false }
+        if secure.read(SendoraStorage.refreshInflightKey) != .absent, !secure.remove(SendoraStorage.refreshInflightKey) { ok = false }
+        return ok
+    }
+
+    // MARK: - ADR-033 rev 3 — status-carrying auth reads / confirmed writes
+
+    /// The five keys that together ARE the current session. Names stay in this file (INV-1 source guard).
+    enum AuthField {
+        case accessToken, accessExpires, refreshToken, user, session
+
+        var key: String {
+            switch self {
+            case .accessToken: return "sendora_auth_access_token"
+            case .accessExpires: return "sendora_auth_access_expires"
+            case .refreshToken: return "sendora_auth_refresh_token"
+            case .user: return "sendora_auth_user"
+            case .session: return SendoraStorage.authSessionKey
+            }
+        }
+    }
+
+    /// INV-17: `.unavailable` is never "absent" — except for a key ACCEPTED as permanently unreadable (T2).
+    func read(_ field: AuthField) -> SendoraSecureRead {
+        let r = secure.read(field.key)
+        if r.isUnavailable && isAcceptedUnreadable(field.key) { return .absent }
+        return r
+    }
+
+    /// INV-16: a confirmed write (`nil` = remove). `false` = the disk still holds the previous value.
+    /// (s58.415, iOS #10) A key given up as unreadable (T2) is RE-READ before anything is written over it: a value now
+    /// means the failure was transient and those bytes may be a guest's only token — the write is refused (nothing
+    /// changes on disk) and `acceptedKeyFoundValue` tells the auth machine to re-hydrate.
+    @discardableResult
+    func write(_ field: AuthField, _ value: String?) -> Bool {
+        if let v = value {
+            // (s58.415, C2) …and a key STILL unreadable is refused too: its bytes may still be the guest. Only a key that
+            // now reads ABSENT may be written (nothing is there to protect).
+            if isAcceptedUnreadable(field.key) {
+                switch secure.read(field.key) {
+                case .value:
+                    acceptedLock.lock(); acceptedFoundValue = true; acceptedLock.unlock()
+                    return false
+                case .unavailable:
+                    return false
+                case .absent:
+                    break
+                }
+            }
+            let ok = secure.write(field.key, v)
+            if ok { acceptedLock.lock(); acceptedUnreadable.remove(field.key); acceptedLock.unlock() }
+            return ok
+        }
+        if isAcceptedUnreadable(field.key) { return true } // (T2) never delete bytes we gave up reading
+        return secure.remove(field.key)
+    }
+
+    static let sessionFields: [AuthField] = [.accessToken, .accessExpires, .refreshToken, .user, .session]
+
+    /// True when none of the five session keys fails to READ (absent is fine) — the INV-17 re-hydrate probe.
+    func sessionKeysReadable() -> Bool {
+        return !SendoraStorage.sessionFields.contains { read($0).isUnavailable }
+    }
+
+    /// (T2) Give up on the session keys whose read is STILL failing: from now on they read as absent. Nothing is
+    /// deleted. Returns the keys given up.
+    @discardableResult
+    func acceptUnreadableSessionKeys() -> [String] {
+        let failing = SendoraStorage.sessionFields.filter { secure.read($0.key).isUnavailable }.map { $0.key }
+        acceptedLock.lock(); acceptedUnreadable.formUnion(failing); acceptedLock.unlock()
+        return failing
+    }
+
+    /// (s58.415, C2) Re-read every key given up as unreadable: `true` when one of them holds a VALUE again.
+    func acceptedKeyHoldsValue() -> Bool {
+        acceptedLock.lock()
+        let keys = acceptedUnreadable
+        acceptedLock.unlock()
+        return keys.contains { if case .value = secure.read($0) { return true }; return false }
+    }
+
+    /// (s58.415, C2 / C3) Re-read every key given up as unreadable: `true` when one of them STILL fails to read — its
+    /// bytes may still be the guest, so nothing may be written over it (a mint is then never installed).
+    func acceptedKeyStillUnreadable() -> Bool {
+        acceptedLock.lock()
+        let keys = acceptedUnreadable
+        acceptedLock.unlock()
+        return keys.contains { secure.read($0).isUnavailable }
+    }
+
+    /// (iOS #10) A write found a value under a key accepted as unreadable. Read-and-reset.
+    func takeAcceptedKeyFoundValue() -> Bool {
+        acceptedLock.lock(); defer { acceptedLock.unlock() }
+        let f = acceptedFoundValue
+        acceptedFoundValue = false
+        return f
+    }
+
+    /// (iOS #10) The store reads again: forget every acceptance (their bytes are real values now), so the re-hydrate
+    /// sees them.
+    func clearAcceptedUnreadable() {
+        acceptedLock.lock(); acceptedUnreadable.removeAll(); acceptedLock.unlock()
+    }
+
+    func isAcceptedUnreadable(_ key: String) -> Bool {
+        acceptedLock.lock(); defer { acceptedLock.unlock() }
+        return acceptedUnreadable.contains(key)
+    }
+
+    /// (T2) The session lives in memory only: its refresh key was given up as permanently unreadable and no write
+    /// has landed over it since. Nothing on disk can be protected by a marker or a pending-commit retry.
+    var sessionIsMemoryOnly: Bool { isAcceptedUnreadable(AuthField.refreshToken.key) }
+
+    func readHeldSlot(_ index: Int) -> SendoraSecureRead {
+        guard SendoraStorage.heldSlotKeys.indices.contains(index) else { return .absent }
+        return secure.read(SendoraStorage.heldSlotKeys[index])
+    }
+
+    func readQuarantineSlot(_ index: Int) -> SendoraSecureRead {
+        guard SendoraStorage.quarantineSlotKeys.indices.contains(index) else { return .absent }
+        return secure.read(SendoraStorage.quarantineSlotKeys[index])
+    }
+
+    /// Confirmed write of quarantine slot `index` (`nil` = release).
+    @discardableResult
+    func setQuarantineSlotJson(_ index: Int, _ json: String?) -> Bool {
+        guard SendoraStorage.quarantineSlotKeys.indices.contains(index) else { return false }
+        let key = SendoraStorage.quarantineSlotKeys[index]
+        if let v = json { return secure.write(key, v) }
+        return secure.remove(key)
+    }
+
+    /// INV-16 marker (Keychain, T15). PRESENT when it reads — or when its read FAILS (a marker we cannot see may be
+    /// there; refreshing once too often is harmless, skipping the immediate refresh is not).
+    var refreshInflightMarkerPresent: Bool {
+        switch secure.read(SendoraStorage.refreshInflightKey) {
+        case .absent: return false
+        case .value, .unavailable: return true
+        }
+    }
+
+    /// Confirmed write (`errSecSuccess` = on disk) or confirmed removal of the marker.
+    @discardableResult
+    func setRefreshInflightMarker(_ value: String?) -> Bool {
+        if let v = value { return secure.write(SendoraStorage.refreshInflightKey, v) }
+        return secure.remove(SendoraStorage.refreshInflightKey)
     }
 
     // MARK: - ADR-033 session record + held slots (Keychain-backed)
@@ -388,10 +707,13 @@ final class SendoraStorage {
         return secure.get(SendoraStorage.heldSlotKeys[index])
     }
 
-    func setHeldSlotJson(_ index: Int, _ json: String?) {
-        guard SendoraStorage.heldSlotKeys.indices.contains(index) else { return }
+    /// Confirmed (rev 3): `false` = the slot on disk still holds its previous bytes.
+    @discardableResult
+    func setHeldSlotJson(_ index: Int, _ json: String?) -> Bool {
+        guard SendoraStorage.heldSlotKeys.indices.contains(index) else { return false }
         let key = SendoraStorage.heldSlotKeys[index]
-        if let v = json { secure.set(key, v) } else { secure.delete(key) }
+        if let v = json { return secure.write(key, v) }
+        return secure.remove(key)
     }
 
     // MARK: - Known-device tokens (5.6.0, Keychain-backed, survives signOut)

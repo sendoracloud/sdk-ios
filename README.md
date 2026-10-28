@@ -17,7 +17,7 @@ Choose **Up to Next Major Version**, with the current release as the minimum.
 Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.9.0"),
+.package(url: "https://github.com/sendoracloud/sdk-ios", from: "5.10.0"),
 ```
 
 ### Upgrading from 4.x
@@ -230,6 +230,70 @@ let held = SendoraCloud.auth?.heldGuests()   // newest first; never exposes toke
   ever displaced. There is no expiry: neither the SDK nor the server releases a held guest by age.
 - `signOut()` KEEPS held guests. `deleteAccount()` keeps them too and suppresses auto-restore;
   `deleteAccount(alsoDiscardHeldGuests: true)` deletes them server-side as well.
+- **A guest signs out exactly like an account** (the industry standard — Firebase, Supabase): its
+  token is dropped from this device (local clear + revoke) and only `.signedOut(reason: .user)` fires
+  — never `.guestHeld`, so the "keep → restore" handler above is never triggered by a sign-out. The
+  server account is left alone, but nothing on the device can sign back in to it: **offer a link
+  (`signUp` / `link*()`) before you let a guest sign out.** `signOut(discardGuest: true)` also erases
+  it server-side (`POST /guest/discard`, then the local clear). A guest REPLACED by a sign-in is still
+  held (that is the accidental path). `signOut()` never fails; while the Keychain cannot be read
+  (`storageUnavailable`) it deletes nothing and runs once the store reads again.
+
+### Token durability (unreleased — ADR-033 rev 3 §3.8)
+
+A guest's refresh token is its only credential, so the SDK never loses it to a storage fault:
+
+- Keychain writes replace in place and are confirmed; a rotation whose write fails stays a pending
+  commit in memory (the session keeps working) and is re-written, never re-rotated. A
+  refresh-in-flight marker makes a relaunch refresh at once, inside the server's 60 s replay window.
+- Before the first unlock after a reboot the Keychain cannot be read: `status()` stays `.unknown` and
+  `SendoraCloud.auth?.storageUnavailable` is `true` — the session is NOT gone. Session-installing
+  verbs wait up to 10 s, then fail `STORAGE_UNAVAILABLE` (kind `.network`, retryable) instead of
+  minting over it; the SDK re-reads on `protectedDataDidBecomeAvailable` and when the app becomes
+  active. A read that keeps failing for the whole window while the device is unlocked (no keychain
+  entitlement, undecodable bytes) is treated as permanent: the verb proceeds as if nothing were
+  stored, and the unreadable item is never deleted by the SDK.
+- A guest's token is dropped only when the server CONFIRMS the account is gone (`deleted` — every refresh
+  sends the last access token as `accessTokenHint` so it can tell). Any other verdict (`reuse`, `revoked`,
+  `expired`, `unknown`, none) QUARANTINES the guest instead — the current guest, and a held guest whose
+  restore / claim / auto-restore was refused (ensureSession() moves on to the next one, then mints):
+
+```swift
+SendoraCloud.auth?.onAuthStateChanged { change in
+    if case .guestQuarantined(let userId, _) = change {
+        // followed by .signedOut(reason: .sessionExpired); lastSignedOutEndReason() = the server's verdict
+        SendoraCloud.auth?.recoverQuarantinedGuest(userId) { result in
+            // QUARANTINE_UNRECOVERABLE (retryable) while the server still refuses the token
+        }
+    }
+}
+let quarantined = SendoraCloud.auth?.getQuarantinedGuests() // newest first; never exposes tokens
+```
+
+  Quarantined guests are never auto-restored and not counted toward the held-guest cap;
+  `discardQuarantinedGuest(_:)` erases one server-side. The 3 quarantine slots are never overwritten:
+  with all of them in use the current guest is kept as it is (and not refreshed for 30 s), and a refused
+  held guest stays held with `autoRestore: false`. A guest whose owner could not be determined is listed
+  as `unknown:<16 hex>`. A held / quarantined guest that IS the current user is not listed, and every
+  verb refuses it with `SLOT_IS_CURRENT` (kind `.config`, nothing sent).
+- Sessions and slots are bound to the API origin they were issued by (scheme + host of `apiBaseUrl`).
+  A stored session of another origin (a staging build installed over the App Store one, an environment
+  switch) is `status() == .withheld` with `withheld()?.reason == "origin_mismatch"` — nothing is sent to
+  the configured host and nothing is written; held / quarantined guests of another origin are kept,
+  never presented and never released. `discardWithheld()` / `signOut()` MOVE a withheld GUEST to a held
+  slot (`autoRestore: false`) and never revoke it (with all 5 slots in use it stays withheld and
+  `signOut(discardGuest:completion:)` fails `HELD_GUEST_LIMIT`); a withheld account is cleared + revoked.
+- A held guest moved to quarantine emits `.guestReleased(reason: .quarantined)` then `.guestQuarantined`
+  (`.dead` now means the server confirmed `deleted`); a withheld guest moved to a held slot emits
+  `.guestHeld` before `.signedOut(.user)`. `SendoraCloudGuestReleasedReason` gained `.quarantined` —
+  default-branch a `switch` over it.
+- `ensureSession()` / `signInAnonymously()` return a NEW guest only once its session is in the Keychain;
+  otherwise they fail `STORAGE_UNAVAILABLE` (retryable) and the retry gets the same guest back. A held /
+  quarantined guest whose rotated token is not yet on disk is not presented again (`STORAGE_UNAVAILABLE`,
+  nothing sent) until it is.
+- The auth Keychain items are `kSecAttrAccessibleAfterFirstUnlock` (not `…ThisDeviceOnly`): an encrypted
+  backup / Quick Start carries the guest to a new iPhone. A backup restored on a second phone clones the
+  token — one of the two later gets `reuse` and quarantines it (recoverable), it is never destroyed.
 - `SendoraCloud.reset()` is unchanged: it resets the ANALYTICS identity (user id, device id, session
   id) and has never touched the auth session on iOS — use `SendoraCloud.auth?.signOut` to sign out.
   `reset(includeHeldGuests:)` exists for parity with RN/web and has no effect on iOS (held guests are
@@ -298,6 +362,48 @@ let created = try await SendoraCloud.support?.createTicket(subject: "Purchase no
 
 Refusals throw `SendoraSupportError` (`code` — e.g. `PROJECT_MISMATCH`, `NOT_SIGNED_IN` — and `status`).
 
+**Filters, paging and one-ticket views (Unreleased).**
+
+```swift
+// Only what is still being worked on (open / pending)
+let active = try await SendoraCloud.support?.listMyTickets(widgetId: "your-widget-id", activeOnly: true)
+// Finished tickets, or the newest 10 (listMyTickets returns the FIRST page)
+let finished = try await SendoraCloud.support?.listMyTickets(widgetId: "your-widget-id", statuses: ["resolved", "closed"])
+let recent = try await SendoraCloud.support?.listMyTickets(widgetId: "your-widget-id", limit: 10)
+
+// Every ticket, 20 at a time: pass each page's nextCursor back until it is nil
+var cursor: String? = nil
+repeat {
+    guard let page = try await SendoraCloud.support?.listMyTicketsPage(widgetId: "your-widget-id", cursor: cursor, limit: 20)
+    else { break }
+    print(page.tickets.map(\.subject))
+    cursor = page.nextCursor
+} while cursor != nil
+
+// The hosted screen: open one ticket directly, finished tickets read-only
+SendoraCloud.support?.presentTicketHistory(
+    widgetId: "your-widget-id",
+    from: viewController,
+    ticketId: "8b0e6c1a-2f3d-4e5f-9a7b-1c2d3e4f5a6b",
+    readOnlyFinished: true
+)
+
+// One active ticket at a time: open the existing one instead
+do {
+    _ = try await SendoraCloud.support?.createTicket(subject: "Purchase not restored", body: "Bought the hint pack")
+} catch let error as SendoraSupportError where error.code == "ACTIVE_TICKET_EXISTS" {
+    if let id = error.activeTicketId {
+        SendoraCloud.support?.presentTicketHistory(widgetId: "your-widget-id", from: viewController, ticketId: id)
+    }
+}
+```
+
+`statuses` takes `open`, `pending`, `resolved`, `closed`; `limit` is the page size, 1–50 (default 50); `statuses` and
+`activeOnly` don't go together; `cursor` is a page's `nextCursor`, as given (keep the same filters across a walk). A
+bad option throws code `INVALID_ARGUMENT` and nothing is sent. On the hosted screen `limit` is the page size of its
+list, which shows "Load more" for the rest; there the same options are lenient (an invalid one is left out, so the
+screen always opens); `ticketId` must be a ticket UUID.
+
 ## Consent + feature flags (5.7.0)
 
 Server consent records and flags. Give `identify` the HMAC `identityToken` your backend signs for the user, and these
@@ -332,7 +438,7 @@ Critical Alerts: `SendoraCloudCriticalAlerts.requestPermission { granted in ... 
 - **Identity tokens.** `identify()` accepts an HMAC `identityToken` (signed by your backend) to block client-side spoofing.
 - **Host allowlist.** `handleDeepLink` returns `nil` for URLs whose host isn't in `config.linkHosts` (default `sendoracloud.com`).
 - **Bundle-id gate.** `links.create()` forwards `Bundle.main.bundleIdentifier` automatically; backend rejects a leaked public key + wrong bundle as `LinkError(code: .bundleMismatch, statusCode: 422)`.
-- **Keychain storage.** `userId` + `deviceId` in `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Event queue persisted with PII stripped.
+- **Keychain storage.** `userId` + `deviceId` in `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`; the auth session, held / quarantined guests and the refresh marker in `kSecAttrAccessibleAfterFirstUnlock` (they move to a new iPhone with an encrypted backup — unreleased). Event queue persisted with PII stripped.
 - **Input validation.** Event names + property depth + key blocklist enforced via `SendoraCloudValidator`.
 - **Consent gating.** Events buffer in memory until `consent.grant()`.
 - **Exponential backoff + circuit breaker.** `APIClient` backs off to 60s after repeated failures.
